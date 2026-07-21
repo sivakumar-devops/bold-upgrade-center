@@ -20,63 +20,39 @@ namespace BoldBI.UpgradeCenter.Services.Stubs
     public class StubUpgradeService : IUpgradeService
     {
         private readonly IUpgradeJobStore _store;
+        private readonly IReleaseVersionProvider _releaseVersionProvider;
 
-        public StubUpgradeService(IUpgradeJobStore store)
+        public StubUpgradeService(
+            IUpgradeJobStore store,
+            IReleaseVersionProvider releaseVersionProvider)
         {
             _store = store;
+            _releaseVersionProvider = releaseVersionProvider;
         }
 
         // ── Catalog ───────────────────────────────────────────────────────────
 
-        public Task<List<Release>> GetAvailableReleasesAsync(
+        public async Task<List<Release>> GetAvailableReleasesAsync(
             string installedVersion,
             CancellationToken ct = default)
         {
-            // TODO: Replace with real catalog API call.
-            // Logic needed:
-            //   1. Fetch all releases newer than installedVersion from catalog.
-            //   2. Determine upgrade path: mark IsRecommendedNext for the lowest
-            //      sequential version.
-            //   3. Mark RequiresIntermediateUpgrade for versions that skip a
-            //      major milestone (e.g. 12.4.x required before 12.5.0).
-            //   4. Set HasSchemaChanges from catalog metadata.
+            var summary = await _releaseVersionProvider.GetReleaseVersionsAsync(installedVersion, ct);
+            var recommendedNext = summary.Versions
+                .OrderBy(version => ProductVersionComparer.Parse(version.Version), ProductVersionPartsComparer.Instance)
+                .FirstOrDefault()?.Version;
 
-            var releases = new List<Release>
-            {
-                new Release
+            return summary.Versions
+                .Select(version => new Release
                 {
-                    Version                    = "12.4.0",
-                    ReleasedOn                 = new DateTime(2026, 6, 18),
-                    ReleaseNotesUrl            = "https://help.boldbi.com/release-notes/12-4-0/",
-                    IsRecommendedNext          = true,
+                    Version = version.Version,
+                    ReleasedOn = version.PublishedAt?.UtcDateTime ?? DateTime.MinValue,
+                    ReleaseNotesUrl = version.Url,
+                    IsRecommendedNext = string.Equals(version.Version, recommendedNext, StringComparison.OrdinalIgnoreCase),
                     RequiresIntermediateUpgrade = false,
-                    HasSchemaChanges           = true,
-                    Type                       = ReleaseType.Standard
-                },
-                new Release
-                {
-                    Version                    = "12.4.2",
-                    ReleasedOn                 = new DateTime(2026, 7, 2),
-                    ReleaseNotesUrl            = "https://help.boldbi.com/release-notes/12-4-2/",
-                    IsRecommendedNext          = false,
-                    RequiresIntermediateUpgrade = false,
-                    HasSchemaChanges           = false,
-                    Type                       = ReleaseType.Standard
-                },
-                new Release
-                {
-                    Version                     = "12.5.0",
-                    ReleasedOn                  = new DateTime(2026, 7, 10),
-                    ReleaseNotesUrl             = "https://help.boldbi.com/release-notes/12-5-0/",
-                    IsRecommendedNext           = false,
-                    RequiresIntermediateUpgrade = true,
-                    UpgradePathNote             = "Requires 12.4.x first",
-                    HasSchemaChanges            = true,
-                    Type                        = ReleaseType.Standard
-                }
-            };
-
-            return Task.FromResult(releases);
+                    HasSchemaChanges = false,
+                    Type = ReleaseType.Standard
+                })
+                .ToList();
         }
 
         // ── Patch validation ──────────────────────────────────────────────────

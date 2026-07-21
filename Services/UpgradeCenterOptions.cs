@@ -2,6 +2,10 @@ namespace BoldBI.UpgradeCenter.Services;
 
 public sealed class UpgradeCenterOptions
 {
+    public string ProductName { get; set; } = "Bold BI";
+
+    public string ReleaseVersionsApiUrl { get; set; } = "https://boldbi-release-api.boldbidemo.com/version/json";
+
     public UpgradeCenterServiceOptions Services { get; set; } = new();
 
     public UpgradeCenterAuthenticationOptions Authentication { get; set; } = new();

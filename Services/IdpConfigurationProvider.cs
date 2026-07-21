@@ -88,26 +88,39 @@ public sealed class IdpConfigurationProvider : IUpgradeCenterConfigurationProvid
 
             using var configurationDocument = JsonDocument.Parse(configurationJson);
             var root = configurationDocument.RootElement;
+            var idpUrl = GetProperty(root, "InternalAppUrls", "Idp");
+            var biUrl = GetProperty(root, "InternalAppUrls", "Bi");
+            var version = GetBoldBiVersion(root);
+            var encryptedMasterConnectionString = GetProperty(root, "SqlConfiguration", "ConnectionString");
+            var masterDatabaseServerType = GetIntegerProperty(root, "SqlConfiguration", "ServerType");
+            var machineKeyDecryptionKey = GetProperty(root, "MachineKey", "DecryptionKey");
+            var internalAppClientId = GetRootProperty(root, "InternalAppClientId");
+            var internalAppClientSecret = GetRootProperty(root, "InternalAppClientSecret");
             var fallback = CreateFallbackConfiguration();
             var runtimeConfiguration = new UpgradeCenterRuntimeConfiguration(
-                FirstConfiguredValue(GetProperty(root, "InternalAppUrls", "Idp"), fallback.IdpBaseUrl)?.TrimEnd('/'),
-                FirstConfiguredValue(GetProperty(root, "InternalAppUrls", "Bi"), fallback.BiBaseUrl)?.TrimEnd('/'),
-                FirstConfiguredValue(GetBoldBiVersion(root), fallback.BoldBiVersion));
+                FirstConfiguredValue(idpUrl, fallback.IdpBaseUrl)?.TrimEnd('/'),
+                FirstConfiguredValue(biUrl, fallback.BiBaseUrl)?.TrimEnd('/'),
+                FirstConfiguredValue(version, fallback.BoldBiVersion),
+                encryptedMasterConnectionString,
+                masterDatabaseServerType,
+                machineKeyDecryptionKey,
+                internalAppClientId,
+                internalAppClientSecret);
 
-            if (string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl) &&
-                string.IsNullOrWhiteSpace(runtimeConfiguration.BiBaseUrl) &&
-                string.IsNullOrWhiteSpace(runtimeConfiguration.BoldBiVersion))
+            if (!IsValidRuntimeConfiguration(runtimeConfiguration))
             {
-                logger.LogWarning("IDP Configuration API returned no Upgrade Center runtime values.");
-                return UseLastKnownGoodOrFallback("IDP Configuration API returned no Upgrade Center runtime values.");
+                logger.LogWarning("IDP Configuration API returned a configuration response, but none of the required Upgrade Center values were available.");
+                return UseLastKnownGoodOrFallback("IDP Configuration API returned incomplete configuration data.");
             }
 
             lastKnownGoodConfiguration = runtimeConfiguration;
             logger.LogInformation(
-                "Loaded Upgrade Center runtime configuration from IDP Configuration API. HasIdpUrl: {HasIdpUrl}. HasBiUrl: {HasBiUrl}. HasBoldBiVersion: {HasBoldBiVersion}.",
+                "Loaded Upgrade Center runtime configuration from IDP Configuration API. HasIdpUrl: {HasIdpUrl}. HasBiUrl: {HasBiUrl}. HasBoldBiVersion: {HasBoldBiVersion}. HasMasterDatabaseConfiguration: {HasMasterDatabaseConfiguration}. HasInternalAppCredentials: {HasInternalAppCredentials}.",
                 !string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl),
                 !string.IsNullOrWhiteSpace(runtimeConfiguration.BiBaseUrl),
-                !string.IsNullOrWhiteSpace(runtimeConfiguration.BoldBiVersion));
+                !string.IsNullOrWhiteSpace(runtimeConfiguration.BoldBiVersion),
+                !string.IsNullOrWhiteSpace(encryptedMasterConnectionString) && masterDatabaseServerType.HasValue && !string.IsNullOrWhiteSpace(machineKeyDecryptionKey),
+                !string.IsNullOrWhiteSpace(internalAppClientId) && !string.IsNullOrWhiteSpace(internalAppClientSecret));
             return runtimeConfiguration;
         }
         catch (OperationCanceledException)
@@ -131,6 +144,16 @@ public sealed class IdpConfigurationProvider : IUpgradeCenterConfigurationProvid
 
         logger.LogWarning("Using explicit fallback Upgrade Center runtime configuration. Reason: {Reason}", reason);
         return CreateFallbackConfiguration();
+    }
+
+    private static bool IsValidRuntimeConfiguration(UpgradeCenterRuntimeConfiguration configuration)
+    {
+        return !string.IsNullOrWhiteSpace(configuration.IdpBaseUrl) ||
+               !string.IsNullOrWhiteSpace(configuration.BiBaseUrl) ||
+               !string.IsNullOrWhiteSpace(configuration.BoldBiVersion) ||
+               (!string.IsNullOrWhiteSpace(configuration.EncryptedMasterDatabaseConnectionString) &&
+                configuration.MasterDatabaseServerType.HasValue &&
+                !string.IsNullOrWhiteSpace(configuration.MachineKeyDecryptionKey));
     }
 
     private string? ResolveIdpApiUrl()
@@ -183,6 +206,62 @@ public sealed class IdpConfigurationProvider : IUpgradeCenterConfigurationProvid
         }
 
         return value.ValueKind == JsonValueKind.String ? value.GetString() : value.GetRawText();
+    }
+
+    private static string? GetRootProperty(JsonElement root, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object ||
+            !TryGetProperty(root, propertyName, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind == JsonValueKind.String ? value.GetString() : value.GetRawText();
+    }
+
+    private static int? GetIntegerProperty(JsonElement root, string parentName, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object ||
+            !TryGetProperty(root, parentName, out var parent) ||
+            parent.ValueKind != JsonValueKind.Object ||
+            !TryGetProperty(parent, propertyName, out var value))
+        {
+            return null;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+        {
+            return number;
+        }
+
+        if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number))
+        {
+            return number;
+        }
+
+        return value.ValueKind == JsonValueKind.String ? MapDatabaseTypeName(value.GetString()) : null;
+    }
+
+    private static int? MapDatabaseTypeName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = value.Replace(" ", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("-", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .ToLowerInvariant();
+
+        return normalized switch
+        {
+            "mssql" or "sqlserver" or "microsoftsqlserver" => 0,
+            "mysql" or "mariadb" => 1,
+            "mssqlce" => 2,
+            "oracle" or "ora" => 3,
+            "postgresql" or "postgres" or "pgsql" => 4,
+            _ => null
+        };
     }
 
     private static string? GetBoldBiVersion(JsonElement root)

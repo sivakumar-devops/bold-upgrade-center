@@ -25,9 +25,18 @@ builder.Services.AddHttpClient(IdpConfigurationProvider.HttpClientName, client =
 {
     client.Timeout = TimeSpan.FromSeconds(10);
 });
+builder.Services.AddHttpClient(ProductVersionProvider.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+builder.Services.AddHttpClient<IReleaseVersionProvider, BoldBiReleaseVersionProvider>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
 builder.Services.AddHttpClient(RemoteUmsAuthenticationHandler.HttpClientName)
     .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddSingleton<IUpgradeCenterConfigurationProvider, IdpConfigurationProvider>();
+builder.Services.AddSingleton<IProductVersionProvider, ProductVersionProvider>();
 builder.Services.AddSingleton<IAdminContinuationStore, InMemoryAdminContinuationStore>();
 builder.Services.AddAuthorization(options =>
 {
@@ -45,7 +54,7 @@ builder.Services
 
 // Upgrade Center services — swap Stub* implementations for real ones when ready
 builder.Services.AddSingleton<IUpgradeJobStore,                    StubUpgradeJobStore>();
-builder.Services.AddScoped<IInstallationInfoProvider,              StubInstallationInfoProvider>();
+builder.Services.AddScoped<IInstallationInfoProvider,              ProductVersionInstallationInfoProvider>();
 builder.Services.AddScoped<IUpgradeCenterAuthorizationService,     ClaimsUpgradeCenterAuthorizationService>();
 builder.Services.AddScoped<IUpgradeService,                        StubUpgradeService>();
 
