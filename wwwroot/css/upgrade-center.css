@@ -23,8 +23,8 @@
     --line-soft: #EDEFF3;
     --bg: #F5F6F9;
     --card: #FFFFFF;
-    --mono: 'IBM Plex Mono', ui-monospace, monospace;
-    --sans: 'IBM Plex Sans', -apple-system, Segoe UI, sans-serif;
+    --mono: Consolas, "Courier New", monospace;
+    --sans: Roboto, "Segoe UI", Arial, sans-serif;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -55,17 +55,11 @@ a { color: inherit; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 
-.brand .mark {
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
-    background: linear-gradient(135deg, var(--blue-500), var(--teal-600));
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 700;
-    font-size: 13px;
-    color: #fff;
+.brand-logo {
+    display: block;
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
     flex-shrink: 0;
 }
 
