@@ -23,7 +23,6 @@ public sealed class ProductVersionInstallationInfoProvider : IInstallationInfoPr
         return new InstallationInfo
         {
             InstalledVersion = currentVersion.Version,
-            DaysInstalled = 0,
             LatestAvailableVersion = releases.LatestVersion?.Version ?? currentVersion.Version,
             NewerVersionCount = releases.Versions.Count,
             DeploymentTarget = "On-premise / Kubernetes"

@@ -1,23 +1,35 @@
 @using BoldBI.UpgradeCenter.Models
+@using BoldBI.UpgradeCenter.Services
 @model UpgradeCenterUser
+@inject IUpgradeCenterConfigurationProvider ConfigurationProvider
+
+@{
+    var runtimeConfiguration = await ConfigurationProvider.GetConfigurationAsync();
+    var boldBiUrl = string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl)
+        ? Url.Action("Index", "UpgradeCenter")
+        : runtimeConfiguration.IdpBaseUrl;
+}
 
 <div class="product-topbar">
     <div class="brand">
         <img class="brand-logo" src="~/upgrade-center/images/main_logo.svg" asp-append-version="true" alt="Bold BI" />
         <div class="name">Bold BI</div>
-        <div class="crumb">Upgrade Center</div>
+        <a class="crumb" href="@Url.Action("Index", "UpgradeCenter")">Upgrade Center</a>
     </div>
-    <details class="user-menu">
-        <summary class="user-chip" aria-label="Open user menu">
-            <div class="avatar">@Model.Initials</div>
-            <span>@Model.DisplayName</span>
-        </summary>
-        <div class="user-menu-panel">
-            <div class="user-menu-header">
-                <div class="avatar avatar-large">@Model.Initials</div>
-                <strong>@Model.DisplayName</strong>
+    <div class="topbar-actions">
+        <a class="back-to-boldbi" href="@boldBiUrl">Back to Bold BI</a>
+        <details class="user-menu">
+            <summary class="user-chip" aria-label="Open user menu">
+                <div class="avatar">@Model.Initials</div>
+                <span>@Model.DisplayName</span>
+            </summary>
+            <div class="user-menu-panel">
+                <div class="user-menu-header">
+                    <div class="avatar avatar-large">@Model.Initials</div>
+                    <strong>@Model.DisplayName</strong>
+                </div>
+                <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Logout</a>
             </div>
-            <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Logout</a>
-        </div>
-    </details>
+        </details>
+    </div>
 </div>

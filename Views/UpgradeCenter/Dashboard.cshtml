@@ -59,7 +59,6 @@
         <div class="card vcard installed">
             <div class="lbl">Currently installed</div>
             <div class="num">v@(Model.Installation.InstalledVersion)</div>
-            <div class="meta">Installed @Model.Installation.DaysInstalled days ago</div>
         </div>
         <div class="card vcard latest">
             <div class="lbl">Latest available</div>
@@ -158,13 +157,24 @@
                   asp-action="StartUpgrade">
                 @Html.AntiForgeryToken()
                 <div class="field">
-                    <label for="imageRef">Image reference / tag</label>
+                    <label for="patchVersion">Custom patch version</label>
                     <input type="text"
-                           id="imageRef"
-                           name="imageRef"
-                           placeholder="registry.boldbi.com/patches/your-org/12.x.x-hotfix-xxxx" />
+                           id="patchVersion"
+                           name="patchVersion"
+                           placeholder="16.1.88" />
                     <div class="hint">
-                        Enter the image reference exactly as provided by Bold BI Support.
+                        Enter the patch version or image tag provided by Bold BI Support.
+                    </div>
+                </div>
+
+                <div class="field">
+                    <label for="imageRepository">Image repository <span style="color:var(--ink-500); font-weight:500;">(optional)</span></label>
+                    <input type="text"
+                           id="imageRepository"
+                           name="imageRepository"
+                           placeholder="us-central1-docker.pkg.dev/boldbi-dev-296107/boldbi" />
+                    <div class="hint">
+                        Leave empty to keep the repository and image name from each currently running Bold BI deployment.
                     </div>
                 </div>
 
@@ -181,15 +191,15 @@
                 {
                     <div class="allow-box" style="background: var(--amber-100, #fff4d6); border-color: var(--amber-300, #f5d28a);">
                         ⚠ An upgrade or rollback is currently in progress. You can prepare the image
-                        reference but the upgrade button is disabled until the active job finishes.
+                        version but the upgrade button is disabled until the active job finishes.
                     </div>
                 }
 
                 <div id="patch-validation-result"></div>
 
                 <div class="allow-box">
-                    Only images under <code>registry.boldbi.com/patches/*</code> can be applied here.
-                    This should match the image reference sent to you by Bold BI Support.
+                    The Upgrade Center generates one target image per Bold BI deployment, validates
+                    every required image, and enables upgrade only when all required images are available.
                 </div>
             </form>
         </div>
@@ -283,18 +293,21 @@
     // ── Custom patch validation (AJAX) ────────────────────────────
     const btnValidate      = document.getElementById('btn-validate');
     const btnPatchUpgrade  = document.getElementById('btn-patch-upgrade');
-    const imageRefInput    = document.getElementById('imageRef');
+    const patchVersionInput = document.getElementById('patchVersion');
+    const imageRepoInput    = document.getElementById('imageRepository');
     const validationResult = document.getElementById('patch-validation-result');
 
     btnValidate.addEventListener('click', async () => {
-        const imageRef = imageRefInput.value.trim();
-        if (!imageRef) return;
+        const patchVersion = patchVersionInput.value.trim();
+        const imageRepository = imageRepoInput.value.trim();
+        if (!patchVersion) return;
 
         btnValidate.disabled = true;
         btnValidate.textContent = 'Validating…';
 
         const formData = new FormData();
-        formData.append('imageRef', imageRef);
+        formData.append('patchVersion', patchVersion);
+        formData.append('imageRepository', imageRepository);
         formData.append('__RequestVerificationToken',
             document.querySelector('input[name="__RequestVerificationToken"]').value);
 
@@ -317,9 +330,9 @@
     });
 
     // Re-validate on input change
-    imageRefInput.addEventListener('input', () => {
+    [patchVersionInput, imageRepoInput].forEach(input => input.addEventListener('input', () => {
         validationResult.innerHTML = '';
         btnPatchUpgrade.disabled = true;
-    });
+    }));
 </script>
 }

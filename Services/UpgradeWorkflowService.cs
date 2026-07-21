@@ -1,0 +1,233 @@
+using BoldBI.UpgradeCenter.Models;
+using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
+
+namespace BoldBI.UpgradeCenter.Services;
+
+public sealed class UpgradeWorkflowService : IUpgradeService
+{
+    private readonly IUpgradeJobStore jobStore;
+    private readonly IUpgradeJobRunner jobRunner;
+    private readonly IUpgradeRollbackStore rollbackStore;
+    private readonly IUpgradeRollbackJobRunner rollbackJobRunner;
+    private readonly IProductVersionProvider productVersionProvider;
+    private readonly IReleaseVersionProvider releaseVersionProvider;
+    private readonly IUpgradeHistoryStore historyStore;
+    private readonly IUpgradeUserContextProvider userContextProvider;
+    private readonly ICustomPatchValidationService customPatchValidationService;
+
+    public UpgradeWorkflowService(
+        IUpgradeJobStore jobStore,
+        IUpgradeJobRunner jobRunner,
+        IUpgradeRollbackStore rollbackStore,
+        IUpgradeRollbackJobRunner rollbackJobRunner,
+        IProductVersionProvider productVersionProvider,
+        IReleaseVersionProvider releaseVersionProvider,
+        IUpgradeHistoryStore historyStore,
+        IUpgradeUserContextProvider userContextProvider,
+        ICustomPatchValidationService customPatchValidationService)
+    {
+        this.jobStore = jobStore;
+        this.jobRunner = jobRunner;
+        this.rollbackStore = rollbackStore;
+        this.rollbackJobRunner = rollbackJobRunner;
+        this.productVersionProvider = productVersionProvider;
+        this.releaseVersionProvider = releaseVersionProvider;
+        this.historyStore = historyStore;
+        this.userContextProvider = userContextProvider;
+        this.customPatchValidationService = customPatchValidationService;
+    }
+
+    public async Task<List<Release>> GetAvailableReleasesAsync(string installedVersion, CancellationToken ct = default)
+    {
+        var summary = await releaseVersionProvider.GetReleaseVersionsAsync(installedVersion, ct);
+        var ordered = summary.Versions
+            .OrderBy(version => ProductVersionComparer.Parse(version.Version), ProductVersionPartsComparer.Instance)
+            .ToList();
+        var recommendedNext = ordered.FirstOrDefault()?.Version;
+
+        return summary.Versions
+            .Select(version => new Release
+            {
+                Version = version.Version,
+                ReleasedOn = version.PublishedAt?.UtcDateTime ?? DateTime.MinValue,
+                ReleaseNotesUrl = version.Url,
+                IsRecommendedNext = string.Equals(version.Version, recommendedNext, StringComparison.OrdinalIgnoreCase),
+                RequiresIntermediateUpgrade = false,
+                HasSchemaChanges = false,
+                Type = ReleaseType.Standard
+            })
+            .ToList();
+    }
+
+    public async Task<PatchValidationResult> ValidatePatchImageAsync(
+        string patchVersion,
+        string? imageRepository = null,
+        CancellationToken ct = default)
+    {
+        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var validation = await customPatchValidationService.ValidateAsync(
+            new CustomPatchValidationRequest
+            {
+                TargetVersion = patchVersion,
+                ImageRepository = imageRepository
+            },
+            currentVersion.Version,
+            ct);
+
+        return new PatchValidationResult
+        {
+            IsValid = validation.IsValid,
+            ImageReference = string.Join(", ", validation.Results.Select(result => result.Image)),
+            ImageRepository = imageRepository,
+            ParsedVersion = validation.TargetVersion,
+            ErrorMessage = validation.Errors.Count > 0 ? string.Join(" ", validation.Errors) : null,
+            Images = validation.Results.Select(result => new PatchImageValidationItem
+            {
+                DeploymentName = result.DeploymentName,
+                ContainerName = result.ContainerName,
+                Image = result.Image,
+                IsValid = result.IsValid,
+                Message = result.Message
+            }).ToList()
+        };
+    }
+
+    public async Task<UiUpgradeJob> StartUpgradeAsync(string targetVersion, string initiatedBy, CancellationToken ct = default)
+    {
+        if (jobStore.TryGetLatestActive(out var active))
+        {
+            throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
+        }
+
+        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var user = userContextProvider.GetCurrentUser();
+        var job = jobStore.Create(
+            currentVersion.Version,
+            targetVersion,
+            UpgradeJobType.AvailableRelease,
+            ["All applicable Bold BI deployments"],
+            null,
+            user);
+
+        await historyStore.SaveStartedAsync(CreateHistoryRecord(job), ct);
+        jobRunner.Start(job.Id);
+        return UpgradeJobViewModelMapper.ToViewModel(job);
+    }
+
+    public async Task<UiUpgradeJob> StartCustomPatchUpgradeAsync(
+        string patchVersion,
+        string? imageRepository,
+        string initiatedBy,
+        CancellationToken ct = default)
+    {
+        if (jobStore.TryGetLatestActive(out var active))
+        {
+            throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
+        }
+
+        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var validation = await customPatchValidationService.ValidateAsync(
+            new CustomPatchValidationRequest
+            {
+                TargetVersion = patchVersion,
+                ImageRepository = imageRepository
+            },
+            currentVersion.Version,
+            ct);
+        if (!validation.IsValid)
+        {
+            throw new InvalidOperationException($"Custom patch validation failed. {string.Join(" ", validation.Errors)}");
+        }
+
+        var customImages = validation.Results
+            .Where(result => result.IsValid)
+            .Select(result => new CustomPatchImageMapping(result.DeploymentName, result.Image, result.ContainerName))
+            .ToArray();
+        var user = userContextProvider.GetCurrentUser();
+        var job = jobStore.Create(
+            currentVersion.Version,
+            validation.TargetVersion,
+            UpgradeJobType.CustomVersionOrPatch,
+            customImages.Select(image => image.DeploymentName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+            customImages,
+            user);
+
+        await historyStore.SaveStartedAsync(CreateHistoryRecord(job), ct);
+        jobRunner.Start(job.Id);
+        return UpgradeJobViewModelMapper.ToViewModel(job);
+    }
+
+    public async Task<UiUpgradeJob> StartRollbackAsync(string upgradeJobId, string initiatedBy, CancellationToken ct = default)
+    {
+        if (jobStore.TryGetLatestActive(out var active))
+        {
+            throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
+        }
+
+        var rollbackEntry = rollbackStore.GetLatest();
+        if (rollbackEntry is null ||
+            !rollbackEntry.CanExecute ||
+            !string.Equals(rollbackEntry.UpgradeJobId, upgradeJobId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Rollback is not available for the selected upgrade job.");
+        }
+
+        if (!rollbackStore.TryBeginRestore(rollbackEntry.Id, out rollbackEntry, out var message))
+        {
+            throw new InvalidOperationException(message);
+        }
+
+        var user = userContextProvider.GetCurrentUser();
+        var rollbackDeployments = rollbackEntry.KubernetesResult?.PreviousImages
+            .Select(image => image.DeploymentName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(deployment => deployment, StringComparer.OrdinalIgnoreCase)
+            .ToList() ?? [];
+        var rollbackJob = jobStore.CreateRollback(
+            rollbackEntry.TargetVersion ?? rollbackEntry.BackupResult.SelectedVersion,
+            rollbackEntry.PreviousVersion ?? "Rollback point",
+            rollbackDeployments,
+            user);
+
+        await historyStore.SaveStartedAsync(new UpgradeHistoryRecord
+        {
+            JobId = rollbackJob.Id,
+            ParentJobId = rollbackEntry.UpgradeJobId,
+            OperationType = UpgradeHistoryOperationTypes.ManualRollback,
+            PreviousVersion = rollbackEntry.TargetVersion ?? rollbackEntry.BackupResult.SelectedVersion,
+            TargetVersion = rollbackEntry.PreviousVersion ?? "Rollback point",
+            UpgradeType = "Rollback",
+            Status = "Running",
+            StartedAt = DateTimeOffset.UtcNow,
+            InitiatedByUserId = user.UserId,
+            InitiatedByName = user.DisplayName,
+            InitiatedByEmail = user.Email,
+            InitiatedByRole = user.Role,
+            RollbackMode = UpgradeHistoryRollbackModes.Manual,
+            RollbackJobId = rollbackJob.Id
+        }, ct);
+
+        rollbackJobRunner.Start(rollbackJob.Id, rollbackEntry.Id);
+        return UpgradeJobViewModelMapper.ToViewModel(rollbackJob);
+    }
+
+    private static UpgradeHistoryRecord CreateHistoryRecord(UpgradeJob job)
+    {
+        return new UpgradeHistoryRecord
+        {
+            JobId = job.Id,
+            OperationType = job.UpgradeType == UpgradeJobType.CustomVersionOrPatch
+                ? UpgradeHistoryOperationTypes.CustomVersionOrPatchUpgrade
+                : UpgradeHistoryOperationTypes.StandardReleaseUpgrade,
+            PreviousVersion = job.CurrentVersion,
+            TargetVersion = job.TargetVersion,
+            UpgradeType = job.UpgradeType.ToString(),
+            Status = job.Status.ToString(),
+            StartedAt = job.StartedAt,
+            InitiatedByUserId = job.InitiatedBy.UserId,
+            InitiatedByName = job.InitiatedBy.DisplayName,
+            InitiatedByEmail = job.InitiatedBy.Email,
+            InitiatedByRole = job.InitiatedBy.Role
+        };
+    }
+}

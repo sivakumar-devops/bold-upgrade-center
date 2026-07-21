@@ -3,7 +3,6 @@ using BoldBI.UpgradeCenter.Security;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.HttpOverrides;
-using Legacy = Bold.UpgradeCenter.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -23,7 +22,6 @@ builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath))
     .SetApplicationName("BoldBI.UpgradeCenter");
 builder.Services.Configure<UpgradeCenterOptions>(builder.Configuration.GetSection("UpgradeCenter"));
-builder.Services.Configure<Legacy.UpgradeCenterOptions>(builder.Configuration.GetSection("UpgradeCenter"));
 builder.Services.AddHttpClient(IdpConfigurationProvider.HttpClientName, client =>
 {
     client.Timeout = TimeSpan.FromSeconds(10);
@@ -56,44 +54,45 @@ builder.Services
         _ => { });
 
 // Real Upgrade Center backend workflow reused from the validated Upgrade Center implementation.
-builder.Services.AddHttpClient(Legacy.IdpPrivateKeyProvider.HttpClientName, client =>
+builder.Services.AddHttpClient(IdpPrivateKeyProvider.HttpClientName, client =>
 {
     client.Timeout = TimeSpan.FromSeconds(15);
 });
-builder.Services.AddHttpClient<Legacy.IUpgradeDatabaseScriptImpactService, Legacy.UpgradeDatabaseScriptImpactService>(client =>
+builder.Services.AddHttpClient<IUpgradeDatabaseScriptImpactService, UpgradeDatabaseScriptImpactService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
 });
-builder.Services.AddHttpClient<Legacy.IKubernetesUpgradeService, Legacy.KubernetesUpgradeService>(client =>
+builder.Services.AddHttpClient<IKubernetesUpgradeService, KubernetesUpgradeService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
 });
-builder.Services.Configure<Legacy.PlaywrightExecutionOptions>(builder.Configuration.GetSection("UpgradeCenter:Playwright"));
-builder.Services.Configure<Legacy.DatabaseBackupOptions>(builder.Configuration.GetSection("UpgradeCenter:DatabaseBackup"));
-builder.Services.Configure<Legacy.KubernetesUpgradeOptions>(builder.Configuration.GetSection("UpgradeCenter:Kubernetes"));
-builder.Services.AddSingleton<Legacy.IUpgradeCenterConfigurationProvider, LegacyConfigurationProviderAdapter>();
-builder.Services.AddSingleton<Legacy.IProductVersionProvider, LegacyProductVersionProviderAdapter>();
-builder.Services.AddSingleton<Legacy.IReleaseVersionProvider, LegacyReleaseVersionProviderAdapter>();
-builder.Services.AddSingleton<Legacy.IIdpPrivateKeyProvider, Legacy.IdpPrivateKeyProvider>();
-builder.Services.AddSingleton<Legacy.IBoldConnectionStringDecryptor, Legacy.BoldConnectionStringDecryptor>();
-builder.Services.AddScoped<Legacy.IUpgradeDatabaseDiscoveryService, Legacy.UpgradeDatabaseDiscoveryService>();
-builder.Services.AddScoped<Legacy.IUpgradeUserContextProvider, Legacy.UpgradeUserContextProvider>();
-builder.Services.AddScoped<Legacy.IPlaywrightScriptRunner, Legacy.PlaywrightScriptRunner>();
-builder.Services.AddSingleton<Legacy.IUpgradeOperationalStateStore, Legacy.DatabaseUpgradeOperationalStateStore>();
-builder.Services.AddSingleton<Legacy.IUpgradeRollbackStore, Legacy.InMemoryUpgradeRollbackStore>();
-builder.Services.AddSingleton<Legacy.IUpgradeJobStore, Legacy.InMemoryUpgradeJobStore>();
-builder.Services.AddSingleton<Legacy.IUpgradeJobRunner, Legacy.UpgradeJobRunner>();
-builder.Services.AddSingleton<Legacy.IUpgradeRollbackJobRunner, Legacy.UpgradeRollbackJobRunner>();
-builder.Services.AddHostedService<Legacy.UpgradeJobRecoveryService>();
-builder.Services.AddScoped<Legacy.IUpgradeHistoryStore, Legacy.DatabaseUpgradeHistoryStore>();
-builder.Services.AddScoped<Legacy.ICustomPatchValidationService, Legacy.CustomPatchValidationService>();
-builder.Services.AddScoped<Legacy.IUpgradeDatabaseBackupService, Legacy.UpgradeDatabaseBackupService>();
-builder.Services.AddScoped<Legacy.IUpgradeImpactService, Legacy.UpgradeImpactService>();
+builder.Services.AddHttpClient(ContainerImageRegistryValidator.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(20);
+});
+builder.Services.Configure<PlaywrightExecutionOptions>(builder.Configuration.GetSection("UpgradeCenter:Playwright"));
+builder.Services.Configure<DatabaseBackupOptions>(builder.Configuration.GetSection("UpgradeCenter:DatabaseBackup"));
+builder.Services.Configure<KubernetesUpgradeOptions>(builder.Configuration.GetSection("UpgradeCenter:Kubernetes"));
+builder.Services.AddSingleton<IIdpPrivateKeyProvider, IdpPrivateKeyProvider>();
+builder.Services.AddSingleton<IBoldConnectionStringDecryptor, BoldConnectionStringDecryptor>();
+builder.Services.AddScoped<IUpgradeDatabaseDiscoveryService, UpgradeDatabaseDiscoveryService>();
+builder.Services.AddScoped<IUpgradeUserContextProvider, UpgradeUserContextProvider>();
+builder.Services.AddScoped<IPlaywrightScriptRunner, PlaywrightScriptRunner>();
+builder.Services.AddSingleton<IUpgradeOperationalStateStore, DatabaseUpgradeOperationalStateStore>();
+builder.Services.AddSingleton<IUpgradeRollbackStore, InMemoryUpgradeRollbackStore>();
+builder.Services.AddSingleton<IUpgradeJobStore, InMemoryUpgradeJobStore>();
+builder.Services.AddSingleton<IUpgradeJobRunner, UpgradeJobRunner>();
+builder.Services.AddSingleton<IUpgradeRollbackJobRunner, UpgradeRollbackJobRunner>();
+builder.Services.AddHostedService<UpgradeJobRecoveryService>();
+builder.Services.AddScoped<IUpgradeHistoryStore, DatabaseUpgradeHistoryStore>();
+builder.Services.AddScoped<IContainerImageRegistryValidator, ContainerImageRegistryValidator>();
+builder.Services.AddScoped<ICustomPatchValidationService, CustomPatchValidationService>();
+builder.Services.AddScoped<IUpgradeDatabaseBackupService, UpgradeDatabaseBackupService>();
+builder.Services.AddScoped<IUpgradeImpactService, UpgradeImpactService>();
 
-builder.Services.AddSingleton<IUpgradeJobStore, LegacyUpgradeJobStoreAdapter>();
 builder.Services.AddScoped<IInstallationInfoProvider, ProductVersionInstallationInfoProvider>();
 builder.Services.AddScoped<IUpgradeCenterAuthorizationService, ClaimsUpgradeCenterAuthorizationService>();
-builder.Services.AddScoped<IUpgradeService, LegacyUpgradeServiceAdapter>();
+builder.Services.AddScoped<IUpgradeService, UpgradeWorkflowService>();
 
 var app = builder.Build();
 

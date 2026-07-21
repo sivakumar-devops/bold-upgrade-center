@@ -1,0 +1,24 @@
+namespace BoldBI.UpgradeCenter.Services;
+
+public interface IUpgradeDatabaseScriptImpactService
+{
+    Task<UpgradeDatabaseScriptImpactResult> AnalyzeAsync(
+        string currentVersion,
+        string targetVersion,
+        IReadOnlyList<DatabaseType> databaseTypes,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed record UpgradeDatabaseScriptImpactResult(
+    bool Succeeded,
+    string Message,
+    string CurrentVersion,
+    string TargetVersion,
+    IReadOnlyList<string> ApplicableVersions,
+    IReadOnlyList<string> DatabaseTypes,
+    IReadOnlyList<string> AffectedTables,
+    IReadOnlyDictionary<string, IReadOnlyList<string>> AffectedTableVersions,
+    string? ScriptPreview)
+{
+    public bool HasSchemaChanges => AffectedTables.Count > 0;
+}

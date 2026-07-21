@@ -7,7 +7,7 @@ using BoldBI.UpgradeCenter.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
-using Legacy = Bold.UpgradeCenter.Services;
+using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
 
 namespace BoldBI.UpgradeCenter.Controllers
 {
@@ -25,7 +25,9 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IInstallationInfoProvider _installationInfo;
         private readonly IUpgradeCenterAuthorizationService _authService;
         private readonly IUpgradeCenterConfigurationProvider _configurationProvider;
-        private readonly Legacy.IUpgradeImpactService _upgradeImpactService;
+        private readonly IUpgradeImpactService _upgradeImpactService;
+        private readonly IUpgradeHistoryStore _historyStore;
+        private readonly IUpgradeRollbackStore _rollbackStore;
         private readonly IOptions<UpgradeCenterOptions> _options;
 
         public UpgradeCenterController(
@@ -34,7 +36,9 @@ namespace BoldBI.UpgradeCenter.Controllers
             IInstallationInfoProvider installationInfo,
             IUpgradeCenterAuthorizationService authService,
             IUpgradeCenterConfigurationProvider configurationProvider,
-            Legacy.IUpgradeImpactService upgradeImpactService,
+            IUpgradeImpactService upgradeImpactService,
+            IUpgradeHistoryStore historyStore,
+            IUpgradeRollbackStore rollbackStore,
             IOptions<UpgradeCenterOptions> options)
         {
             _upgradeService  = upgradeService;
@@ -43,6 +47,8 @@ namespace BoldBI.UpgradeCenter.Controllers
             _authService     = authService;
             _configurationProvider = configurationProvider;
             _upgradeImpactService = upgradeImpactService;
+            _historyStore = historyStore;
+            _rollbackStore = rollbackStore;
             _options = options;
         }
 
@@ -61,9 +67,9 @@ namespace BoldBI.UpgradeCenter.Controllers
 
             var installation = await _installationInfo.GetInstallationInfoAsync();
             var releases     = await _upgradeService.GetAvailableReleasesAsync(installation.InstalledVersion);
-            var history      = await _jobStore.GetHistoryAsync();
-            var activeJob    = await _jobStore.GetActiveJobAsync();
-            var rollbackable = await _jobStore.GetMostRecentRollbackableJobAsync();
+            var history      = await GetHistoryEntriesAsync(HttpContext.RequestAborted);
+            var activeJob    = ResolveActiveJob();
+            var rollbackable = ResolveMostRecentRollbackableJob();
 
             var vm = new DashboardViewModel
             {
@@ -140,7 +146,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             }
 
             var targetVersion = release?.Version ?? version ?? imageRef ?? "—";
-            Legacy.UpgradeImpactResult? impact = null;
+            UpgradeImpactResult? impact = null;
             if (string.IsNullOrWhiteSpace(imageRef) &&
                 !string.IsNullOrWhiteSpace(targetVersion) &&
                 targetVersion != "—")
@@ -176,13 +182,15 @@ namespace BoldBI.UpgradeCenter.Controllers
         [ValidateAntiForgeryToken]
         public async Task<IActionResult> StartUpgrade(
             string? version,
-            string? imageRef)
+            string? imageRef,
+            string? patchVersion,
+            string? imageRepository)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return View("Unauthorized", user);
 
             // Block new upgrade if any job is already running (single-job constraint).
-            var activeJob = await _jobStore.GetActiveJobAsync();
+            var activeJob = ResolveActiveJob();
             if (activeJob != null)
             {
                 var what = activeJob.IsRollback ? "rollback" : "upgrade";
@@ -192,18 +200,19 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return RedirectToAction(nameof(Index));
             }
 
-            UpgradeJob job;
+            UiUpgradeJob job;
 
-            if (!string.IsNullOrWhiteSpace(imageRef))
+            var requestedPatchVersion = !string.IsNullOrWhiteSpace(patchVersion) ? patchVersion : imageRef;
+            if (!string.IsNullOrWhiteSpace(requestedPatchVersion))
             {
-                var validation = await _upgradeService.ValidatePatchImageAsync(imageRef);
+                var validation = await _upgradeService.ValidatePatchImageAsync(requestedPatchVersion, imageRepository);
                 if (!validation.IsValid)
                 {
                     TempData["PatchError"] = validation.ErrorMessage;
                     return RedirectToAction(nameof(Index));
                 }
 
-                job = await _upgradeService.StartCustomPatchUpgradeAsync(imageRef, user.DisplayName);
+                job = await _upgradeService.StartCustomPatchUpgradeAsync(requestedPatchVersion, imageRepository, user.DisplayName);
             }
             else if (!string.IsNullOrWhiteSpace(version))
             {
@@ -227,9 +236,9 @@ namespace BoldBI.UpgradeCenter.Controllers
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return View("Unauthorized", user);
 
-            var job = await _jobStore.GetJobAsync(jobId);
-            if (job == null) return NotFound($"Job '{jobId}' not found.");
+            if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound($"Job '{jobId}' not found.");
 
+            var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return View("Monitor", vm);
@@ -246,9 +255,9 @@ namespace BoldBI.UpgradeCenter.Controllers
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return Forbid();
 
-            var job = await _jobStore.GetJobAsync(jobId);
-            if (job == null) return NotFound();
+            if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound();
 
+            var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return PartialView("_MonitoringContent", vm);
@@ -266,7 +275,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (!user.IsAuthorized) return View("Unauthorized", user);
 
             // Block new rollback if any job is already running (single-job constraint).
-            var activeJob = await _jobStore.GetActiveJobAsync();
+            var activeJob = ResolveActiveJob();
             if (activeJob != null)
             {
                 var what = activeJob.IsRollback ? "rollback" : "upgrade";
@@ -277,7 +286,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             }
 
             // Only allow rollback of the most recent completed upgrade.
-            var mostRecent = await _jobStore.GetMostRecentRollbackableJobAsync();
+            var mostRecent = ResolveMostRecentRollbackableJob();
             if (mostRecent == null || mostRecent.JobId != jobId)
             {
                 TempData["ErrorMessage"] =
@@ -296,19 +305,25 @@ namespace BoldBI.UpgradeCenter.Controllers
 
         [HttpPost("validate-patch")]
         [ValidateAntiForgeryToken]
-        public async Task<IActionResult> ValidatePatch([FromForm] string imageRef)
+        public async Task<IActionResult> ValidatePatch(
+            [FromForm] string patchVersion,
+            [FromForm] string? imageRepository,
+            [FromForm] string? imageRef)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return Forbid();
 
-            var result = await _upgradeService.ValidatePatchImageAsync(imageRef);
+            var requestedPatchVersion = !string.IsNullOrWhiteSpace(patchVersion) ? patchVersion : imageRef ?? string.Empty;
+            var result = await _upgradeService.ValidatePatchImageAsync(requestedPatchVersion, imageRepository);
 
             var vm = new PatchValidationViewModel
             {
                 IsValid        = result.IsValid,
                 ErrorMessage   = result.ErrorMessage,
                 ParsedVersion  = result.ParsedVersion,
-                ImageReference = result.ImageReference
+                ImageRepository = result.ImageRepository,
+                ImageReference = result.ImageReference,
+                Images = result.Images
             };
 
             return PartialView("_PatchValidationResult", vm);
@@ -324,7 +339,7 @@ namespace BoldBI.UpgradeCenter.Controllers
         }
 
         private static MonitoringViewModel BuildMonitoringViewModel(
-            UpgradeCenterUser user, UpgradeJob job)
+            UpgradeCenterUser user, UiUpgradeJob job)
         {
             var vm = new MonitoringViewModel
             {
@@ -347,15 +362,62 @@ namespace BoldBI.UpgradeCenter.Controllers
         /// monitoring view can decide whether to render the Rollback button.
         /// Only the most recent completed, in-window upgrade may be rolled back.
         /// </summary>
-        private async Task ApplyRollbackEligibilityAsync(UpgradeJob job)
+        private Task ApplyRollbackEligibilityAsync(UiUpgradeJob job)
         {
             bool isLatest = false;
             if (!job.IsRollback && job.CanRollBack)
             {
-                var latest = await _jobStore.GetMostRecentRollbackableJobAsync();
-                isLatest = latest != null && latest.JobId == job.JobId;
+                var latest = _rollbackStore.GetLatest();
+                isLatest = latest?.CanExecute == true &&
+                    string.Equals(latest.UpgradeJobId, job.JobId, StringComparison.OrdinalIgnoreCase);
             }
             ViewData["IsLatestRollbackable"] = isLatest;
+            return Task.CompletedTask;
+        }
+
+        private UiUpgradeJob? ResolveActiveJob()
+        {
+            return _jobStore.TryGetLatestActive(out var activeJob)
+                ? UpgradeJobViewModelMapper.ToViewModel(activeJob)
+                : null;
+        }
+
+        private UiUpgradeJob? ResolveMostRecentRollbackableJob()
+        {
+            var latest = _rollbackStore.GetLatest();
+            if (latest is null || !latest.CanExecute || string.IsNullOrWhiteSpace(latest.UpgradeJobId))
+            {
+                return null;
+            }
+
+            if (!_jobStore.TryGet(latest.UpgradeJobId, out var job))
+            {
+                return null;
+            }
+
+            return UpgradeJobViewModelMapper.ToViewModel(job);
+        }
+
+        private async Task<List<UpgradeHistoryEntry>> GetHistoryEntriesAsync(CancellationToken cancellationToken)
+        {
+            var records = await _historyStore.ListAsync(20, cancellationToken);
+            return records
+                .Select(record => new UpgradeHistoryEntry
+                {
+                    JobId = record.JobId,
+                    Label = $"{FormatVersion(record.PreviousVersion)} \u2192 {FormatVersion(record.TargetVersion)}",
+                    InitiatedBy = string.IsNullOrWhiteSpace(record.InitiatedByName)
+                        ? record.InitiatedByUserId
+                        : record.InitiatedByName,
+                    Status = UpgradeJobViewModelMapper.ToViewModelStatus(record.Status, record.OperationType),
+                    CompletedAt = (record.CompletedAt ?? record.StartedAt).UtcDateTime
+                })
+                .ToList();
+        }
+
+        private static string FormatVersion(string? version)
+        {
+            return string.IsNullOrWhiteSpace(version) ? "Unknown" : $"v{version.TrimStart('v', 'V')}";
         }
     }
 }

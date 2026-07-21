@@ -60,7 +60,7 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: boldbi-upgrade-center
-          image: sivakumar2809/upgrade-center-ui:v0.1
+          image: sivakumar2809/upgrade-center-ui:v0.5
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

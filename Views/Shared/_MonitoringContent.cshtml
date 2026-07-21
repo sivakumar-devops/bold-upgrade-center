@@ -205,49 +205,71 @@ else if (job.Status == UpgradeJobStatus.Running)
 @foreach (var stage in job.Stages)
 {
     var iconCls = StageIconClass(stage.Status);
-    var hasBody = stage.Checks.Count > 0 || stage.LogLines.Count > 0;
+    var hasProgress = stage.Checks.Count > 0;
+    var hasLogs = stage.LogLines.Count > 0;
+    var hasDetails = hasProgress || hasLogs;
 
     <div class="card stage-card">
-        <div class="stage-head" onclick="toggleStageBody(this)">
+        <div class="stage-head">
             <div class="stage-head-left">
                 <div class="stage-icon @iconCls">@StageIconLabel(stage.Status)</div>
                 <div>
                     <div class="stage-name">@stage.Name</div>
-                    @if (!string.IsNullOrWhiteSpace(stage.Meta))
-                    {
-                        <div class="stage-meta">@stage.Meta</div>
-                    }
-                    else if (stage.Checks.Count > 0)
-                    {
-                        var passed = stage.Checks.Count(c => c.Passed);
-                        <div class="stage-meta">@passed of @stage.Checks.Count checks passed</div>
-                    }
+                    <div class="stage-summary">
+                        @if (!string.IsNullOrWhiteSpace(stage.Meta))
+                        {
+                            <span>@stage.Meta</span>
+                        }
+                        else if (stage.Checks.Count > 0)
+                        {
+                            var passed = stage.Checks.Count(c => c.Passed);
+                            <span>@passed of @stage.Checks.Count checks passed</span>
+                        }
+                        else
+                        {
+                            <span>@BadgeLabel(stage.Status)</span>
+                        }
+
+                        @if (stage.Duration.HasValue)
+                        {
+                            <span class="stage-duration">@FormatDuration(stage.Duration)</span>
+                        }
+                    </div>
                 </div>
             </div>
             <span class="badge @BadgeClass(stage.Status)">@BadgeLabel(stage.Status)</span>
         </div>
 
-        @if (hasBody)
+        @if (hasDetails)
         {
             <div class="stage-body">
-                @if (stage.Checks.Count > 0)
-                {
-                    <ul>
-                        @foreach (var check in stage.Checks)
-                        {
-                            <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
-                        }
-                    </ul>
-                }
-                @if (stage.LogLines.Count > 0)
-                {
-                    <div class="log-box">
-                        @foreach (var line in stage.LogLines)
-                        {
-                            @Html.Raw(line)<br />
-                        }
-                    </div>
-                }
+                <details class="stage-log-details">
+                    <summary>
+                        <span class="summary-open">Hide Details ^</span>
+                        <span class="summary-closed">View Details v</span>
+                    </summary>
+
+                    @if (hasProgress)
+                    {
+                        <div class="stage-log-heading">Progress Details</div>
+                        <ul class="stage-progress-list">
+                            @foreach (var check in stage.Checks)
+                            {
+                                <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
+                            }
+                        </ul>
+                    }
+                    else if (hasLogs)
+                    {
+                        <div class="stage-log-heading">Detailed Logs</div>
+                        <div class="log-box">
+                            @foreach (var line in stage.LogLines)
+                            {
+                                @line<br />
+                            }
+                        </div>
+                    }
+                </details>
             </div>
         }
     </div>

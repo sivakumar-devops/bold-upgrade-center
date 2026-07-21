@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using BoldBI.UpgradeCenter.Models;
+using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
 
 namespace BoldBI.UpgradeCenter.Services
 {
@@ -27,11 +28,12 @@ namespace BoldBI.UpgradeCenter.Services
         // ── Patch validation ──
 
         /// <summary>
-        /// Validates a custom patch image reference entered by the admin.
-        /// Must confirm it lives under the allowed registry prefix.
+        /// Validates generated custom patch images from a patch version and
+        /// optional repository override.
         /// </summary>
         Task<PatchValidationResult> ValidatePatchImageAsync(
-            string imageReference,
+            string patchVersion,
+            string? imageRepository = null,
             CancellationToken ct = default);
 
         // ── Upgrade execution ──
@@ -40,17 +42,18 @@ namespace BoldBI.UpgradeCenter.Services
         /// Starts an upgrade job for a standard catalog release.
         /// Returns the new UpgradeJob with status = Running.
         /// </summary>
-        Task<UpgradeJob> StartUpgradeAsync(
+        Task<UiUpgradeJob> StartUpgradeAsync(
             string targetVersion,
             string initiatedBy,
             CancellationToken ct = default);
 
         /// <summary>
-        /// Starts an upgrade job for a custom patch image.
+        /// Starts an upgrade job for generated custom patch images.
         /// Returns the new UpgradeJob with status = Running.
         /// </summary>
-        Task<UpgradeJob> StartCustomPatchUpgradeAsync(
-            string imageReference,
+        Task<UiUpgradeJob> StartCustomPatchUpgradeAsync(
+            string patchVersion,
+            string? imageRepository,
             string initiatedBy,
             CancellationToken ct = default);
 
@@ -60,7 +63,7 @@ namespace BoldBI.UpgradeCenter.Services
         /// Triggers a rollback of the specified completed upgrade job.
         /// Returns the new rollback UpgradeJob with status = Running.
         /// </summary>
-        Task<UpgradeJob> StartRollbackAsync(
+        Task<UiUpgradeJob> StartRollbackAsync(
             string upgradeJobId,
             string initiatedBy,
             CancellationToken ct = default);

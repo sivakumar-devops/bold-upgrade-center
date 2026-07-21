@@ -1,3 +1,5 @@
+using BoldBI.UpgradeCenter.Models;
+
 namespace BoldBI.UpgradeCenter.Models.ViewModels
 {
     /// <summary>
@@ -8,6 +10,8 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
         public bool IsValid { get; set; }
         public string? ErrorMessage { get; set; }
         public string? ParsedVersion { get; set; }
+        public string? ImageRepository { get; set; }
         public string ImageReference { get; set; } = string.Empty;
+        public List<PatchImageValidationItem> Images { get; set; } = [];
     }
 }

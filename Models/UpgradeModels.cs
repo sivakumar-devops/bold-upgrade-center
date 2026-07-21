@@ -87,6 +87,7 @@ namespace BoldBI.UpgradeCenter.Models
     {
         public bool IsValid { get; set; }
         public string ImageReference { get; set; } = string.Empty;
+        public string? ImageRepository { get; set; }
 
         /// <summary>
         /// Human-readable reason when IsValid = false.
@@ -97,6 +98,17 @@ namespace BoldBI.UpgradeCenter.Models
         /// Derived version string parsed from the image tag, when valid.
         /// </summary>
         public string? ParsedVersion { get; set; }
+
+        public List<PatchImageValidationItem> Images { get; set; } = [];
+    }
+
+    public class PatchImageValidationItem
+    {
+        public string DeploymentName { get; set; } = string.Empty;
+        public string? ContainerName { get; set; }
+        public string Image { get; set; } = string.Empty;
+        public bool IsValid { get; set; }
+        public string Message { get; set; } = string.Empty;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -194,11 +206,6 @@ namespace BoldBI.UpgradeCenter.Models
         /// Version currently running in the cluster / host.
         /// </summary>
         public string InstalledVersion { get; set; } = string.Empty;
-
-        /// <summary>
-        /// Days since InstalledVersion was deployed.
-        /// </summary>
-        public int DaysInstalled { get; set; }
 
         /// <summary>
         /// The highest version available in the catalog.
