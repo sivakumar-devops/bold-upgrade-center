@@ -1,0 +1,14 @@
+@using BoldBI.UpgradeCenter.Models
+@model UpgradeCenterUser
+
+<div class="product-topbar">
+    <div class="brand">
+        <div class="mark">B</div>
+        <div class="name">Bold BI</div>
+        <div class="crumb">Upgrade Center</div>
+    </div>
+    <div class="user-chip">
+        <div class="avatar">@Model.Initials</div>
+        @Model.DisplayName · @Model.Role
+    </div>
+</div>

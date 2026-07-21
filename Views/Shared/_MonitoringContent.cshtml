@@ -1,0 +1,235 @@
+@using BoldBI.UpgradeCenter.Models
+@using BoldBI.UpgradeCenter.Models.ViewModels
+@model MonitoringViewModel
+
+@{
+    var job = Model.Job;
+
+    // Map each stage index to a rail CSS class
+    string RailClass(int index)
+    {
+        if (index >= job.Stages.Count) return "";
+        return job.Stages[index].Status switch
+        {
+            StageStatus.Passed  => "done",
+            StageStatus.Running => "running",
+            StageStatus.Failed  => "failed",
+            _                   => ""
+        };
+    }
+
+    string StageIconClass(StageStatus s) => s switch
+    {
+        StageStatus.Passed  => "pass",
+        StageStatus.Running => "run",
+        StageStatus.Failed  => "fail",
+        _                   => "skip"
+    };
+
+    string StageIconLabel(StageStatus s) => s switch
+    {
+        StageStatus.Passed  => "✓",
+        StageStatus.Running => "●",
+        StageStatus.Failed  => "!",
+        _                   => "—"
+    };
+
+    string BadgeClass(StageStatus s) => s switch
+    {
+        StageStatus.Passed  => "badge-teal",
+        StageStatus.Running => "badge-blue",
+        StageStatus.Failed  => "badge-red",
+        _                   => "badge-grey"
+    };
+
+    string BadgeLabel(StageStatus s) => s switch
+    {
+        StageStatus.Passed  => "Passed",
+        StageStatus.Running => "Running",
+        StageStatus.Failed  => "Failed",
+        _                   => "Pending"
+    };
+
+    string JobBadgeClass(UpgradeJobStatus s) => s switch
+    {
+        UpgradeJobStatus.Completed   => "badge-teal",
+        UpgradeJobStatus.Failed      => "badge-red",
+        UpgradeJobStatus.Running     => "badge-amber",
+        UpgradeJobStatus.RollingBack => "badge-blue",
+        UpgradeJobStatus.RolledBack  => "badge-grey",
+        _                            => "badge-grey"
+    };
+
+    string JobBadgeLabel(UpgradeJobStatus s) => s switch
+    {
+        UpgradeJobStatus.Completed   => "● Completed",
+        UpgradeJobStatus.Failed      => "● Action required",
+        UpgradeJobStatus.Running     => "● Running",
+        UpgradeJobStatus.RollingBack => "● Rolling back",
+        UpgradeJobStatus.RolledBack  => "Rolled back",
+        _                            => "Pending"
+    };
+
+    string FormatDuration(TimeSpan? d) =>
+        d.HasValue ? $"{(int)d.Value.TotalMinutes}m {d.Value.Seconds}s" : "—";
+
+    string FormatStageStatus(JobStage stage) =>
+        stage.Status == StageStatus.Passed  ? $"Passed · {FormatDuration(stage.Duration)}" :
+        stage.Status == StageStatus.Running ? "Running…" :
+        stage.Status == StageStatus.Failed  ? $"{stage.Checks.Count(c => !c.Passed)} checks failed" :
+        "Pending";
+
+    // Rollback is only allowed on the *most recent* completed upgrade.
+    // The controller supplies a flag via ViewData when the page is rendered
+    // for a job that is not the latest eligible one.
+    var isLatestRollbackable = ViewData["IsLatestRollbackable"] is bool b && b;
+}
+
+<!-- Job header -->
+<div class="job-header">
+    <div>
+        <div class="eyebrow">@(job.IsRollback ? $"Rollback job · reverting job {job.RevertsJobId}" : "Upgrade job")</div>
+        <h1 class="page-title">v@(job.FromVersion) → v@(job.ToVersion)</h1>
+        <div class="job-id">
+            Job ID: @job.JobId · started @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
+        </div>
+    </div>
+    <span class="badge @JobBadgeClass(job.Status)">@JobBadgeLabel(job.Status)</span>
+</div>
+
+<!-- Three-step rail -->
+<div class="rail">
+    <div class="rail-step @RailClass(0)">
+        <div class="line"></div>
+        <div class="dot">@(RailClass(0) == "done" ? "✓" : RailClass(0) == "running" ? "●" : RailClass(0) == "failed" ? "!" : "1")</div>
+        <div class="stitle">@Model.Phase1Label</div>
+        <div class="sstatus">@(job.Stages.Count > 0 ? FormatStageStatus(job.Stages[0]) : "Pending")</div>
+    </div>
+    <div class="rail-step @RailClass(1)">
+        <div class="line"></div>
+        <div class="dot">@(RailClass(1) == "done" ? "✓" : RailClass(1) == "running" ? "●" : RailClass(1) == "failed" ? "!" : "2")</div>
+        <div class="stitle">@Model.Phase2Label</div>
+        <div class="sstatus">@(job.Stages.Count > 1 ? FormatStageStatus(job.Stages[1]) : "Pending")</div>
+    </div>
+    <div class="rail-step @RailClass(2)">
+        <div class="dot">@(RailClass(2) == "done" ? "✓" : RailClass(2) == "running" ? "●" : RailClass(2) == "failed" ? "!" : "3")</div>
+        <div class="stitle">@Model.Phase3Label</div>
+        <div class="sstatus">@(job.Stages.Count > 2 ? FormatStageStatus(job.Stages[2]) : "Pending")</div>
+    </div>
+</div>
+
+<!-- Result banners -->
+@if (job.Status == UpgradeJobStatus.Completed)
+{
+    <div class="success-banner">
+        <div class="txt">
+            <b>Upgrade completed successfully.</b>
+            <span>Bold BI is now running v@(job.ToVersion). No further action is required.</span>
+        </div>
+        @if (job.CanRollBack && isLatestRollbackable)
+        {
+            <form method="post" asp-controller="UpgradeCenter" asp-action="Rollback" asp-route-jobId="@job.JobId">
+                @Html.AntiForgeryToken()
+                <button type="submit" class="btn btn-secondary">Roll back this upgrade</button>
+            </form>
+        }
+        else if (job.CanRollBack && !isLatestRollbackable)
+        {
+            <span class="badge badge-grey" title="Only the most recent upgrade can be rolled back.">
+                Rollback unavailable — newer upgrade exists
+            </span>
+        }
+    </div>
+}
+else if (job.Status == UpgradeJobStatus.Failed)
+{
+    <div class="fail-banner">
+        <div class="txt">
+            <b>Post-upgrade validation found issues.</b>
+            <span>Rolling back restores v@(job.FromVersion) and the backed-up tables.</span>
+        </div>
+        @if (isLatestRollbackable)
+        {
+            <form method="post" asp-controller="UpgradeCenter" asp-action="Rollback" asp-route-jobId="@job.JobId">
+                @Html.AntiForgeryToken()
+                <button type="submit" class="btn btn-danger">Roll back to v@(job.FromVersion)</button>
+            </form>
+        }
+        else
+        {
+            <span class="badge badge-grey" title="Only the most recent upgrade can be rolled back.">
+                Rollback unavailable — newer upgrade exists
+            </span>
+        }
+    </div>
+}
+else if (job.Status == UpgradeJobStatus.RollingBack)
+{
+    <div class="banner">
+        <div class="txt">
+            <b>Rollback in progress.</b>
+            <span>Bold BI will be back on v@(job.ToVersion) with the pre-upgrade data restored once this finishes. This page updates automatically.</span>
+        </div>
+    </div>
+}
+else if (job.Status == UpgradeJobStatus.Running)
+{
+    <div class="banner running">
+        <div class="txt">
+            <b>Upgrade in progress.</b>
+            <span>Started by @job.InitiatedBy — @(job.CurrentStage != null ? $"currently running: {job.CurrentStage.Name}" : "preparing…")</span>
+        </div>
+    </div>
+}
+
+<!-- Stage detail cards -->
+@foreach (var (stage, idx) in job.Stages.Select((s, i) => (s, i)))
+{
+    var iconCls = StageIconClass(stage.Status);
+    var hasBody = stage.Checks.Count > 0 || stage.LogLines.Count > 0;
+
+    <div class="card stage-card">
+        <div class="stage-head" onclick="toggleStageBody(this)">
+            <div class="stage-head-left">
+                <div class="stage-icon @iconCls">@StageIconLabel(stage.Status)</div>
+                <div>
+                    <div class="stage-name">@stage.Name</div>
+                    @if (!string.IsNullOrWhiteSpace(stage.Meta))
+                    {
+                        <div class="stage-meta">@stage.Meta</div>
+                    }
+                    else if (stage.Checks.Count > 0)
+                    {
+                        var passed = stage.Checks.Count(c => c.Passed);
+                        <div class="stage-meta">@passed of @stage.Checks.Count checks passed</div>
+                    }
+                </div>
+            </div>
+            <span class="badge @BadgeClass(stage.Status)">@BadgeLabel(stage.Status)</span>
+        </div>
+
+        @if (hasBody)
+        {
+            <div class="stage-body">
+                @if (stage.Checks.Count > 0)
+                {
+                    <ul>
+                        @foreach (var check in stage.Checks)
+                        {
+                            <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
+                        }
+                    </ul>
+                }
+                @if (stage.LogLines.Count > 0)
+                {
+                    <div class="log-box">
+                        @foreach (var line in stage.LogLines)
+                        {
+                            @Html.Raw(line)<br />
+                        }
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}

@@ -1,0 +1,15 @@
+@using BoldBI.UpgradeCenter.Models.ViewModels
+@model PatchValidationViewModel
+
+@if (Model.IsValid)
+{
+    <div class="validation-result valid">
+        ✓ Image reference is valid — version: <strong>@Model.ParsedVersion</strong>
+    </div>
+}
+else
+{
+    <div class="validation-result invalid">
+        ✗ @Model.ErrorMessage
+    </div>
+}

@@ -1,0 +1,67 @@
+@using BoldBI.UpgradeCenter.Models
+@using BoldBI.UpgradeCenter.Models.ViewModels
+@model MonitoringViewModel
+
+@{
+    ViewData["Title"] = $"Monitoring — v{Model.Job.FromVersion} → v{Model.Job.ToVersion}";
+    Layout = "~/Views/Shared/_Layout.cshtml";
+
+    // Poll every 5 s while the job is still running / rolling back
+    var isLive = Model.Job.Status is UpgradeJobStatus.Running or UpgradeJobStatus.RollingBack;
+}
+
+<!-- Top bar -->
+<partial name="_Topbar" model="@Model.CurrentUser" />
+
+<div class="wrap">
+
+    <!-- Monitoring content (can be refreshed by polling) -->
+    <div id="monitoring-body">
+        <partial name="_MonitoringContent" model="@Model" />
+    </div>
+
+    <!-- Back link -->
+    <div style="margin-top:24px;">
+        <a href="@Url.Action("Index", "UpgradeCenter")" class="btn btn-ghost">← Back to Upgrade Center</a>
+    </div>
+
+</div>
+
+@if (isLive)
+{
+    @section Scripts {
+    <script>
+        // Auto-refresh the monitoring content every 5 seconds while the job is live
+        (function () {
+            var jobId   = '@Model.Job.JobId';
+            var pollUrl = '@Url.Action("MonitorStatus", "UpgradeCenter", new { jobId = "__JID__" })'.replace('__JID__', jobId);
+            var body    = document.getElementById('monitoring-body');
+            var stopped = false;
+
+            function poll() {
+                if (stopped) return;
+                fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                    .then(function (r) { return r.text(); })
+                    .then(function (html) {
+                        body.innerHTML = html;
+
+                        // Stop polling when the job reaches a terminal state
+                        var terminalStatuses = ['● Completed', '● Action required', 'Rolled back'];
+                        var badgeText = body.querySelector('.badge') && body.querySelector('.badge').textContent;
+                        if (terminalStatuses.some(s => badgeText && badgeText.includes(s.replace('● ', '')))) {
+                            stopped = true;
+                        } else {
+                            setTimeout(poll, 5000);
+                        }
+                    })
+                    .catch(function () {
+                        // Retry on network error
+                        setTimeout(poll, 8000);
+                    });
+            }
+
+            setTimeout(poll, 5000);
+        })();
+    </script>
+    }
+}
