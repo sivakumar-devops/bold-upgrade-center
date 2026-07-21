@@ -7,8 +7,17 @@
         <div class="name">Bold BI</div>
         <div class="crumb">Upgrade Center</div>
     </div>
-    <div class="user-chip">
-        <div class="avatar">@Model.Initials</div>
-        @Model.DisplayName · @Model.Role
-    </div>
+    <details class="user-menu">
+        <summary class="user-chip" aria-label="Open user menu">
+            <div class="avatar">@Model.Initials</div>
+            <span>@Model.DisplayName</span>
+        </summary>
+        <div class="user-menu-panel">
+            <div class="user-menu-header">
+                <div class="avatar avatar-large">@Model.Initials</div>
+                <strong>@Model.DisplayName</strong>
+            </div>
+            <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Logout</a>
+        </div>
+    </details>
 </div>

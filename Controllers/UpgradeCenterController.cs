@@ -6,6 +6,7 @@ using BoldBI.UpgradeCenter.Security;
 using BoldBI.UpgradeCenter.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace BoldBI.UpgradeCenter.Controllers
 {
@@ -23,19 +24,22 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IInstallationInfoProvider _installationInfo;
         private readonly IUpgradeCenterAuthorizationService _authService;
         private readonly IUpgradeCenterConfigurationProvider _configurationProvider;
+        private readonly IOptions<UpgradeCenterOptions> _options;
 
         public UpgradeCenterController(
             IUpgradeService upgradeService,
             IUpgradeJobStore jobStore,
             IInstallationInfoProvider installationInfo,
             IUpgradeCenterAuthorizationService authService,
-            IUpgradeCenterConfigurationProvider configurationProvider)
+            IUpgradeCenterConfigurationProvider configurationProvider,
+            IOptions<UpgradeCenterOptions> options)
         {
             _upgradeService  = upgradeService;
             _jobStore        = jobStore;
             _installationInfo = installationInfo;
             _authService     = authService;
             _configurationProvider = configurationProvider;
+            _options = options;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -87,6 +91,26 @@ namespace BoldBI.UpgradeCenter.Controllers
                 : runtimeConfiguration.IdpBaseUrl;
 
             return View("Unauthorized", user);
+        }
+
+        [HttpGet("logout")]
+        public async Task<IActionResult> Logout(CancellationToken cancellationToken)
+        {
+            var runtimeConfiguration = await _configurationProvider.GetConfigurationAsync(cancellationToken);
+            var idpBaseUrl = runtimeConfiguration.IdpBaseUrl?.TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(idpBaseUrl))
+            {
+                return RedirectToAction(nameof(UnauthorizedPage));
+            }
+
+            var loginPath = string.IsNullOrWhiteSpace(_options.Value.Authentication.LoginPath)
+                ? "/accounts/login"
+                : _options.Value.Authentication.LoginPath;
+            var logoutUrl = CombineUrl(idpBaseUrl, "accounts/logout");
+            var returnUrl = CombineUrl(idpBaseUrl, loginPath);
+            Response.Headers.CacheControl = "no-store, no-cache, max-age=0";
+            Response.Headers.Pragma = "no-cache";
+            return Redirect($"{logoutUrl}?returnUrl={Uri.EscapeDataString(returnUrl)}");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -275,6 +299,11 @@ namespace BoldBI.UpgradeCenter.Controllers
         // ─────────────────────────────────────────────────────────────────────
         // Private helpers
         // ─────────────────────────────────────────────────────────────────────
+
+        private static string CombineUrl(string baseUrl, string relativePath)
+        {
+            return $"{baseUrl.TrimEnd('/')}/{relativePath.TrimStart('/')}";
+        }
 
         private static MonitoringViewModel BuildMonitoringViewModel(
             UpgradeCenterUser user, UpgradeJob job)
