@@ -1,0 +1,10 @@
+{
+  "name": "bold-upgrade-center-playwright-poc",
+  "private": true,
+  "scripts": {
+    "playwright:poc": "playwright test PlaywrightScripts/sample-upgrade-poc.spec.ts --reporter=line"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

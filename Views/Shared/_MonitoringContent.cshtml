@@ -5,7 +5,6 @@
 @{
     var job = Model.Job;
 
-    // Map each stage index to a rail CSS class
     string RailClass(int index)
     {
         if (index >= job.Stages.Count) return "";
@@ -28,10 +27,10 @@
 
     string StageIconLabel(StageStatus s) => s switch
     {
-        StageStatus.Passed  => "✓",
-        StageStatus.Running => "●",
+        StageStatus.Passed  => "OK",
+        StageStatus.Running => "...",
         StageStatus.Failed  => "!",
-        _                   => "—"
+        _                   => "-"
     };
 
     string BadgeClass(StageStatus s) => s switch
@@ -47,6 +46,7 @@
         StageStatus.Passed  => "Passed",
         StageStatus.Running => "Running",
         StageStatus.Failed  => "Failed",
+        StageStatus.Skipped => "Skipped",
         _                   => "Pending"
     };
 
@@ -62,63 +62,83 @@
 
     string JobBadgeLabel(UpgradeJobStatus s) => s switch
     {
-        UpgradeJobStatus.Completed   => "● Completed",
-        UpgradeJobStatus.Failed      => "● Action required",
-        UpgradeJobStatus.Running     => "● Running",
-        UpgradeJobStatus.RollingBack => "● Rolling back",
+        UpgradeJobStatus.Completed   => "Completed",
+        UpgradeJobStatus.Failed      => "Action required",
+        UpgradeJobStatus.Running     => "Running",
+        UpgradeJobStatus.RollingBack => "Rolling back",
         UpgradeJobStatus.RolledBack  => "Rolled back",
         _                            => "Pending"
     };
 
     string FormatDuration(TimeSpan? d) =>
-        d.HasValue ? $"{(int)d.Value.TotalMinutes}m {d.Value.Seconds}s" : "—";
+        d.HasValue ? $"{(int)d.Value.TotalMinutes}m {d.Value.Seconds}s" : "-";
 
     string FormatStageStatus(JobStage stage) =>
-        stage.Status == StageStatus.Passed  ? $"Passed · {FormatDuration(stage.Duration)}" :
-        stage.Status == StageStatus.Running ? "Running…" :
+        stage.Status == StageStatus.Passed  ? $"Passed - {FormatDuration(stage.Duration)}" :
+        stage.Status == StageStatus.Running ? "Running..." :
         stage.Status == StageStatus.Failed  ? $"{stage.Checks.Count(c => !c.Passed)} checks failed" :
+        stage.Status == StageStatus.Skipped ? "Skipped" :
         "Pending";
 
-    // Rollback is only allowed on the *most recent* completed upgrade.
-    // The controller supplies a flag via ViewData when the page is rendered
-    // for a job that is not the latest eligible one.
+    string FailureTitle(JobStage? stage)
+    {
+        var name = stage?.Name ?? string.Empty;
+        return name switch
+        {
+            "Pre-Upgrade Validation" => "Pre-upgrade validation found issues.",
+            "Schema Backup" => "Schema backup failed.",
+            "Upgrade" => "Upgrade failed.",
+            "Post-Upgrade Validation" => "Post-upgrade validation found issues.",
+            _ => "Upgrade workflow found issues."
+        };
+    }
+
+    string FailureMessage(JobStage? stage)
+    {
+        var name = stage?.Name ?? string.Empty;
+        return name switch
+        {
+            "Pre-Upgrade Validation" => "No database backup or deployment image change should have been applied before this failure.",
+            "Schema Backup" => "The upgrade was stopped before deployment images were changed. Review the schema backup details and retry after fixing the issue.",
+            "Upgrade" => "Rollback is available only if the previous images and database backup were recorded successfully.",
+            "Post-Upgrade Validation" => $"Rolling back restores v{job.FromVersion} and the backed-up tables when a valid rollback point is available.",
+            _ => "Review the failed stage details before retrying or starting rollback."
+        };
+    }
+
     var isLatestRollbackable = ViewData["IsLatestRollbackable"] is bool b && b;
+    var failedStage = job.Stages.FirstOrDefault(stage => stage.Status == StageStatus.Failed);
 }
 
-<!-- Job header -->
 <div class="job-header">
     <div>
-        <div class="eyebrow">@(job.IsRollback ? $"Rollback job · reverting job {job.RevertsJobId}" : "Upgrade job")</div>
-        <h1 class="page-title">v@(job.FromVersion) → v@(job.ToVersion)</h1>
+        <div class="eyebrow">@(job.IsRollback ? $"Rollback job - reverting job {job.RevertsJobId}" : "Upgrade job")</div>
+        <h1 class="page-title">v@(job.FromVersion) -> v@(job.ToVersion)</h1>
         <div class="job-id">
-            Job ID: @job.JobId · started @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
+            Job ID: @job.JobId - started @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
         </div>
     </div>
     <span class="badge @JobBadgeClass(job.Status)">@JobBadgeLabel(job.Status)</span>
 </div>
 
-<!-- Three-step rail -->
 <div class="rail">
-    <div class="rail-step @RailClass(0)">
-        <div class="line"></div>
-        <div class="dot">@(RailClass(0) == "done" ? "✓" : RailClass(0) == "running" ? "●" : RailClass(0) == "failed" ? "!" : "1")</div>
-        <div class="stitle">@Model.Phase1Label</div>
-        <div class="sstatus">@(job.Stages.Count > 0 ? FormatStageStatus(job.Stages[0]) : "Pending")</div>
-    </div>
-    <div class="rail-step @RailClass(1)">
-        <div class="line"></div>
-        <div class="dot">@(RailClass(1) == "done" ? "✓" : RailClass(1) == "running" ? "●" : RailClass(1) == "failed" ? "!" : "2")</div>
-        <div class="stitle">@Model.Phase2Label</div>
-        <div class="sstatus">@(job.Stages.Count > 1 ? FormatStageStatus(job.Stages[1]) : "Pending")</div>
-    </div>
-    <div class="rail-step @RailClass(2)">
-        <div class="dot">@(RailClass(2) == "done" ? "✓" : RailClass(2) == "running" ? "●" : RailClass(2) == "failed" ? "!" : "3")</div>
-        <div class="stitle">@Model.Phase3Label</div>
-        <div class="sstatus">@(job.Stages.Count > 2 ? FormatStageStatus(job.Stages[2]) : "Pending")</div>
-    </div>
+    @for (var index = 0; index < Model.PhaseLabels.Count; index++)
+    {
+        var railClass = RailClass(index);
+        var dotText = railClass == "done" ? "OK" :
+            railClass == "running" ? "..." :
+            railClass == "failed" ? "!" :
+            (index + 1).ToString();
+
+        <div class="rail-step @railClass">
+            <div class="line"></div>
+            <div class="dot">@dotText</div>
+            <div class="stitle">@Model.PhaseLabels[index]</div>
+            <div class="sstatus">@(job.Stages.Count > index ? FormatStageStatus(job.Stages[index]) : "Pending")</div>
+        </div>
+    }
 </div>
 
-<!-- Result banners -->
 @if (job.Status == UpgradeJobStatus.Completed)
 {
     <div class="success-banner">
@@ -136,7 +156,7 @@
         else if (job.CanRollBack && !isLatestRollbackable)
         {
             <span class="badge badge-grey" title="Only the most recent upgrade can be rolled back.">
-                Rollback unavailable — newer upgrade exists
+                Rollback unavailable - newer upgrade exists
             </span>
         }
     </div>
@@ -145,8 +165,8 @@ else if (job.Status == UpgradeJobStatus.Failed)
 {
     <div class="fail-banner">
         <div class="txt">
-            <b>Post-upgrade validation found issues.</b>
-            <span>Rolling back restores v@(job.FromVersion) and the backed-up tables.</span>
+            <b>@FailureTitle(failedStage)</b>
+            <span>@FailureMessage(failedStage)</span>
         </div>
         @if (isLatestRollbackable)
         {
@@ -158,7 +178,7 @@ else if (job.Status == UpgradeJobStatus.Failed)
         else
         {
             <span class="badge badge-grey" title="Only the most recent upgrade can be rolled back.">
-                Rollback unavailable — newer upgrade exists
+                Rollback unavailable - newer upgrade exists
             </span>
         }
     </div>
@@ -177,13 +197,12 @@ else if (job.Status == UpgradeJobStatus.Running)
     <div class="banner running">
         <div class="txt">
             <b>Upgrade in progress.</b>
-            <span>Started by @job.InitiatedBy — @(job.CurrentStage != null ? $"currently running: {job.CurrentStage.Name}" : "preparing…")</span>
+            <span>Started by @job.InitiatedBy - @(job.CurrentStage != null ? $"currently running: {job.CurrentStage.Name}" : "preparing...")</span>
         </div>
     </div>
 }
 
-<!-- Stage detail cards -->
-@foreach (var (stage, idx) in job.Stages.Select((s, i) => (s, i)))
+@foreach (var stage in job.Stages)
 {
     var iconCls = StageIconClass(stage.Status);
     var hasBody = stage.Checks.Count > 0 || stage.LogLines.Count > 0;

@@ -1,8 +1,9 @@
 using BoldBI.UpgradeCenter.Services;
-using BoldBI.UpgradeCenter.Services.Stubs;
 using BoldBI.UpgradeCenter.Security;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.HttpOverrides;
+using Legacy = Bold.UpgradeCenter.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -17,10 +18,12 @@ Directory.CreateDirectory(dataProtectionKeysPath);
 
 builder.Services.AddControllersWithViews();
 builder.Services.AddHealthChecks();
+builder.Services.AddHttpContextAccessor();
 builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath))
     .SetApplicationName("BoldBI.UpgradeCenter");
 builder.Services.Configure<UpgradeCenterOptions>(builder.Configuration.GetSection("UpgradeCenter"));
+builder.Services.Configure<Legacy.UpgradeCenterOptions>(builder.Configuration.GetSection("UpgradeCenter"));
 builder.Services.AddHttpClient(IdpConfigurationProvider.HttpClientName, client =>
 {
     client.Timeout = TimeSpan.FromSeconds(10);
@@ -52,13 +55,52 @@ builder.Services
         UpgradeCenterAuthenticationDefaults.Scheme,
         _ => { });
 
-// Upgrade Center services — swap Stub* implementations for real ones when ready
-builder.Services.AddSingleton<IUpgradeJobStore,                    StubUpgradeJobStore>();
-builder.Services.AddScoped<IInstallationInfoProvider,              ProductVersionInstallationInfoProvider>();
-builder.Services.AddScoped<IUpgradeCenterAuthorizationService,     ClaimsUpgradeCenterAuthorizationService>();
-builder.Services.AddScoped<IUpgradeService,                        StubUpgradeService>();
+// Real Upgrade Center backend workflow reused from the validated Upgrade Center implementation.
+builder.Services.AddHttpClient(Legacy.IdpPrivateKeyProvider.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+builder.Services.AddHttpClient<Legacy.IUpgradeDatabaseScriptImpactService, Legacy.UpgradeDatabaseScriptImpactService>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.AddHttpClient<Legacy.IKubernetesUpgradeService, Legacy.KubernetesUpgradeService>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.Configure<Legacy.PlaywrightExecutionOptions>(builder.Configuration.GetSection("UpgradeCenter:Playwright"));
+builder.Services.Configure<Legacy.DatabaseBackupOptions>(builder.Configuration.GetSection("UpgradeCenter:DatabaseBackup"));
+builder.Services.Configure<Legacy.KubernetesUpgradeOptions>(builder.Configuration.GetSection("UpgradeCenter:Kubernetes"));
+builder.Services.AddSingleton<Legacy.IUpgradeCenterConfigurationProvider, LegacyConfigurationProviderAdapter>();
+builder.Services.AddSingleton<Legacy.IProductVersionProvider, LegacyProductVersionProviderAdapter>();
+builder.Services.AddSingleton<Legacy.IReleaseVersionProvider, LegacyReleaseVersionProviderAdapter>();
+builder.Services.AddSingleton<Legacy.IIdpPrivateKeyProvider, Legacy.IdpPrivateKeyProvider>();
+builder.Services.AddSingleton<Legacy.IBoldConnectionStringDecryptor, Legacy.BoldConnectionStringDecryptor>();
+builder.Services.AddScoped<Legacy.IUpgradeDatabaseDiscoveryService, Legacy.UpgradeDatabaseDiscoveryService>();
+builder.Services.AddScoped<Legacy.IUpgradeUserContextProvider, Legacy.UpgradeUserContextProvider>();
+builder.Services.AddScoped<Legacy.IPlaywrightScriptRunner, Legacy.PlaywrightScriptRunner>();
+builder.Services.AddSingleton<Legacy.IUpgradeOperationalStateStore, Legacy.DatabaseUpgradeOperationalStateStore>();
+builder.Services.AddSingleton<Legacy.IUpgradeRollbackStore, Legacy.InMemoryUpgradeRollbackStore>();
+builder.Services.AddSingleton<Legacy.IUpgradeJobStore, Legacy.InMemoryUpgradeJobStore>();
+builder.Services.AddSingleton<Legacy.IUpgradeJobRunner, Legacy.UpgradeJobRunner>();
+builder.Services.AddSingleton<Legacy.IUpgradeRollbackJobRunner, Legacy.UpgradeRollbackJobRunner>();
+builder.Services.AddHostedService<Legacy.UpgradeJobRecoveryService>();
+builder.Services.AddScoped<Legacy.IUpgradeHistoryStore, Legacy.DatabaseUpgradeHistoryStore>();
+builder.Services.AddScoped<Legacy.ICustomPatchValidationService, Legacy.CustomPatchValidationService>();
+builder.Services.AddScoped<Legacy.IUpgradeDatabaseBackupService, Legacy.UpgradeDatabaseBackupService>();
+builder.Services.AddScoped<Legacy.IUpgradeImpactService, Legacy.UpgradeImpactService>();
+
+builder.Services.AddSingleton<IUpgradeJobStore, LegacyUpgradeJobStoreAdapter>();
+builder.Services.AddScoped<IInstallationInfoProvider, ProductVersionInstallationInfoProvider>();
+builder.Services.AddScoped<IUpgradeCenterAuthorizationService, ClaimsUpgradeCenterAuthorizationService>();
+builder.Services.AddScoped<IUpgradeService, LegacyUpgradeServiceAdapter>();
 
 var app = builder.Build();
+
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedHost | ForwardedHeaders.XForwardedProto
+});
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())

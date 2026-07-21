@@ -7,6 +7,7 @@ using BoldBI.UpgradeCenter.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
+using Legacy = Bold.UpgradeCenter.Services;
 
 namespace BoldBI.UpgradeCenter.Controllers
 {
@@ -24,6 +25,7 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IInstallationInfoProvider _installationInfo;
         private readonly IUpgradeCenterAuthorizationService _authService;
         private readonly IUpgradeCenterConfigurationProvider _configurationProvider;
+        private readonly Legacy.IUpgradeImpactService _upgradeImpactService;
         private readonly IOptions<UpgradeCenterOptions> _options;
 
         public UpgradeCenterController(
@@ -32,6 +34,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             IInstallationInfoProvider installationInfo,
             IUpgradeCenterAuthorizationService authService,
             IUpgradeCenterConfigurationProvider configurationProvider,
+            Legacy.IUpgradeImpactService upgradeImpactService,
             IOptions<UpgradeCenterOptions> options)
         {
             _upgradeService  = upgradeService;
@@ -39,6 +42,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             _installationInfo = installationInfo;
             _authService     = authService;
             _configurationProvider = configurationProvider;
+            _upgradeImpactService = upgradeImpactService;
             _options = options;
         }
 
@@ -135,16 +139,30 @@ namespace BoldBI.UpgradeCenter.Controllers
                 release = releases.Find(r => r.Version == version);
             }
 
+            var targetVersion = release?.Version ?? version ?? imageRef ?? "—";
+            Legacy.UpgradeImpactResult? impact = null;
+            if (string.IsNullOrWhiteSpace(imageRef) &&
+                !string.IsNullOrWhiteSpace(targetVersion) &&
+                targetVersion != "—")
+            {
+                impact = await _upgradeImpactService.GetImpactAsync(targetVersion, HttpContext.RequestAborted);
+            }
+
             var vm = new ConfirmUpgradeViewModel
             {
                 CurrentUser          = user,
                 FromVersion          = installation.InstalledVersion,
-                ToVersion            = release?.Version ?? version ?? imageRef ?? "—",
-                HasSchemaChanges     = release?.HasSchemaChanges ?? false,
+                ToVersion            = targetVersion,
+                HasSchemaChanges     = impact?.DatabaseSchemaChangesExpected ?? release?.HasSchemaChanges ?? false,
                 CustomImageReference = imageRef,
                 ReleaseType          = string.IsNullOrWhiteSpace(imageRef)
                                            ? ReleaseType.Standard
-                                           : ReleaseType.CustomPatch
+                                           : ReleaseType.CustomPatch,
+                SchemaImpactKnown    = impact?.SchemaImpactKnown ?? false,
+                AffectedTableCount   = impact?.AffectedTableCount ?? 0,
+                AffectedTables       = impact?.AffectedTables ?? Array.Empty<string>(),
+                DatabaseTypes        = impact?.DatabaseTypes ?? Array.Empty<string>(),
+                Warnings             = impact?.Warnings ?? Array.Empty<string>()
             };
 
             return View("Confirm", vm);

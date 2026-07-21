@@ -22,5 +22,15 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
         public string? CustomImageReference { get; set; }
 
         public ReleaseType ReleaseType { get; set; } = ReleaseType.Standard;
+
+        public bool SchemaImpactKnown { get; set; }
+
+        public int AffectedTableCount { get; set; }
+
+        public IReadOnlyList<string> AffectedTables { get; set; } = Array.Empty<string>();
+
+        public IReadOnlyList<string> DatabaseTypes { get; set; } = Array.Empty<string>();
+
+        public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
     }
 }

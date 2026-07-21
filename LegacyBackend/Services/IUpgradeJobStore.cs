@@ -1,0 +1,46 @@
+namespace Bold.UpgradeCenter.Services;
+
+public interface IUpgradeJobStore
+{
+    UpgradeJob Create(
+        string currentVersion,
+        string targetVersion,
+        UpgradeJobType upgradeType,
+        IReadOnlyList<string> selectedDeployments,
+        IReadOnlyList<CustomPatchImageMapping>? customImages = null,
+        UpgradeUserInfo? initiatedBy = null);
+
+    UpgradeJob CreateRollback(
+        string currentVersion,
+        string targetVersion,
+        IReadOnlyList<string> selectedDeployments,
+        UpgradeUserInfo? initiatedBy = null);
+
+    bool TryGet(string jobId, out UpgradeJob job);
+
+    bool TryGetLatestActive(out UpgradeJob job);
+
+    void MarkRunning(string jobId);
+
+    void MarkStageRunning(string jobId, UpgradeJobStageName stageName, string? message = null);
+
+    void MarkStageSucceeded(string jobId, UpgradeJobStageName stageName, string? message = null);
+
+    void MarkStageSkipped(string jobId, UpgradeJobStageName stageName, string? message = null);
+
+    void MarkStageFailed(string jobId, UpgradeJobStageName stageName, string safeErrorDetails);
+
+    void ReplaceStageOperations(string jobId, UpgradeJobStageName stageName, IReadOnlyList<UpgradeJobOperation> operations);
+
+    void MarkOperationRunning(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null);
+
+    void MarkOperationSucceeded(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null);
+
+    void MarkOperationSkipped(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null);
+
+    void MarkOperationFailed(string jobId, UpgradeJobStageName stageName, string operationId, string safeErrorDetails);
+
+    void MarkRollbackAvailable(string jobId, string rollbackId);
+
+    void Complete(string jobId, UpgradeJobStatus status, string? safeErrorDetails = null);
+}

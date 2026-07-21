@@ -7,25 +7,22 @@
     Layout = "~/Views/Shared/_Layout.cshtml";
 }
 
-<!-- Top bar -->
 <partial name="_Topbar" model="@Model.CurrentUser" />
 
-<!-- The confirm dialog is rendered as an overlay on a blurred background page -->
 <div class="modal-scrim">
     <div class="modal-card">
         <h2>Confirm upgrade</h2>
         <p class="sub">
             Review the details below before starting.
-            You'll be able to monitor every step once it begins.
+            You can monitor every step once the upgrade begins.
         </p>
 
-        <!-- Version swap row -->
         <div class="swap-row">
             <div class="swap-item">
                 <div class="t">From</div>
                 <div class="v">v@(Model.FromVersion)</div>
             </div>
-            <div class="swap-arrow">→</div>
+            <div class="swap-arrow">to</div>
             <div class="swap-item">
                 <div class="t">To</div>
                 <div class="v">
@@ -41,20 +38,73 @@
             </div>
         </div>
 
-        <!-- Schema-change notice -->
-        @if (Model.HasSchemaChanges)
+        @if (Model.ReleaseType == ReleaseType.Standard)
         {
             <div class="modal-note">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="flex-shrink:0;margin-top:1px">
                     <circle cx="8" cy="8" r="7" stroke="#2452B8" stroke-width="1.5"/>
                     <path d="M8 5v4M8 11v.5" stroke="#2452B8" stroke-width="1.5" stroke-linecap="round"/>
                 </svg>
-                This release includes schema changes. Affected tables will be backed up automatically
-                before anything is applied — no manual steps required.
+                <div>
+                    <strong>Database schema impact</strong>
+                    @if (!Model.SchemaImpactKnown)
+                    {
+                        <div>Unable to determine the complete database impact before confirmation. The backup stage will validate this again before making upgrade changes.</div>
+                    }
+                    else if (Model.HasSchemaChanges)
+                    {
+                        <div>
+                            @Model.AffectedTableCount affected table(s) identified
+                            @if (Model.DatabaseTypes.Count > 0)
+                            {
+                                <span> for @string.Join(", ", Model.DatabaseTypes)</span>
+                            }
+                            .
+                        </div>
+                    }
+                    else
+                    {
+                        <div>No database schema changes were reported for this upgrade range.</div>
+                    }
+                </div>
             </div>
         }
 
-        <!-- Custom patch image reference display -->
+        @if (Model.AffectedTableCount > 0)
+        {
+            <div class="affected-table-box">
+                <div class="affected-table-head">
+                    <strong>Affected tables</strong>
+                    <span>@Model.AffectedTableCount total</span>
+                </div>
+                <ul>
+                    @foreach (var table in Model.AffectedTables)
+                    {
+                        <li>@table</li>
+                    }
+                </ul>
+                @if (Model.AffectedTableCount > Model.AffectedTables.Count)
+                {
+                    <div class="affected-table-more">
+                        Showing @Model.AffectedTables.Count of @Model.AffectedTableCount table(s). The full set is used by the backend backup workflow.
+                    </div>
+                }
+            </div>
+        }
+
+        @if (Model.Warnings.Count > 0)
+        {
+            <div class="warning-list">
+                <strong>Before this starts</strong>
+                <ul>
+                    @foreach (var warning in Model.Warnings)
+                    {
+                        <li>@warning</li>
+                    }
+                </ul>
+            </div>
+        }
+
         @if (Model.ReleaseType == ReleaseType.CustomPatch && !string.IsNullOrWhiteSpace(Model.CustomImageReference))
         {
             <div class="modal-note" style="background:var(--amber-100);">
@@ -66,7 +116,6 @@
             </div>
         }
 
-        <!-- Actions -->
         <div class="modal-actions">
             <a class="btn btn-secondary"
                href="@Url.Action("Index", "UpgradeCenter")">
@@ -78,9 +127,9 @@
                   asp-action="StartUpgrade"
                   style="display:inline">
                 @Html.AntiForgeryToken()
-                <input type="hidden" name="version"  value="@Model.ToVersion" />
+                <input type="hidden" name="version" value="@Model.ToVersion" />
                 <input type="hidden" name="imageRef" value="@Model.CustomImageReference" />
-                <button type="submit" class="btn btn-primary">Start upgrade →</button>
+                <button type="submit" class="btn btn-primary">Start upgrade</button>
             </form>
         </div>
     </div>
