@@ -2,7 +2,9 @@ using System;
 using System.Threading.Tasks;
 using BoldBI.UpgradeCenter.Models;
 using BoldBI.UpgradeCenter.Models.ViewModels;
+using BoldBI.UpgradeCenter.Security;
 using BoldBI.UpgradeCenter.Services;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
 namespace BoldBI.UpgradeCenter.Controllers
@@ -12,6 +14,7 @@ namespace BoldBI.UpgradeCenter.Controllers
     ///
     /// Route prefix: /upgrade-center
     /// </summary>
+    [Authorize(Policy = UpgradeCenterPolicies.AdminOnly)]
     [Route("upgrade-center")]
     public class UpgradeCenterController : Controller
     {
@@ -19,17 +22,20 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IUpgradeJobStore _jobStore;
         private readonly IInstallationInfoProvider _installationInfo;
         private readonly IUpgradeCenterAuthorizationService _authService;
+        private readonly IUpgradeCenterConfigurationProvider _configurationProvider;
 
         public UpgradeCenterController(
             IUpgradeService upgradeService,
             IUpgradeJobStore jobStore,
             IInstallationInfoProvider installationInfo,
-            IUpgradeCenterAuthorizationService authService)
+            IUpgradeCenterAuthorizationService authService,
+            IUpgradeCenterConfigurationProvider configurationProvider)
         {
             _upgradeService  = upgradeService;
             _jobStore        = jobStore;
             _installationInfo = installationInfo;
             _authService     = authService;
+            _configurationProvider = configurationProvider;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -68,6 +74,19 @@ namespace BoldBI.UpgradeCenter.Controllers
             }
 
             return View("Dashboard", vm);
+        }
+
+        [AllowAnonymous]
+        [HttpGet("unauthorized")]
+        public async Task<IActionResult> UnauthorizedPage()
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            var runtimeConfiguration = await _configurationProvider.GetConfigurationAsync(HttpContext.RequestAborted);
+            ViewData["ReturnToBoldBiUrl"] = string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl)
+                ? "/"
+                : runtimeConfiguration.IdpBaseUrl;
+
+            return View("Unauthorized", user);
         }
 
         // ─────────────────────────────────────────────────────────────────────

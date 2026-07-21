@@ -8,7 +8,7 @@
 
 <div class="product-topbar">
     <div class="brand">
-        <div class="mark">B</div>
+        <img class="brand-logo" src="~/upgrade-center/images/main_logo.svg" asp-append-version="true" alt="Bold BI" />
         <div class="name">Bold BI</div>
         <div class="crumb">Upgrade Center</div>
     </div>
@@ -32,6 +32,6 @@
             The Upgrade Center is available to Bold BI administrators only.
             If you believe you should have access, contact your UMS administrator.
         </p>
-        <a href="/" class="btn btn-primary">Return to Bold BI</a>
+        <a href="@(ViewData["ReturnToBoldBiUrl"] as string ?? "/")" class="btn btn-primary">Return to Bold BI</a>
     </div>
 </div>

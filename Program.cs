@@ -1,5 +1,7 @@
 using BoldBI.UpgradeCenter.Services;
 using BoldBI.UpgradeCenter.Services.Stubs;
+using BoldBI.UpgradeCenter.Security;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.DataProtection;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -18,11 +20,33 @@ builder.Services.AddHealthChecks();
 builder.Services.AddDataProtection()
     .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath))
     .SetApplicationName("BoldBI.UpgradeCenter");
+builder.Services.Configure<UpgradeCenterOptions>(builder.Configuration.GetSection("UpgradeCenter"));
+builder.Services.AddHttpClient(IdpConfigurationProvider.HttpClientName, client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+builder.Services.AddHttpClient(RemoteUmsAuthenticationHandler.HttpClientName)
+    .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddSingleton<IUpgradeCenterConfigurationProvider, IdpConfigurationProvider>();
+builder.Services.AddSingleton<IAdminContinuationStore, InMemoryAdminContinuationStore>();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy(UpgradeCenterPolicies.AdminOnly, policy =>
+    {
+        policy.RequireAuthenticatedUser();
+        policy.RequireClaim(UpgradeCenterClaimTypes.IsAdmin, "true");
+    });
+});
+builder.Services
+    .AddAuthentication(UpgradeCenterAuthenticationDefaults.Scheme)
+    .AddScheme<AuthenticationSchemeOptions, RemoteUmsAuthenticationHandler>(
+        UpgradeCenterAuthenticationDefaults.Scheme,
+        _ => { });
 
 // Upgrade Center services — swap Stub* implementations for real ones when ready
 builder.Services.AddSingleton<IUpgradeJobStore,                    StubUpgradeJobStore>();
 builder.Services.AddScoped<IInstallationInfoProvider,              StubInstallationInfoProvider>();
-builder.Services.AddScoped<IUpgradeCenterAuthorizationService,     StubUpgradeCenterAuthorizationService>();
+builder.Services.AddScoped<IUpgradeCenterAuthorizationService,     ClaimsUpgradeCenterAuthorizationService>();
 builder.Services.AddScoped<IUpgradeService,                        StubUpgradeService>();
 
 var app = builder.Build();
@@ -43,6 +67,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 app.UseRouting();
 
+app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapStaticAssets();
