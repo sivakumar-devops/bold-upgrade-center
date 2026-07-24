@@ -127,6 +127,7 @@ namespace BoldBI.UpgradeCenter.Models
         public TimeSpan? Duration { get; set; }
         public List<StageCheckResult> Checks { get; set; } = new();
         public List<string> LogLines { get; set; } = new();
+        public string? HtmlReportUrl { get; set; }
     }
 
     /// <summary>
@@ -157,6 +158,12 @@ namespace BoldBI.UpgradeCenter.Models
         /// or revert deployment → restore schema → verify health for rollback).
         /// </summary>
         public List<JobStage> Stages { get; set; } = new();
+
+        /// <summary>
+        /// Safe, customer-viewable operation log assembled from persisted job
+        /// stages and operation messages. Sensitive values must never be added.
+        /// </summary>
+        public List<string> CompleteLogLines { get; set; } = new();
 
         /// <summary>
         /// Set when this job is a rollback; references the original upgrade job id.

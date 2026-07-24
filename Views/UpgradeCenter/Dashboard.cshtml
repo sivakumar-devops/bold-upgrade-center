@@ -76,76 +76,86 @@
 
     <!-- ── Tab: Available releases ────────────────────────────── -->
     <div class="tabpanel active" id="t-releases">
-        <div class="card">
-            <table class="release-table">
-                <thead>
-                    <tr>
-                        <th>Version</th>
-                        <th>Released</th>
-                        <th>Release notes</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @foreach (var release in Model.AvailableReleases)
-                    {
-                        <tr class="@(release.IsRecommendedNext ? "recommended" : "")">
-                            <td>
-                                <div class="ver-cell">
-                                    <span class="v">v@(release.Version)</span>
+        @if (Model.AvailableReleases.Count == 0)
+        {
+            <div class="card card-pad empty-state">
+                <h2>You are already using the latest version.</h2>
+                <p>No newer versions are available.</p>
+            </div>
+        }
+        else
+        {
+            <div class="card">
+                <table class="release-table">
+                    <thead>
+                        <tr>
+                            <th>Version</th>
+                            <th>Released</th>
+                            <th>Release notes</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var release in Model.AvailableReleases)
+                        {
+                            <tr class="@(release.IsRecommendedNext ? "recommended" : "")">
+                                <td>
+                                    <div class="ver-cell">
+                                        <span class="v">v@(release.Version)</span>
+                                        @if (release.IsRecommendedNext)
+                                        {
+                                            <span class="badge badge-blue">Recommended next</span>
+                                        }
+                                        @if (release.RequiresIntermediateUpgrade)
+                                        {
+                                            <span class="badge badge-grey">@release.UpgradePathNote</span>
+                                        }
+                                    </div>
                                     @if (release.IsRecommendedNext)
                                     {
-                                        <span class="badge badge-blue">Recommended next</span>
+                                        <div class="path-note">Direct upgrade from your current version</div>
                                     }
+                                    @if (release.RequiresIntermediateUpgrade && !string.IsNullOrWhiteSpace(release.UpgradePathNote))
+                                    {
+                                        <div class="path-note">Not a direct upgrade path from v@(Model.Installation.InstalledVersion)</div>
+                                    }
+                                </td>
+                                <td>@release.ReleasedOn.ToString("dd MMM yyyy")</td>
+                                <td>
+                                    @if (!string.IsNullOrWhiteSpace(release.ReleaseNotesUrl))
+                                    {
+                                        <a class="notes-link" href="@release.ReleaseNotesUrl" target="_blank" rel="noopener">Release notes ↗</a>
+                                    }
+                                </td>
+                                <td>
                                     @if (release.RequiresIntermediateUpgrade)
                                     {
-                                        <span class="badge badge-grey">@release.UpgradePathNote</span>
+                                        <button class="btn btn-secondary" disabled
+                                                title="@release.UpgradePathNote">
+                                            Upgrade
+                                        </button>
                                     }
-                                </div>
-                                @if (release.IsRecommendedNext)
-                                {
-                                    <div class="path-note">Direct upgrade from your current version</div>
-                                }
-                                @if (release.RequiresIntermediateUpgrade && !string.IsNullOrWhiteSpace(release.UpgradePathNote))
-                                {
-                                    <div class="path-note">Not a direct upgrade path from v@(Model.Installation.InstalledVersion)</div>
-                                }
-                            </td>
-                            <td>@release.ReleasedOn.ToString("dd MMM yyyy")</td>
-                            <td>
-                                @if (!string.IsNullOrWhiteSpace(release.ReleaseNotesUrl))
-                                {
-                                    <a class="notes-link" href="@release.ReleaseNotesUrl" target="_blank" rel="noopener">Release notes ↗</a>
-                                }
-                            </td>
-                            <td>
-                                @if (release.RequiresIntermediateUpgrade)
-                                {
-                                    <button class="btn btn-secondary" disabled
-                                            title="@release.UpgradePathNote">
-                                        Upgrade
-                                    </button>
-                                }
-                                else if (Model.HasActiveJob)
-                                {
-                                    <button class="btn btn-secondary" disabled
-                                            title="Another upgrade or rollback is currently in progress.">
-                                        Upgrade
-                                    </button>
-                                }
-                                else
-                                {
-                                    <a class="btn btn-primary"
-                                       href="@Url.Action("Confirm", "UpgradeCenter", new { version = release.Version })">
-                                        Upgrade
-                                    </a>
-                                }
-                            </td>
-                        </tr>
-                    }
-                </tbody>
-            </table>
-        </div>
+                                    else if (Model.HasActiveJob)
+                                    {
+                                        <button class="btn btn-secondary" disabled
+                                                title="Another upgrade or rollback is currently in progress.">
+                                            Upgrade
+                                        </button>
+                                    }
+                                    else
+                                    {
+                                        <a class="btn btn-primary"
+                                           href="@Url.Action("Confirm", "UpgradeCenter", new { version = release.Version })">
+                                            Upgrade
+                                        </a>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
     </div>
 
     <!-- ── Tab: Custom patch ──────────────────────────────────── -->
@@ -241,19 +251,25 @@
                                    href="@Url.Action("Monitor", "UpgradeCenter", new { jobId = entry.JobId })">
                                     Open
                                 </a>
-                                <form method="post"
-                                      asp-controller="UpgradeCenter"
-                                      asp-action="Rollback"
-                                      asp-route-jobId="@entry.JobId"
-                                      style="display:inline">
-                                    @Html.AntiForgeryToken()
-                                    <button type="submit" class="btn btn-secondary"
+                                @if (Model.HasActiveJob)
+                                {
+                                    <button type="button"
+                                            class="btn btn-secondary"
                                             style="font-size:12px; padding:5px 10px;"
-                                            @if (Model.HasActiveJob) { <text>disabled title="Another upgrade or rollback is currently in progress."</text> }
-                                            title="Roll back to the previous version">
+                                            disabled
+                                            title="Another upgrade or rollback is currently in progress.">
                                         Roll back
                                     </button>
-                                </form>
+                                }
+                                else
+                                {
+                                    <a class="btn btn-secondary"
+                                       style="font-size:12px; padding:5px 10px;"
+                                       href="@Url.Action("ConfirmRollback", "UpgradeCenter", new { jobId = entry.JobId })"
+                                       title="Roll back to the previous version">
+                                        Roll back
+                                    </a>
+                                }
                             }
                             else if (entry.Status == UpgradeJobStatus.Completed)
                             {

@@ -194,6 +194,32 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         return false;
     }
 
+    public bool TryGetLatest(out UpgradeJob job)
+    {
+        lock (syncRoot)
+        {
+            var latestJob = jobs.Values
+                .OrderByDescending(item => item.StartedAt)
+                .FirstOrDefault();
+
+            if (latestJob is not null)
+            {
+                job = Clone(latestJob);
+                return true;
+            }
+        }
+
+        if (operationalStateStore.TryGetLatestJob(out var persistedJob))
+        {
+            jobs[persistedJob.Id] = Clone(persistedJob);
+            job = Clone(persistedJob);
+            return true;
+        }
+
+        job = null!;
+        return false;
+    }
+
     public void MarkRunning(string jobId)
     {
         Update(jobId, job =>
@@ -399,8 +425,16 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         return new UpgradeJobOperation
         {
             Id = id,
-            Name = name
+            Name = string.Equals(id, name, StringComparison.OrdinalIgnoreCase) ? CreateDisplayName(id) : name
         };
+    }
+
+    private static string CreateDisplayName(string id)
+    {
+        var words = id.Replace("-", " ", StringComparison.Ordinal).Replace("_", " ", StringComparison.Ordinal);
+        return string.IsNullOrWhiteSpace(words)
+            ? id
+            : char.ToUpperInvariant(words[0]) + words[1..];
     }
 
     public static string KubernetesRollbackImageOperationId(string deploymentName)

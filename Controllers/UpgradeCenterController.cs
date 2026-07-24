@@ -28,6 +28,7 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IUpgradeImpactService _upgradeImpactService;
         private readonly IUpgradeHistoryStore _historyStore;
         private readonly IUpgradeRollbackStore _rollbackStore;
+        private readonly IPlaywrightReportStore _playwrightReportStore;
         private readonly IOptions<UpgradeCenterOptions> _options;
 
         public UpgradeCenterController(
@@ -39,6 +40,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             IUpgradeImpactService upgradeImpactService,
             IUpgradeHistoryStore historyStore,
             IUpgradeRollbackStore rollbackStore,
+            IPlaywrightReportStore playwrightReportStore,
             IOptions<UpgradeCenterOptions> options)
         {
             _upgradeService  = upgradeService;
@@ -49,6 +51,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             _upgradeImpactService = upgradeImpactService;
             _historyStore = historyStore;
             _rollbackStore = rollbackStore;
+            _playwrightReportStore = playwrightReportStore;
             _options = options;
         }
 
@@ -239,6 +242,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound($"Job '{jobId}' not found.");
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
+            ApplyPlaywrightReportLinks(job);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return View("Monitor", vm);
@@ -258,9 +262,96 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound();
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
+            ApplyPlaywrightReportLinks(job);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return PartialView("_MonitoringContent", vm);
+        }
+
+        [HttpGet("reports/{jobId}/{stage}/html")]
+        public async Task<IActionResult> PlaywrightHtmlReport(string jobId, string stage)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return Forbid();
+
+            if (!_jobStore.TryGet(jobId, out _))
+            {
+                return NotFound();
+            }
+
+            if (!TryParsePlaywrightStage(stage, out var mode))
+            {
+                return NotFound();
+            }
+
+            if (!_playwrightReportStore.TryOpenRead(jobId, mode, out var stream) || stream is null)
+            {
+                return NotFound();
+            }
+
+            Response.Headers["X-Content-Type-Options"] = "nosniff";
+            return File(stream, "text/html; charset=utf-8");
+        }
+
+        [HttpGet("rollback/{jobId}/confirm")]
+        public async Task<IActionResult> ConfirmRollback(string jobId)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return View("Unauthorized", user);
+
+            var activeJob = ResolveActiveJob();
+            if (activeJob != null)
+            {
+                var what = activeJob.IsRollback ? "rollback" : "upgrade";
+                TempData["ErrorMessage"] =
+                    $"An {what} is already in progress (job {activeJob.JobId}). " +
+                    "Please wait until it finishes before starting a rollback.";
+                return RedirectToAction(nameof(Monitor), new { jobId });
+            }
+
+            var rollbackEntry = _rollbackStore.GetLatest();
+            if (rollbackEntry is null ||
+                !rollbackEntry.CanExecute ||
+                !string.Equals(rollbackEntry.UpgradeJobId, jobId, StringComparison.OrdinalIgnoreCase))
+            {
+                TempData["ErrorMessage"] =
+                    "Rollback is only available for the most recent successful upgrade. " +
+                    "Older versions cannot be rolled back directly.";
+                return RedirectToAction(nameof(Monitor), new { jobId });
+            }
+
+            if (!_jobStore.TryGet(jobId, out var backendJob))
+            {
+                return NotFound($"Job '{jobId}' not found.");
+            }
+
+            var rollbackFromVersion = !string.IsNullOrWhiteSpace(rollbackEntry.TargetVersion)
+                ? rollbackEntry.TargetVersion
+                : backendJob.TargetVersion;
+            var restoreToVersion = !string.IsNullOrWhiteSpace(rollbackEntry.PreviousVersion)
+                ? rollbackEntry.PreviousVersion
+                : backendJob.CurrentVersion;
+
+            var vm = new ConfirmRollbackViewModel
+            {
+                CurrentUser = user,
+                JobId = jobId,
+                RollbackId = rollbackEntry.Id,
+                RollbackFromVersion = FormatVersionValue(rollbackFromVersion),
+                RestoreToVersion = FormatVersionValue(restoreToVersion),
+                RollbackPointCreatedAt = rollbackEntry.CreatedAt.UtcDateTime,
+                BackupDatabaseCount = rollbackEntry.BackupResult.BackupMappings.Count(mapping => mapping.Succeeded),
+                KubernetesImageCount = rollbackEntry.KubernetesResult?.PreviousImages.Count ?? 0,
+                Warnings =
+                [
+                    $"Bold BI will be restored from v{FormatVersionValue(rollbackFromVersion)} to v{FormatVersionValue(restoreToVersion)}.",
+                    "Database tables captured in the rollback point will be restored to their pre-upgrade state.",
+                    "Recorded Kubernetes deployment images will be reverted and rollout health will be validated.",
+                    "Do not stop the Upgrade Center pod while rollback is restoring database tables or deployment images."
+                ]
+            };
+
+            return View("ConfirmRollback", vm);
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -357,6 +448,41 @@ namespace BoldBI.UpgradeCenter.Controllers
             return vm;
         }
 
+        private void ApplyPlaywrightReportLinks(UiUpgradeJob job)
+        {
+            foreach (var stage in job.Stages)
+            {
+                if (string.Equals(stage.Name, "Pre-Upgrade Validation", StringComparison.OrdinalIgnoreCase) &&
+                    _playwrightReportStore.Exists(job.JobId, PlaywrightValidationMode.Pre))
+                {
+                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "pre-upgrade" });
+                }
+                else if (string.Equals(stage.Name, "Post-Upgrade Validation", StringComparison.OrdinalIgnoreCase) &&
+                         _playwrightReportStore.Exists(job.JobId, PlaywrightValidationMode.Post))
+                {
+                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "post-upgrade" });
+                }
+            }
+        }
+
+        private static bool TryParsePlaywrightStage(string stage, out PlaywrightValidationMode mode)
+        {
+            if (string.Equals(stage, "pre-upgrade", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = PlaywrightValidationMode.Pre;
+                return true;
+            }
+
+            if (string.Equals(stage, "post-upgrade", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = PlaywrightValidationMode.Post;
+                return true;
+            }
+
+            mode = PlaywrightValidationMode.Pre;
+            return false;
+        }
+
         /// <summary>
         /// Sets the <c>IsLatestRollbackable</c> flag in ViewData so the
         /// monitoring view can decide whether to render the Rollback button.
@@ -418,6 +544,11 @@ namespace BoldBI.UpgradeCenter.Controllers
         private static string FormatVersion(string? version)
         {
             return string.IsNullOrWhiteSpace(version) ? "Unknown" : $"v{version.TrimStart('v', 'V')}";
+        }
+
+        private static string FormatVersionValue(string? version)
+        {
+            return string.IsNullOrWhiteSpace(version) ? "Unknown" : version.TrimStart('v', 'V');
         }
     }
 }

@@ -9,7 +9,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
     private readonly IUpgradeJobRunner jobRunner;
     private readonly IUpgradeRollbackStore rollbackStore;
     private readonly IUpgradeRollbackJobRunner rollbackJobRunner;
-    private readonly IProductVersionProvider productVersionProvider;
+    private readonly IInstallationInfoProvider installationInfoProvider;
     private readonly IReleaseVersionProvider releaseVersionProvider;
     private readonly IUpgradeHistoryStore historyStore;
     private readonly IUpgradeUserContextProvider userContextProvider;
@@ -20,7 +20,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         IUpgradeJobRunner jobRunner,
         IUpgradeRollbackStore rollbackStore,
         IUpgradeRollbackJobRunner rollbackJobRunner,
-        IProductVersionProvider productVersionProvider,
+        IInstallationInfoProvider installationInfoProvider,
         IReleaseVersionProvider releaseVersionProvider,
         IUpgradeHistoryStore historyStore,
         IUpgradeUserContextProvider userContextProvider,
@@ -30,7 +30,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         this.jobRunner = jobRunner;
         this.rollbackStore = rollbackStore;
         this.rollbackJobRunner = rollbackJobRunner;
-        this.productVersionProvider = productVersionProvider;
+        this.installationInfoProvider = installationInfoProvider;
         this.releaseVersionProvider = releaseVersionProvider;
         this.historyStore = historyStore;
         this.userContextProvider = userContextProvider;
@@ -64,14 +64,14 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         string? imageRepository = null,
         CancellationToken ct = default)
     {
-        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(ct);
         var validation = await customPatchValidationService.ValidateAsync(
             new CustomPatchValidationRequest
             {
                 TargetVersion = patchVersion,
                 ImageRepository = imageRepository
             },
-            currentVersion.Version,
+            currentVersion.InstalledVersion,
             ct);
 
         return new PatchValidationResult
@@ -99,10 +99,10 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
         }
 
-        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(ct);
         var user = userContextProvider.GetCurrentUser();
         var job = jobStore.Create(
-            currentVersion.Version,
+            currentVersion.InstalledVersion,
             targetVersion,
             UpgradeJobType.AvailableRelease,
             ["All applicable Bold BI deployments"],
@@ -125,14 +125,14 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
         }
 
-        var currentVersion = await productVersionProvider.GetCurrentVersionAsync(ct);
+        var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(ct);
         var validation = await customPatchValidationService.ValidateAsync(
             new CustomPatchValidationRequest
             {
                 TargetVersion = patchVersion,
                 ImageRepository = imageRepository
             },
-            currentVersion.Version,
+            currentVersion.InstalledVersion,
             ct);
         if (!validation.IsValid)
         {
@@ -145,7 +145,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             .ToArray();
         var user = userContextProvider.GetCurrentUser();
         var job = jobStore.Create(
-            currentVersion.Version,
+            currentVersion.InstalledVersion,
             validation.TargetVersion,
             UpgradeJobType.CustomVersionOrPatch,
             customImages.Select(image => image.DeploymentName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),

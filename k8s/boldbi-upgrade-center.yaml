@@ -18,6 +18,38 @@ rules:
       - list
       - patch
       - update
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/log
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -39,6 +71,9 @@ data:
   releaseVersionsApiUrl: "https://boldbi-release-api.boldbidemo.com/version/json"
   idpApi: "http://id-api-service:6001/api"
   ums: "http://id-ums-service:6002/ums"
+  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v0.5"
+  playwrightJobTimeoutSeconds: "9000"
+  playwrightPassRateThreshold: "80"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -60,11 +95,15 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: boldbi-upgrade-center
-          image: sivakumar2809/upgrade-center-ui:v0.5
+          image: sivakumar2809/upgrade-center-ui:v1.4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
               name: http
+          envFrom:
+            - secretRef:
+                name: boldbi-upgrade-center-playwright
+                optional: true
           env:
             - name: ASPNETCORE_ENVIRONMENT
               value: "Production"
@@ -87,6 +126,23 @@ spec:
                 configMapKeyRef:
                   name: boldbi-upgrade-center-config
                   key: ums
+            - name: UpgradeCenter__Playwright__UseKubernetesJob
+              value: "true"
+            - name: UpgradeCenter__Playwright__RunnerImage
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightRunnerImage
+            - name: UpgradeCenter__Playwright__JobTimeoutSeconds
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightJobTimeoutSeconds
+            - name: UpgradeCenter__Playwright__PassRateThreshold
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightPassRateThreshold
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

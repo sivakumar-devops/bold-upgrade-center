@@ -4,18 +4,18 @@ public sealed class UpgradeImpactService : IUpgradeImpactService
 {
     private const int MaxDisplayedTables = 20;
 
-    private readonly IProductVersionProvider productVersionProvider;
+    private readonly IInstallationInfoProvider installationInfoProvider;
     private readonly IUpgradeDatabaseDiscoveryService databaseDiscoveryService;
     private readonly IUpgradeDatabaseScriptImpactService scriptImpactService;
     private readonly ILogger<UpgradeImpactService> logger;
 
     public UpgradeImpactService(
-        IProductVersionProvider productVersionProvider,
+        IInstallationInfoProvider installationInfoProvider,
         IUpgradeDatabaseDiscoveryService databaseDiscoveryService,
         IUpgradeDatabaseScriptImpactService scriptImpactService,
         ILogger<UpgradeImpactService> logger)
     {
-        this.productVersionProvider = productVersionProvider;
+        this.installationInfoProvider = installationInfoProvider;
         this.databaseDiscoveryService = databaseDiscoveryService;
         this.scriptImpactService = scriptImpactService;
         this.logger = logger;
@@ -31,7 +31,7 @@ public sealed class UpgradeImpactService : IUpgradeImpactService
 
         try
         {
-            var currentVersion = await productVersionProvider.GetCurrentVersionAsync(cancellationToken);
+            var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(cancellationToken);
             var discoveredDatabases = await databaseDiscoveryService.DiscoverDatabasesAsync(cancellationToken);
             if (discoveredDatabases.Count == 0)
             {
@@ -43,7 +43,7 @@ public sealed class UpgradeImpactService : IUpgradeImpactService
                 .Distinct()
                 .OrderBy(databaseType => databaseType.ToString(), StringComparer.OrdinalIgnoreCase)
                 .ToList();
-            var impact = await scriptImpactService.AnalyzeAsync(currentVersion.Version, selectedVersion, databaseTypes, cancellationToken);
+            var impact = await scriptImpactService.AnalyzeAsync(currentVersion.InstalledVersion, selectedVersion, databaseTypes, cancellationToken);
             if (!impact.Succeeded)
             {
                 return new UpgradeImpactResult(

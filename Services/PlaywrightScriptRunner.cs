@@ -7,15 +7,18 @@ namespace BoldBI.UpgradeCenter.Services;
 public sealed class PlaywrightScriptRunner : IPlaywrightScriptRunner
 {
     private readonly IWebHostEnvironment environment;
+    private readonly IPlaywrightKubernetesJobService kubernetesJobService;
     private readonly ILogger<PlaywrightScriptRunner> logger;
     private readonly PlaywrightExecutionOptions options;
 
     public PlaywrightScriptRunner(
         IWebHostEnvironment environment,
+        IPlaywrightKubernetesJobService kubernetesJobService,
         IOptions<PlaywrightExecutionOptions> options,
         ILogger<PlaywrightScriptRunner> logger)
     {
         this.environment = environment;
+        this.kubernetesJobService = kubernetesJobService;
         this.options = options.Value;
         this.logger = logger;
     }
@@ -28,6 +31,26 @@ public sealed class PlaywrightScriptRunner : IPlaywrightScriptRunner
     public Task<PlaywrightScriptResult> ExecutePostUpgradeAsync(CancellationToken cancellationToken = default)
     {
         return ExecuteAsync(options.PostUpgrade, fallbackName: "Post-upgrade Playwright validation", fallbackArguments: options.Arguments, cancellationToken);
+    }
+
+    public Task<PlaywrightScriptResult> ExecutePreUpgradeAsync(
+        string upgradeJobId,
+        Action<PlaywrightValidationProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return options.UseKubernetesJob
+            ? kubernetesJobService.RunAsync(PlaywrightValidationMode.Pre, upgradeJobId, progress, cancellationToken)
+            : ExecutePreUpgradeAsync(cancellationToken);
+    }
+
+    public Task<PlaywrightScriptResult> ExecutePostUpgradeAsync(
+        string upgradeJobId,
+        Action<PlaywrightValidationProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return options.UseKubernetesJob
+            ? kubernetesJobService.RunAsync(PlaywrightValidationMode.Post, upgradeJobId, progress, cancellationToken)
+            : ExecutePostUpgradeAsync(cancellationToken);
     }
 
     private async Task<PlaywrightScriptResult> ExecuteAsync(

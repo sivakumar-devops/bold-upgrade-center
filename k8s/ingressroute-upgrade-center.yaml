@@ -15,10 +15,10 @@ metadata:
   name: boldbi-upgrade-center-route-template
 spec:
   entryPoints:
-    - web
+    - websecure
   routes:
     - kind: Rule
-      match: PathPrefix(`/upgrade-center`)
+      match: Host(`in-app-upgrade.boldbidemo.com`) && PathPrefix(`/upgrade-center`)
       middlewares:
         - name: body-limit-200m
         - name: boldbi-upgrade-center-trailing-slash
@@ -31,3 +31,5 @@ spec:
             cookie:
               maxAge: 600
               name: bold.k8s.pod.id
+  tls:
+    secretName: bold-tls

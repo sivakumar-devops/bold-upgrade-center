@@ -57,7 +57,10 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Starting pre-upgrade Playwright validation.");
             jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Pre-upgrade Playwright validation started.");
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", "Executing pre-upgrade validation tests.");
-            var preUpgradeResult = await playwrightRunner.ExecutePreUpgradeAsync(cancellationToken);
+            var preUpgradeResult = await playwrightRunner.ExecutePreUpgradeAsync(
+                jobId,
+                progress => UpdatePlaywrightProgress(jobId, UpgradeJobStageName.PreUpgradeValidation, progress),
+                cancellationToken);
             if (!preUpgradeResult.Succeeded)
             {
                 jobStore.MarkOperationFailed(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", Safe(preUpgradeResult.Message));
@@ -262,7 +265,10 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
             jobStore.MarkStageRunning(jobId, UpgradeJobStageName.PostUpgradeValidation, "Running post-upgrade Playwright validation.");
             jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PostUpgradeValidation, "post-validation-wait", "Kubernetes image upgrade completed; starting post-upgrade validation.");
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PostUpgradeValidation, "post-validation-tests", "Executing post-upgrade validation tests.");
-            var postUpgradeResult = await playwrightRunner.ExecutePostUpgradeAsync(cancellationToken);
+            var postUpgradeResult = await playwrightRunner.ExecutePostUpgradeAsync(
+                jobId,
+                progress => UpdatePlaywrightProgress(jobId, UpgradeJobStageName.PostUpgradeValidation, progress),
+                cancellationToken);
             if (postUpgradeResult.Succeeded)
             {
                 jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PostUpgradeValidation, "post-validation-tests", Safe(postUpgradeResult.Message));
@@ -556,7 +562,10 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         jobStore.MarkOperationSucceeded(job.Id, UpgradeJobStageName.PostUpgradeValidation, "post-validation-wait", "Kubernetes rollout recovery completed; starting post-upgrade validation.");
         jobStore.MarkOperationRunning(job.Id, UpgradeJobStageName.PostUpgradeValidation, "post-validation-tests", "Executing post-upgrade validation tests.");
 
-        var postUpgradeResult = await playwrightRunner.ExecutePostUpgradeAsync(cancellationToken);
+        var postUpgradeResult = await playwrightRunner.ExecutePostUpgradeAsync(
+            job.Id,
+            progress => UpdatePlaywrightProgress(job.Id, UpgradeJobStageName.PostUpgradeValidation, progress),
+            cancellationToken);
         if (postUpgradeResult.Succeeded)
         {
             jobStore.MarkOperationSucceeded(job.Id, UpgradeJobStageName.PostUpgradeValidation, "post-validation-tests", Safe(postUpgradeResult.Message));
@@ -998,6 +1007,26 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                 break;
             default:
                 jobStore.MarkOperationRunning(jobId, stageName, operationId, message);
+                break;
+        }
+    }
+
+    private void UpdatePlaywrightProgress(string jobId, UpgradeJobStageName stageName, PlaywrightValidationProgress progress)
+    {
+        var message = Safe(progress.Message);
+        switch (progress.Status)
+        {
+            case UpgradeJobStageStatus.Succeeded:
+                jobStore.MarkOperationSucceeded(jobId, stageName, progress.OperationId, message);
+                break;
+            case UpgradeJobStageStatus.Failed:
+                jobStore.MarkOperationFailed(jobId, stageName, progress.OperationId, message);
+                break;
+            case UpgradeJobStageStatus.Skipped:
+                jobStore.MarkOperationSkipped(jobId, stageName, progress.OperationId, message);
+                break;
+            default:
+                jobStore.MarkOperationRunning(jobId, stageName, progress.OperationId, message);
                 break;
         }
     }

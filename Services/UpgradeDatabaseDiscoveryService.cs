@@ -228,7 +228,7 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
 
     private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadPostgreSqlTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuotePostgreSqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL;";
+        var query = $"SELECT id, connectionstring, databasetype FROM {QuotePostgreSqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND isactive = 1;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -244,7 +244,7 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
 
     private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadSqlServerTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteSqlServerIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL;";
+        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteSqlServerIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -260,7 +260,7 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
 
     private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadMySqlTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteMySqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL;";
+        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteMySqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -276,7 +276,7 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
 
     private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadOracleTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteOracleIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL";
+        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteOracleIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new OracleConnection(connectionString);
         await connection.OpenAsync(cancellationToken);

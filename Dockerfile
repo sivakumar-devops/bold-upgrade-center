@@ -18,25 +18,19 @@ WORKDIR /app
 
 ENV ASPNETCORE_URLS=http://+:8080 \
     ASPNETCORE_FORWARDEDHEADERS_ENABLED=true \
-    DOTNET_RUNNING_IN_CONTAINER=true \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    DOTNET_RUNNING_IN_CONTAINER=true
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        nodejs \
-        npm \
+    && groupadd --system --gid 10001 appgroup \
+    && useradd --system --uid 10001 --gid appgroup --home-dir /app --shell /usr/sbin/nologin appuser \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/publish ./
 
-RUN npm ci --include=dev --ignore-scripts \
-    && npx playwright install --with-deps chromium \
-    && npm cache clean --force \
-    && groupadd --system --gid 10001 appgroup \
-    && useradd --system --uid 10001 --gid appgroup --home-dir /app --shell /usr/sbin/nologin appuser \
-    && mkdir -p /app/App_Data/DataProtectionKeys /tmp/boldbi-upgrade-center /ms-playwright \
-    && chown -R appuser:appgroup /app /tmp/boldbi-upgrade-center /ms-playwright
+RUN mkdir -p /app/App_Data/DataProtectionKeys /tmp/boldbi-upgrade-center \
+    && chown -R appuser:appgroup /app /tmp/boldbi-upgrade-center
 
 USER appuser
 

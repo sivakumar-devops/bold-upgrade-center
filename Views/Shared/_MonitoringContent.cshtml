@@ -148,10 +148,10 @@
         </div>
         @if (job.CanRollBack && isLatestRollbackable)
         {
-            <form method="post" asp-controller="UpgradeCenter" asp-action="Rollback" asp-route-jobId="@job.JobId">
-                @Html.AntiForgeryToken()
-                <button type="submit" class="btn btn-secondary">Roll back this upgrade</button>
-            </form>
+            <a class="btn btn-secondary"
+               href="@Url.Action("ConfirmRollback", "UpgradeCenter", new { jobId = job.JobId })">
+                Roll back this upgrade
+            </a>
         }
         else if (job.CanRollBack && !isLatestRollbackable)
         {
@@ -170,10 +170,10 @@ else if (job.Status == UpgradeJobStatus.Failed)
         </div>
         @if (isLatestRollbackable)
         {
-            <form method="post" asp-controller="UpgradeCenter" asp-action="Rollback" asp-route-jobId="@job.JobId">
-                @Html.AntiForgeryToken()
-                <button type="submit" class="btn btn-danger">Roll back to v@(job.FromVersion)</button>
-            </form>
+            <a class="btn btn-danger"
+               href="@Url.Action("ConfirmRollback", "UpgradeCenter", new { jobId = job.JobId })">
+                Roll back to v@(job.FromVersion)
+            </a>
         }
         else
         {
@@ -208,6 +208,8 @@ else if (job.Status == UpgradeJobStatus.Running)
     var hasProgress = stage.Checks.Count > 0;
     var hasLogs = stage.LogLines.Count > 0;
     var hasDetails = hasProgress || hasLogs;
+    var hasHtmlReport = !string.IsNullOrWhiteSpace(stage.HtmlReportUrl);
+    var detailsKey = $"stage:{job.JobId}:{stage.Name}";
 
     <div class="card stage-card">
         <div class="stage-head">
@@ -240,37 +242,113 @@ else if (job.Status == UpgradeJobStatus.Running)
             <span class="badge @BadgeClass(stage.Status)">@BadgeLabel(stage.Status)</span>
         </div>
 
-        @if (hasDetails)
+        @if (hasHtmlReport || hasDetails)
         {
             <div class="stage-body">
-                <details class="stage-log-details">
-                    <summary>
-                        <span class="summary-open">Hide Details ^</span>
-                        <span class="summary-closed">View Details v</span>
-                    </summary>
+                @if (hasDetails)
+                {
+                    <details class="stage-log-details" data-details-key="@detailsKey">
+                        <summary class="stage-action-row">
+                            <span class="stage-action-left">
+                                @if (hasHtmlReport)
+                                {
+                                    <a class="stage-action-link stage-report-link"
+                                       href="@stage.HtmlReportUrl"
+                                       target="_blank"
+                                       rel="noopener"
+                                       onclick="event.stopPropagation();">
+                                        View HTML Report
+                                    </a>
+                                }
+                            </span>
+                            <span class="stage-action-link stage-action-right">
+                                <span class="summary-open">Hide Details</span>
+                                <span class="summary-closed">View Details</span>
+                            </span>
+                        </summary>
 
-                    @if (hasProgress)
-                    {
-                        <div class="stage-log-heading">Progress Details</div>
-                        <ul class="stage-progress-list">
-                            @foreach (var check in stage.Checks)
+                        <div class="stage-details-content">
+                            @if (hasProgress)
                             {
-                                <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
+                                <div class="stage-log-heading">Progress Details</div>
+                                <ul class="stage-progress-list">
+                                    @foreach (var check in stage.Checks)
+                                    {
+                                        <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
+                                    }
+                                </ul>
                             }
-                        </ul>
-                    }
-                    else if (hasLogs)
-                    {
-                        <div class="stage-log-heading">Detailed Logs</div>
-                        <div class="log-box">
-                            @foreach (var line in stage.LogLines)
+                            else if (hasLogs)
+                            {
+                                <div class="stage-log-heading">Detailed Logs</div>
+                                <div class="log-box">
+                                    @foreach (var line in stage.LogLines)
+                                    {
+                                        @line<br />
+                                    }
+                                </div>
+                            }
+                        </div>
+                    </details>
+                }
+                else if (hasHtmlReport)
+                {
+                    <div class="stage-action-row">
+                        <span class="stage-action-left">
+                            <a class="stage-action-link stage-report-link"
+                               href="@stage.HtmlReportUrl"
+                               target="_blank"
+                               rel="noopener">
+                                View HTML Report
+                            </a>
+                        </span>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+@if (job.CompleteLogLines.Count > 0)
+{
+    <div class="card complete-log-card">
+        <div class="complete-log-head">
+            <div>
+                <div class="stage-name">Complete operation logs</div>
+                <div class="stage-summary">
+                    <span>
+                        Includes database backup/restore, Playwright validation, Kubernetes upgrade/rollback,
+                        warnings, errors, and final operation status.
+                    </span>
+                </div>
+            </div>
+        </div>
+        <div class="stage-body complete-log-body">
+            <details class="stage-log-details complete-log-details" data-details-key="complete:@job.JobId">
+                <summary class="stage-action-row">
+                    <span class="stage-action-left"></span>
+                    <span class="stage-action-link stage-action-right">
+                        <span class="summary-open">Hide Complete Logs</span>
+                        <span class="summary-closed">View Complete Logs</span>
+                    </span>
+                </summary>
+                <div class="stage-details-content">
+                    <div class="stage-log-heading">Detailed Logs</div>
+                    <div class="log-box complete-log-box">
+                        @foreach (var line in job.CompleteLogLines)
+                        {
+                            if (string.IsNullOrWhiteSpace(line))
+                            {
+                                <br />
+                            }
+                            else
                             {
                                 @line<br />
                             }
-                        </div>
-                    }
-                </details>
-            </div>
-        }
+                        }
+                    </div>
+                </div>
+            </details>
+        </div>
     </div>
 }

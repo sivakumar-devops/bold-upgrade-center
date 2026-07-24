@@ -16,6 +16,8 @@ public interface IUpgradeOperationalStateStore
 
     bool TryGetLatestActiveJob(out UpgradeJob job);
 
+    bool TryGetLatestJob(out UpgradeJob job);
+
     void SaveRollback(UpgradeRollbackEntry entry);
 
     bool TryGetRollback(string id, out UpgradeRollbackEntry entry);
@@ -81,6 +83,23 @@ public sealed class DatabaseUpgradeOperationalStateStore : IUpgradeOperationalSt
             .Select(context => JsonSerializer.Deserialize<UpgradeJob>(context.Payload, JsonOptions))
             .OfType<UpgradeJob>()
             .Where(IsActive)
+            .OrderByDescending(item => item.StartedAt)
+            .ToArray();
+        if (jobs.Length == 0)
+        {
+            return false;
+        }
+
+        job = jobs[0];
+        return true;
+    }
+
+    public bool TryGetLatestJob(out UpgradeJob job)
+    {
+        job = null!;
+        var jobs = LoadContexts(ContextTypeJob)
+            .Select(context => JsonSerializer.Deserialize<UpgradeJob>(context.Payload, JsonOptions))
+            .OfType<UpgradeJob>()
             .OrderByDescending(item => item.StartedAt)
             .ToArray();
         if (jobs.Length == 0)

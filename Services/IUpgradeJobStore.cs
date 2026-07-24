@@ -20,6 +20,8 @@ public interface IUpgradeJobStore
 
     bool TryGetLatestActive(out UpgradeJob job);
 
+    bool TryGetLatest(out UpgradeJob job);
+
     void MarkRunning(string jobId);
 
     void MarkStageRunning(string jobId, UpgradeJobStageName stageName, string? message = null);
