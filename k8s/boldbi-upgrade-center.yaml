@@ -71,7 +71,7 @@ data:
   releaseVersionsApiUrl: "https://boldbi-release-api.boldbidemo.com/version/json"
   idpApi: "http://id-api-service:6001/api"
   ums: "http://id-ums-service:6002/ums"
-  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v0.5"
+  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v0.7"
   playwrightJobTimeoutSeconds: "9000"
   playwrightPassRateThreshold: "80"
 ---
@@ -91,11 +91,13 @@ spec:
       labels:
         app.kubernetes.io/name: boldbi-upgrade-center
     spec:
+      imagePullSecrets:
+        - name: dev-imagepull-secret
       serviceAccountName: boldbi-upgrade-center
       automountServiceAccountToken: true
       containers:
         - name: boldbi-upgrade-center
-          image: sivakumar2809/upgrade-center-ui:v1.4
+          image: us-central1-docker.pkg.dev/boldbi-dev-296107/boldbi/bold-upgrade-center:v1.0.180695
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
