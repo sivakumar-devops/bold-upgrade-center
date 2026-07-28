@@ -183,7 +183,25 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             ["BOLDBI_DB_USERNAME"] = Required(databaseValues.Username, "database username"),
             ["BOLDBI_DB_PASSWORD"] = Required(databaseValues.Password, "database password"),
             ["BOLDBI_DB_SSL"] = databaseValues.SslEnabled ? "true" : "false",
-            ["BOLDBI_PLAYWRIGHT_PASS_THRESHOLD"] = passRateThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            ["BOLDBI_PLAYWRIGHT_PASS_THRESHOLD"] = passRateThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["PLAYWRIGHT_PRE_JUNIT_REPORT_PATH"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PreJunitReportPath",
+                playwrightOptions.PreJunitReportPath),
+            ["PLAYWRIGHT_POST_JUNIT_REPORT_PATH"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PostJunitReportPath",
+                playwrightOptions.PostJunitReportPath),
+            ["PLAYWRIGHT_PRE_HTML_REPORT_PATH"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PreHtmlReportPath",
+                playwrightOptions.PreHtmlReportPath),
+            ["PLAYWRIGHT_POST_HTML_REPORT_PATH"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PostHtmlReportPath",
+                playwrightOptions.PostHtmlReportPath),
+            ["PLAYWRIGHT_PRE_HTML_REPORT_DIR"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PreHtmlReportDirectory",
+                playwrightOptions.PreHtmlReportDirectory),
+            ["PLAYWRIGHT_POST_HTML_REPORT_DIR"] = GetConfiguredReportPath(
+                "UpgradeCenter:Playwright:PostHtmlReportDirectory",
+                playwrightOptions.PostHtmlReportDirectory)
         };
 
         AddOptional(values, "BOLDBI_DB_MAINTENANCE");
@@ -219,6 +237,12 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         }
 
         return threshold;
+    }
+
+    private string GetConfiguredReportPath(string key, string configuredValue)
+    {
+        var value = FirstConfiguredValue(configuration[key], configuredValue);
+        return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim();
     }
 
     private void AddOptional(IDictionary<string, string> values, string key)
@@ -428,19 +452,36 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
 
     private string CreateRunnerScript(string mode)
     {
-        var reportPath = string.IsNullOrWhiteSpace(playwrightOptions.ReportPath)
-            ? "/app/test-results/reports.html"
-            : playwrightOptions.ReportPath.Trim();
+        var isPost = string.Equals(mode, "post", StringComparison.OrdinalIgnoreCase);
+        var htmlPathVariable = isPost ? "PLAYWRIGHT_POST_HTML_REPORT_PATH" : "PLAYWRIGHT_PRE_HTML_REPORT_PATH";
+        var htmlDirectoryVariable = isPost ? "PLAYWRIGHT_POST_HTML_REPORT_DIR" : "PLAYWRIGHT_PRE_HTML_REPORT_DIR";
+        var defaultHtmlPath = isPost ? "/app/post-upgrade-test-results/reports.html" : "/app/pre-upgrade-test-results/reports.html";
+        var defaultHtmlDirectory = isPost ? "/app/post-upgrade-test-results" : "/app/pre-upgrade-test-results";
 
         return $$"""
 set +e
 node /app/docker-entrypoint.js {{ShellQuote(mode)}}
 exit_code=$?
-if [ -f {{ShellQuote(reportPath)}} ]; then
+html_path=$(printenv {{ShellQuote(htmlPathVariable)}})
+if [ -z "$html_path" ]; then
+  html_path={{ShellQuote(defaultHtmlPath)}}
+fi
+report_dir=$(printenv {{ShellQuote(htmlDirectoryVariable)}})
+if [ -z "$report_dir" ]; then
+  report_dir={{ShellQuote(defaultHtmlDirectory)}}
+fi
+if [ -d "$report_dir" ]; then
+  echo "{{PlaywrightReportStore.ReportArchiveBeginMarker}}"
+  tar -czf - -C "$report_dir" . | base64 | tr -d '\n'
+  echo
+  echo "{{PlaywrightReportStore.ReportArchiveEndMarker}}"
+elif [ -f "$html_path" ]; then
   echo "{{PlaywrightReportStore.ReportBeginMarker}}"
-  base64 {{ShellQuote(reportPath)}} | tr -d '\n'
+  base64 "$html_path" | tr -d '\n'
   echo
   echo "{{PlaywrightReportStore.ReportEndMarker}}"
+else
+  echo "Playwright HTML report was not found. Mode: {{mode}}. Expected file: $html_path. Expected directory: $report_dir."
 fi
 exit $exit_code
 """;
@@ -792,19 +833,31 @@ exit $exit_code
 
     private static string RemoveEmbeddedReport(string logs)
     {
-        var begin = logs.LastIndexOf(PlaywrightReportStore.ReportBeginMarker, StringComparison.Ordinal);
+        logs = RemoveMarkedBlock(
+            logs,
+            PlaywrightReportStore.ReportArchiveBeginMarker,
+            PlaywrightReportStore.ReportArchiveEndMarker);
+        return RemoveMarkedBlock(
+            logs,
+            PlaywrightReportStore.ReportBeginMarker,
+            PlaywrightReportStore.ReportEndMarker);
+    }
+
+    private static string RemoveMarkedBlock(string logs, string beginMarker, string endMarker)
+    {
+        var begin = logs.LastIndexOf(beginMarker, StringComparison.Ordinal);
         if (begin < 0)
         {
             return logs;
         }
 
-        var end = logs.IndexOf(PlaywrightReportStore.ReportEndMarker, begin, StringComparison.Ordinal);
+        var end = logs.IndexOf(endMarker, begin, StringComparison.Ordinal);
         if (end < 0)
         {
             return logs[..begin];
         }
 
-        end += PlaywrightReportStore.ReportEndMarker.Length;
+        end += endMarker.Length;
         return logs.Remove(begin, end - begin);
     }
 

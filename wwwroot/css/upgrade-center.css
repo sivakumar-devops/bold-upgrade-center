@@ -702,6 +702,7 @@ table.release-table tr.recommended   { background: var(--blue-100); }
 
 .complete-log-box {
     max-height: 420px;
+    overflow-y: auto;
     white-space: pre-wrap;
 }
 

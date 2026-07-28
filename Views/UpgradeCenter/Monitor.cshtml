@@ -26,8 +26,11 @@
     (function () {
         var jobId = '@Model.Job.JobId';
         var pollUrl = '@Url.Action("MonitorStatus", "UpgradeCenter", new { jobId = "__JID__" })'.replace('__JID__', jobId);
+        var logUrl = '@Url.Action("MonitorLogs", "UpgradeCenter", new { jobId = "__JID__" })'.replace('__JID__', jobId);
         var body = document.getElementById('monitoring-body');
         var stopped = @((isLive ? "false" : "true"));
+        var logsStopped = @((isLive ? "false" : "true"));
+        var lastLogSequence = readLastLogSequence();
         var detailsStorageKey = 'upgrade-center:monitor-details:' + jobId;
         var detailsState = readDetailsState();
 
@@ -67,12 +70,47 @@
             });
         }
 
+        function readLastLogSequence() {
+            var logBox = document.getElementById('complete-log-box');
+            if (!logBox) return 0;
+
+            var value = parseInt(logBox.dataset.lastSequence || '0', 10);
+            return Number.isNaN(value) ? 0 : value;
+        }
+
+        function scrollCompleteLogToBottom() {
+            var logBox = document.getElementById('complete-log-box');
+            if (!logBox) return;
+
+            requestAnimationFrame(function () {
+                logBox.scrollTop = logBox.scrollHeight;
+            });
+        }
+
+        function appendLogEntries(entries) {
+            var logBox = document.getElementById('complete-log-box');
+            if (!logBox || !Array.isArray(entries) || entries.length === 0) return;
+
+            entries.forEach(function (entry) {
+                var line = document.createTextNode(entry.line || '');
+                logBox.appendChild(line);
+                logBox.appendChild(document.createElement('br'));
+                lastLogSequence = Math.max(lastLogSequence, Number(entry.sequence || 0));
+            });
+
+            logBox.dataset.lastSequence = String(lastLogSequence);
+            scrollCompleteLogToBottom();
+        }
+
         document.addEventListener('toggle', function (event) {
             var details = event.target;
             if (!details || !details.matches || !details.matches('details[data-details-key]')) return;
 
             detailsState[details.dataset.detailsKey] = details.open;
             saveDetailsState();
+            if (details.open && details.dataset.detailsKey === 'complete:' + jobId) {
+                scrollCompleteLogToBottom();
+            }
         }, true);
 
         function poll() {
@@ -84,6 +122,10 @@
                 .then(function (html) {
                     body.innerHTML = html;
                     restoreDetailsState();
+                    lastLogSequence = readLastLogSequence();
+                    if (detailsState['complete:' + jobId]) {
+                        scrollCompleteLogToBottom();
+                    }
 
                     var terminalStatuses = ['Completed', 'Action required', 'Rolled back'];
                     var jobBadge = body.querySelector('.job-header .badge');
@@ -99,9 +141,35 @@
                 });
         }
 
+        function pollLogs() {
+            if (logsStopped) return;
+
+            fetch(logUrl + '?afterSequence=' + encodeURIComponent(lastLogSequence), {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    appendLogEntries(data.entries);
+                    if (data.isTerminal) {
+                        logsStopped = true;
+                    } else {
+                        setTimeout(pollLogs, 2000);
+                    }
+                })
+                .catch(function () {
+                    setTimeout(pollLogs, 5000);
+                });
+        }
+
         restoreDetailsState();
+        if (detailsState['complete:' + jobId]) {
+            scrollCompleteLogToBottom();
+        }
         if (!stopped) {
             setTimeout(poll, 5000);
+        }
+        if (!logsStopped) {
+            setTimeout(pollLogs, 2000);
         }
     })();
 </script>

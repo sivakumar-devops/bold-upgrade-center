@@ -244,13 +244,17 @@
                         </div>
                         <div style="display:flex; gap:8px; align-items:center;">
                             <span class="badge @statusBadge.Item1">@statusBadge.Item2</span>
-                            @if (isLatestRollbackable)
+                            @if (entry.HasJobContext)
                             {
-                                <a class="btn btn-secondary"
+                                <a class="@(isLatestRollbackable ? "btn btn-secondary" : "btn btn-ghost")"
                                    style="font-size:12px; padding:5px 10px;"
                                    href="@Url.Action("Monitor", "UpgradeCenter", new { jobId = entry.JobId })">
                                     Open
                                 </a>
+                            }
+
+                            @if (isLatestRollbackable)
+                            {
                                 @if (Model.HasActiveJob)
                                 {
                                     <button type="button"
@@ -270,14 +274,6 @@
                                         Roll back
                                     </a>
                                 }
-                            }
-                            else if (entry.Status == UpgradeJobStatus.Completed)
-                            {
-                                <a class="btn btn-ghost"
-                                   style="font-size:12px; padding:5px 10px;"
-                                   href="@Url.Action("Monitor", "UpgradeCenter", new { jobId = entry.JobId })">
-                                    Open
-                                </a>
                             }
                         </div>
                     </div>

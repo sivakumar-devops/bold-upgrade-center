@@ -29,6 +29,7 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IUpgradeHistoryStore _historyStore;
         private readonly IUpgradeRollbackStore _rollbackStore;
         private readonly IPlaywrightReportStore _playwrightReportStore;
+        private readonly IUpgradeOperationLogStore _operationLogStore;
         private readonly IOptions<UpgradeCenterOptions> _options;
 
         public UpgradeCenterController(
@@ -41,6 +42,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             IUpgradeHistoryStore historyStore,
             IUpgradeRollbackStore rollbackStore,
             IPlaywrightReportStore playwrightReportStore,
+            IUpgradeOperationLogStore operationLogStore,
             IOptions<UpgradeCenterOptions> options)
         {
             _upgradeService  = upgradeService;
@@ -52,6 +54,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             _historyStore = historyStore;
             _rollbackStore = rollbackStore;
             _playwrightReportStore = playwrightReportStore;
+            _operationLogStore = operationLogStore;
             _options = options;
         }
 
@@ -243,6 +246,7 @@ namespace BoldBI.UpgradeCenter.Controllers
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             ApplyPlaywrightReportLinks(job);
+            ApplyCompleteOperationLogs(job);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return View("Monitor", vm);
@@ -263,13 +267,38 @@ namespace BoldBI.UpgradeCenter.Controllers
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             ApplyPlaywrightReportLinks(job);
+            ApplyCompleteOperationLogs(job);
             var vm = BuildMonitoringViewModel(user, job);
             await ApplyRollbackEligibilityAsync(job);
             return PartialView("_MonitoringContent", vm);
         }
 
+        [HttpGet("monitor/{jobId}/logs")]
+        public async Task<IActionResult> MonitorLogs(string jobId, [FromQuery] long afterSequence = 0)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return Forbid();
+
+            if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound();
+
+            var entries = _operationLogStore.ListAfter(jobId, afterSequence, 250);
+            return Json(new
+            {
+                isTerminal = backendJob.Status is Services.UpgradeJobStatus.Succeeded
+                    or Services.UpgradeJobStatus.Failed
+                    or Services.UpgradeJobStatus.RollbackSucceeded
+                    or Services.UpgradeJobStatus.RollbackFailed,
+                entries = entries.Select(entry => new
+                {
+                    sequence = entry.Sequence,
+                    line = FormatLogLine(entry)
+                })
+            });
+        }
+
         [HttpGet("reports/{jobId}/{stage}/html")]
-        public async Task<IActionResult> PlaywrightHtmlReport(string jobId, string stage)
+        [HttpGet("reports/{jobId}/{stage}/html/{**assetPath}")]
+        public async Task<IActionResult> PlaywrightHtmlReport(string jobId, string stage, string? assetPath = null)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return Forbid();
@@ -284,13 +313,13 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return NotFound();
             }
 
-            if (!_playwrightReportStore.TryOpenRead(jobId, mode, out var stream) || stream is null)
+            if (!_playwrightReportStore.TryOpenRead(jobId, mode, assetPath, out var stream, out var contentType) || stream is null)
             {
                 return NotFound();
             }
 
             Response.Headers["X-Content-Type-Options"] = "nosniff";
-            return File(stream, "text/html; charset=utf-8");
+            return File(stream, contentType);
         }
 
         [HttpGet("rollback/{jobId}/confirm")]
@@ -455,14 +484,27 @@ namespace BoldBI.UpgradeCenter.Controllers
                 if (string.Equals(stage.Name, "Pre-Upgrade Validation", StringComparison.OrdinalIgnoreCase) &&
                     _playwrightReportStore.Exists(job.JobId, PlaywrightValidationMode.Pre))
                 {
-                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "pre-upgrade" });
+                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "pre-upgrade", assetPath = "report.html" });
                 }
                 else if (string.Equals(stage.Name, "Post-Upgrade Validation", StringComparison.OrdinalIgnoreCase) &&
                          _playwrightReportStore.Exists(job.JobId, PlaywrightValidationMode.Post))
                 {
-                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "post-upgrade" });
+                    stage.HtmlReportUrl = Url.Action(nameof(PlaywrightHtmlReport), "UpgradeCenter", new { jobId = job.JobId, stage = "post-upgrade", assetPath = "report.html" });
                 }
             }
+        }
+
+        private void ApplyCompleteOperationLogs(UiUpgradeJob job)
+        {
+            var entries = _operationLogStore.List(job.JobId, 1000);
+            job.CompleteLogLines = entries.Select(FormatLogLine).ToList();
+            job.CompleteLogSequence = entries.Count == 0 ? 0 : entries.Max(entry => entry.Sequence);
+        }
+
+        private static string FormatLogLine(UpgradeOperationLogEntry entry)
+        {
+            var stage = string.IsNullOrWhiteSpace(entry.Stage) ? "Job" : entry.Stage;
+            return $"[{entry.CreatedAt.UtcDateTime:dd MMM yyyy, HH:mm:ss 'UTC'}] [{entry.Level}] [{stage}] {entry.Message}";
         }
 
         private static bool TryParsePlaywrightStage(string stage, out PlaywrightValidationMode mode)
@@ -536,7 +578,8 @@ namespace BoldBI.UpgradeCenter.Controllers
                         ? record.InitiatedByUserId
                         : record.InitiatedByName,
                     Status = UpgradeJobViewModelMapper.ToViewModelStatus(record.Status, record.OperationType),
-                    CompletedAt = (record.CompletedAt ?? record.StartedAt).UtcDateTime
+                    CompletedAt = (record.CompletedAt ?? record.StartedAt).UtcDateTime,
+                    HasJobContext = _jobStore.TryGet(record.JobId, out _)
                 })
                 .ToList();
         }

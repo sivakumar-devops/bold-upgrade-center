@@ -7,4 +7,6 @@ public interface IPlaywrightReportStore
     bool Exists(string jobId, PlaywrightValidationMode mode);
 
     bool TryOpenRead(string jobId, PlaywrightValidationMode mode, out Stream? stream);
+
+    bool TryOpenRead(string jobId, PlaywrightValidationMode mode, string? relativePath, out Stream? stream, out string contentType);
 }

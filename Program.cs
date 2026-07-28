@@ -81,6 +81,7 @@ builder.Services.AddScoped<IPlaywrightKubernetesJobService, PlaywrightKubernetes
 builder.Services.AddScoped<IPlaywrightScriptRunner, PlaywrightScriptRunner>();
 builder.Services.AddSingleton<IPlaywrightReportStore, PlaywrightReportStore>();
 builder.Services.AddSingleton<IUpgradeOperationalStateStore, DatabaseUpgradeOperationalStateStore>();
+builder.Services.AddSingleton<IUpgradeOperationLogStore, DatabaseUpgradeOperationLogStore>();
 builder.Services.AddSingleton<IUpgradeRollbackStore, InMemoryUpgradeRollbackStore>();
 builder.Services.AddSingleton<IUpgradeJobStore, InMemoryUpgradeJobStore>();
 builder.Services.AddSingleton<IUpgradeJobRunner, UpgradeJobRunner>();

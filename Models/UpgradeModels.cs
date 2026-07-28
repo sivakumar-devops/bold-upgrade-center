@@ -165,6 +165,8 @@ namespace BoldBI.UpgradeCenter.Models
         /// </summary>
         public List<string> CompleteLogLines { get; set; } = new();
 
+        public long CompleteLogSequence { get; set; }
+
         /// <summary>
         /// Set when this job is a rollback; references the original upgrade job id.
         /// </summary>
@@ -201,6 +203,7 @@ namespace BoldBI.UpgradeCenter.Models
         public string InitiatedBy { get; set; } = string.Empty;
         public UpgradeJobStatus Status { get; set; }
         public DateTime CompletedAt { get; set; }
+        public bool HasJobContext { get; set; }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

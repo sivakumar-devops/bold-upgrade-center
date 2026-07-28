@@ -1,17 +1,27 @@
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 
 namespace BoldBI.UpgradeCenter.Services;
 
 // Keeps a hot in-memory cache and writes operational state through to persistent storage.
 public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 {
+    private static readonly Regex SensitiveAssignmentPattern = new(
+        @"(?<key>Password|Pwd|User\s*ID|Username|Token|AccessToken|Secret|Key)\s*=\s*[^;,\s]+",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private readonly ConcurrentDictionary<string, UpgradeJob> jobs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> lastLogFingerprints = new(StringComparer.OrdinalIgnoreCase);
     private readonly IUpgradeOperationalStateStore operationalStateStore;
+    private readonly IUpgradeOperationLogStore operationLogStore;
     private readonly object syncRoot = new();
 
-    public InMemoryUpgradeJobStore(IUpgradeOperationalStateStore operationalStateStore)
+    public InMemoryUpgradeJobStore(
+        IUpgradeOperationalStateStore operationalStateStore,
+        IUpgradeOperationLogStore operationLogStore)
     {
         this.operationalStateStore = operationalStateStore;
+        this.operationLogStore = operationLogStore;
     }
 
     public UpgradeJob Create(
@@ -80,6 +90,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
         jobs[job.Id] = job;
         operationalStateStore.SaveJob(Clone(job));
+        AppendJobLog(job, "Info", "Job", $"Upgrade job created. Source version v{currentVersion}; target version v{targetVersion}; operation type {upgradeType}; initiated by {job.InitiatedBy.DisplayName}.");
         return Clone(job);
     }
 
@@ -142,6 +153,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
         jobs[job.Id] = job;
         operationalStateStore.SaveJob(Clone(job));
+        AppendJobLog(job, "Info", "Job", $"Manual rollback job created. Rollback from v{currentVersion} to v{targetVersion}; initiated by {job.InitiatedBy.DisplayName}.");
         return Clone(job);
     }
 
@@ -225,6 +237,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         Update(jobId, job =>
         {
             job.Status = UpgradeJobStatus.Running;
+            AppendJobLog(job, "Info", "Job", $"Job started. Current status: {job.Status}.");
         });
     }
 
@@ -240,6 +253,9 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             stage.CompletedAt = null;
             stage.Message = message;
             stage.SafeErrorDetails = null;
+            AppendStageLog(job, stage, "Info", "Stage", string.IsNullOrWhiteSpace(message)
+                ? $"Stage '{stage.DisplayName}' started."
+                : $"Stage '{stage.DisplayName}' started. {message}");
         });
     }
 
@@ -260,6 +276,10 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                 job.CompletedAt ??= now;
                 job.SafeErrorDetails = null;
             }
+
+            AppendStageLog(job, stage, "Info", "Stage", string.IsNullOrWhiteSpace(message)
+                ? $"Stage '{stage.DisplayName}' completed successfully."
+                : $"Stage '{stage.DisplayName}' completed successfully. {message}");
         });
     }
 
@@ -273,6 +293,9 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             stage.Message = message;
             stage.SafeErrorDetails = null;
             CompletePendingOperations(stage, UpgradeJobStageStatus.Skipped, message);
+            AppendStageLog(job, stage, "Info", "Stage", string.IsNullOrWhiteSpace(message)
+                ? $"Stage '{stage.DisplayName}' skipped."
+                : $"Stage '{stage.DisplayName}' skipped. {message}");
         });
     }
 
@@ -293,6 +316,8 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                 job.Status = UpgradeJobStatus.RollbackFailed;
                 job.CompletedAt ??= now;
             }
+
+            AppendStageLog(job, stage, "Error", "Stage", $"Stage '{stage.DisplayName}' failed. {safeErrorDetails}");
         });
     }
 
@@ -303,53 +328,61 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             var stage = GetStage(job, stageName);
             stage.Operations.Clear();
             stage.Operations.AddRange(operations.Select(CloneOperation));
+            foreach (var operation in stage.Operations.Where(operation => operation.Status != UpgradeJobStageStatus.Pending))
+            {
+                AppendOperationLog(job, stage, operation, ResolveLogLevel(operation.Status), "OperationResult");
+            }
         });
     }
 
     public void MarkOperationRunning(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null)
     {
-        UpdateOperation(jobId, stageName, operationId, operation =>
+        UpdateOperation(jobId, stageName, operationId, (job, stage, operation) =>
         {
             operation.Status = UpgradeJobStageStatus.Running;
             operation.StartedAt ??= DateTimeOffset.UtcNow;
             operation.CompletedAt = null;
             operation.Message = message;
             operation.SafeErrorDetails = null;
+            AppendOperationLog(job, stage, operation, "Info", "Operation");
         });
     }
 
     public void MarkOperationSucceeded(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null)
     {
-        UpdateOperation(jobId, stageName, operationId, operation =>
+        UpdateOperation(jobId, stageName, operationId, (job, stage, operation) =>
         {
             operation.Status = UpgradeJobStageStatus.Succeeded;
             operation.StartedAt ??= DateTimeOffset.UtcNow;
             operation.CompletedAt = DateTimeOffset.UtcNow;
             operation.Message = message;
             operation.SafeErrorDetails = null;
+            AppendOperationLog(job, stage, operation, "Info", "Operation");
         });
     }
 
     public void MarkOperationSkipped(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null)
     {
-        UpdateOperation(jobId, stageName, operationId, operation =>
+        UpdateOperation(jobId, stageName, operationId, (job, stage, operation) =>
         {
             operation.Status = UpgradeJobStageStatus.Skipped;
             operation.StartedAt ??= DateTimeOffset.UtcNow;
             operation.CompletedAt = DateTimeOffset.UtcNow;
             operation.Message = message;
             operation.SafeErrorDetails = null;
+            AppendOperationLog(job, stage, operation, "Info", "Operation");
         });
     }
 
     public void MarkOperationFailed(string jobId, UpgradeJobStageName stageName, string operationId, string safeErrorDetails)
     {
-        UpdateOperation(jobId, stageName, operationId, operation =>
+        UpdateOperation(jobId, stageName, operationId, (job, stage, operation) =>
         {
             operation.Status = UpgradeJobStageStatus.Failed;
             operation.StartedAt ??= DateTimeOffset.UtcNow;
             operation.CompletedAt = DateTimeOffset.UtcNow;
             operation.SafeErrorDetails = safeErrorDetails;
+            AppendOperationLog(job, stage, operation, "Error", "Operation");
         });
     }
 
@@ -359,6 +392,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         {
             job.RollbackAvailable = true;
             job.RollbackId = rollbackId;
+            AppendJobLog(job, "Info", "Rollback", $"Rollback point recorded. rollbackId={rollbackId}.");
         });
     }
 
@@ -369,6 +403,9 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             job.Status = status;
             job.CompletedAt = DateTimeOffset.UtcNow;
             job.SafeErrorDetails = safeErrorDetails;
+            AppendJobLog(job, status is UpgradeJobStatus.Failed or UpgradeJobStatus.RollbackFailed ? "Error" : "Info", "Job", string.IsNullOrWhiteSpace(safeErrorDetails)
+                ? $"Job completed. Final status: {status}."
+                : $"Job completed. Final status: {status}. {safeErrorDetails}");
         });
     }
 
@@ -394,7 +431,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         return job.Stages.First(stage => stage.Name == stageName);
     }
 
-    private void UpdateOperation(string jobId, UpgradeJobStageName stageName, string operationId, Action<UpgradeJobOperation> update)
+    private void UpdateOperation(string jobId, UpgradeJobStageName stageName, string operationId, Action<UpgradeJob, UpgradeJobStage, UpgradeJobOperation> update)
     {
         Update(jobId, job =>
         {
@@ -406,7 +443,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                 stage.Operations.Add(operation);
             }
 
-            update(operation);
+            update(job, stage, operation);
         });
     }
 
@@ -477,6 +514,82 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         operation.StartedAt ??= stage.StartedAt ?? DateTimeOffset.UtcNow;
         operation.CompletedAt = DateTimeOffset.UtcNow;
         operation.SafeErrorDetails = safeErrorDetails;
+    }
+
+    private void AppendJobLog(UpgradeJob job, string level, string source, string message)
+    {
+        AppendLog(job.Id, null, level, source, message);
+    }
+
+    private void AppendStageLog(UpgradeJob job, UpgradeJobStage stage, string level, string source, string message)
+    {
+        AppendLog(job.Id, stage.DisplayName, level, source, message);
+    }
+
+    private void AppendOperationLog(UpgradeJob job, UpgradeJobStage stage, UpgradeJobOperation operation, string level, string source)
+    {
+        var detail = operation.SafeErrorDetails ?? operation.Message;
+        var message = string.IsNullOrWhiteSpace(detail)
+            ? $"{operation.Name}: {operation.Status}."
+            : $"{operation.Name}: {operation.Status}. {detail}";
+
+        if (operation.StartedAt.HasValue && operation.CompletedAt.HasValue)
+        {
+            var duration = operation.CompletedAt.Value - operation.StartedAt.Value;
+            message += $" Duration {FormatDuration(duration)}.";
+        }
+
+        AppendLog(job.Id, stage.DisplayName, level, source, message, operation.Id, operation.Status);
+    }
+
+    private void AppendLog(
+        string jobId,
+        string? stage,
+        string level,
+        string source,
+        string message,
+        string? operationId = null,
+        UpgradeJobStageStatus? status = null)
+    {
+        var safeMessage = RedactSensitive(message);
+        var fingerprintKey = string.Join(
+            "|",
+            jobId,
+            stage ?? string.Empty,
+            source,
+            operationId ?? string.Empty);
+        var fingerprintValue = string.Join("|", level, status?.ToString() ?? string.Empty, safeMessage);
+
+        if (lastLogFingerprints.TryGetValue(fingerprintKey, out var previous) &&
+            string.Equals(previous, fingerprintValue, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        lastLogFingerprints[fingerprintKey] = fingerprintValue;
+        operationLogStore.Append(jobId, stage, level, source, safeMessage);
+    }
+
+    private static string ResolveLogLevel(UpgradeJobStageStatus status)
+    {
+        return status == UpgradeJobStageStatus.Failed ? "Error" : "Info";
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        return duration.TotalSeconds < 60
+            ? $"{duration.TotalSeconds:0}s"
+            : $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
+    }
+
+    private static string RedactSensitive(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        return SensitiveAssignmentPattern.Replace(value, "${key}=***");
     }
 
     private static UpgradeJob Clone(UpgradeJob job)

@@ -334,7 +334,9 @@ else if (job.Status == UpgradeJobStatus.Running)
                 </summary>
                 <div class="stage-details-content">
                     <div class="stage-log-heading">Detailed Logs</div>
-                    <div class="log-box complete-log-box">
+                    <div class="log-box complete-log-box"
+                         id="complete-log-box"
+                         data-last-sequence="@job.CompleteLogSequence">
                         @foreach (var line in job.CompleteLogLines)
                         {
                             if (string.IsNullOrWhiteSpace(line))

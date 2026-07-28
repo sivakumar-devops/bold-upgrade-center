@@ -23,7 +23,7 @@ internal static class UpgradeJobViewModelMapper
             ReleaseType = job.UpgradeType == UpgradeJobType.CustomVersionOrPatch ? UiReleaseType.CustomPatch : UiReleaseType.Standard,
             RevertsJobId = job.UpgradeType == UpgradeJobType.Rollback ? job.RollbackId ?? job.Id : null,
             RollbackJobId = job.RollbackAvailable ? null : job.RollbackId,
-            CompleteLogLines = BuildCompleteLogLines(job),
+            CompleteLogLines = [],
             Stages = job.Stages
                 .Where(stage => ShouldRenderStage(stage, job.UpgradeType))
                 .Select(ToViewModelStage)
@@ -46,15 +46,7 @@ internal static class UpgradeJobViewModelMapper
                 ? UiReleaseType.CustomPatch
                 : UiReleaseType.Standard,
             RevertsJobId = record.ParentJobId,
-            CompleteLogLines =
-            [
-                $"Job ID: {record.JobId}",
-                $"Operation type: {record.OperationType}",
-                $"Started: {FormatTimestamp(record.StartedAt)}",
-                $"Completed: {FormatTimestamp(record.CompletedAt)}",
-                $"Final status: {record.Status}",
-                string.IsNullOrWhiteSpace(record.FailureStage) ? "Failure stage: None" : $"Failure stage: {record.FailureStage}"
-            ]
+            CompleteLogLines = []
         };
     }
 
@@ -159,77 +151,6 @@ internal static class UpgradeJobViewModelMapper
             : $"{operation.Name} - {status}: {message}";
     }
 
-    private static List<string> BuildCompleteLogLines(UpgradeJob job)
-    {
-        var lines = new List<string>
-        {
-            $"Job ID: {job.Id}",
-            $"Operation type: {job.UpgradeType}",
-            $"Current version: v{job.CurrentVersion}",
-            $"Target version: v{job.TargetVersion}",
-            $"Started by: {job.InitiatedBy.DisplayName}",
-            $"Started: {FormatTimestamp(job.StartedAt)}"
-        };
-
-        if (job.CompletedAt.HasValue)
-        {
-            lines.Add($"Completed: {FormatTimestamp(job.CompletedAt)}");
-        }
-
-        lines.Add($"Final status: {job.Status}");
-
-        if (!string.IsNullOrWhiteSpace(job.SafeErrorDetails))
-        {
-            lines.Add($"Final safe error: {job.SafeErrorDetails}");
-        }
-
-        foreach (var stage in job.Stages.Where(stage => ShouldRenderStage(stage, job.UpgradeType)))
-        {
-            lines.Add(string.Empty);
-            lines.Add($"Stage: {ToViewModelStageName(stage)}");
-            lines.Add($"Stage status: {stage.Status}");
-
-            if (stage.StartedAt.HasValue)
-            {
-                lines.Add($"Stage started: {FormatTimestamp(stage.StartedAt)}");
-            }
-
-            if (stage.CompletedAt.HasValue)
-            {
-                lines.Add($"Stage completed: {FormatTimestamp(stage.CompletedAt)}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(stage.Message))
-            {
-                lines.Add($"Stage message: {stage.Message}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(stage.SafeErrorDetails))
-            {
-                lines.Add($"Stage safe error: {stage.SafeErrorDetails}");
-            }
-
-            foreach (var operation in stage.Operations)
-            {
-                lines.Add($"- {BuildOperationDescription(operation)}");
-
-                if (operation.StartedAt.HasValue)
-                {
-                    lines.Add($"  Started: {FormatTimestamp(operation.StartedAt)}");
-                }
-
-                if (operation.CompletedAt.HasValue)
-                {
-                    lines.Add($"  Completed: {FormatTimestamp(operation.CompletedAt)}");
-                }
-            }
-        }
-
-        return lines;
-    }
-
-    private static string FormatTimestamp(DateTimeOffset? value)
-    {
-        return value?.UtcDateTime.ToString("dd MMM yyyy, HH:mm:ss 'UTC'") ?? "Not available";
-    }
+    private static string FormatTimestamp(DateTimeOffset? value) =>
+        value?.UtcDateTime.ToString("dd MMM yyyy, HH:mm:ss 'UTC'") ?? "Not available";
 }

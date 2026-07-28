@@ -18,6 +18,18 @@ public sealed class PlaywrightExecutionOptions
 
     public string ReportPath { get; set; } = "/app/test-results/reports.html";
 
+    public string PreJunitReportPath { get; set; } = "/app/pre-upgrade-test-results/junit-report.xml";
+
+    public string PostJunitReportPath { get; set; } = "/app/post-upgrade-test-results/junit-report.xml";
+
+    public string PreHtmlReportPath { get; set; } = "/app/pre-upgrade-test-results/reports.html";
+
+    public string PostHtmlReportPath { get; set; } = "/app/post-upgrade-test-results/reports.html";
+
+    public string PreHtmlReportDirectory { get; set; } = "/app/pre-upgrade-test-results";
+
+    public string PostHtmlReportDirectory { get; set; } = "/app/post-upgrade-test-results";
+
     public string? ReportStoragePath { get; set; }
 
     public int ReportRetentionJobCount { get; set; } = 7;
