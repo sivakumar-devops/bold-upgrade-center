@@ -50,6 +50,14 @@ rules:
       - get
       - create
       - delete
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - create
+      - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -71,9 +79,19 @@ data:
   releaseVersionsApiUrl: "https://boldbi-release-api.boldbidemo.com/version/json"
   idpApi: "http://id-api-service:6001/api"
   ums: "http://id-ums-service:6002/ums"
-  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v1.3"
+  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v2.6"
   playwrightJobTimeoutSeconds: "9000"
-  playwrightPassRateThreshold: "80"
+  playwrightCompletedJobTtlSeconds: "3600"
+  playwrightSharedStateVolumeEnabled: "true"
+  playwrightSharedStateStorageClassName: ""
+  playwrightSharedStateStorageSize: "1Gi"
+  playwrightSharedStateAccessMode: "ReadWriteOnce"
+  playwrightSharedStateMountPath: "/app/playwright-shared-state"
+  playwrightSharedStateFsGroup: "1001"
+  playwrightPodHoldSeconds: "180"
+  playwrightPassRateThreshold: "40"
+  playwrightReportUploadBaseUrl: "http://boldbi-upgrade-center/upgrade-center/api/playwright-reports"
+  playwrightResultUploadBaseUrl: "http://boldbi-upgrade-center/upgrade-center/api/playwright-results"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -97,8 +115,8 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: boldbi-upgrade-center
-          image: sivakumar2809/upgrade-center-ui:v2.2
-          imagePullPolicy: IfNotPresent
+          image: sivakumar2809/upgrade-center-ui:v3.6
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
@@ -140,11 +158,61 @@ spec:
                 configMapKeyRef:
                   name: boldbi-upgrade-center-config
                   key: playwrightJobTimeoutSeconds
+            - name: UpgradeCenter__Playwright__CompletedJobTtlSeconds
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightCompletedJobTtlSeconds
+            - name: UpgradeCenter__Playwright__SharedStateVolumeEnabled
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateVolumeEnabled
+            - name: UpgradeCenter__Playwright__SharedStateStorageClassName
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateStorageClassName
+            - name: UpgradeCenter__Playwright__SharedStateStorageSize
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateStorageSize
+            - name: UpgradeCenter__Playwright__SharedStateAccessMode
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateAccessMode
+            - name: UpgradeCenter__Playwright__SharedStateMountPath
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateMountPath
+            - name: UpgradeCenter__Playwright__SharedStateFsGroup
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightSharedStateFsGroup
+            - name: PLAYWRIGHT_POD_HOLD_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightPodHoldSeconds
             - name: UpgradeCenter__Playwright__PassRateThreshold
               valueFrom:
                 configMapKeyRef:
                   name: boldbi-upgrade-center-config
                   key: playwrightPassRateThreshold
+            - name: UpgradeCenter__Playwright__ReportUploadBaseUrl
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightReportUploadBaseUrl
+            - name: UpgradeCenter__Playwright__ResultUploadBaseUrl
+              valueFrom:
+                configMapKeyRef:
+                  name: boldbi-upgrade-center-config
+                  key: playwrightResultUploadBaseUrl
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

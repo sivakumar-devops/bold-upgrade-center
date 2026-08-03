@@ -57,6 +57,11 @@ namespace BoldBI.UpgradeCenter.Services
             string initiatedBy,
             CancellationToken ct = default);
 
+
+        Task<UiUpgradeJob> CancelUpgradeAsync(
+            string jobId,
+            string requestedBy,
+            CancellationToken ct = default);
         // ── Rollback ──
 
         /// <summary>

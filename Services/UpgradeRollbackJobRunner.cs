@@ -104,7 +104,7 @@ public sealed class UpgradeRollbackJobRunner : IUpgradeRollbackJobRunner
         jobStore.MarkStageRunning(rollbackJobId, UpgradeJobStageName.RollbackDatabaseRestore, "Restoring affected database tables from backup.");
         jobStore.MarkOperationRunning(rollbackJobId, UpgradeJobStageName.RollbackDatabaseRestore, "rollback-database", "Restoring affected database tables from backup.");
 
-        var restoreResult = await databaseBackupService.RestoreAffectedTablesAsync(rollbackEntry.BackupResult, cancellationToken);
+        var restoreResult = await databaseBackupService.RestoreAffectedTablesAsync(rollbackEntry.BackupResult, rollbackJobId, "Restore database", cancellationToken);
         if (restoreResult.Succeeded)
         {
             jobStore.MarkOperationSucceeded(rollbackJobId, UpgradeJobStageName.RollbackDatabaseRestore, "rollback-database", Safe(restoreResult.Message));

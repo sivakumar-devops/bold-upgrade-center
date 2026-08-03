@@ -10,26 +10,31 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
 
     private readonly IServiceScopeFactory scopeFactory;
     private readonly IUpgradeJobStore jobStore;
+    private readonly IUpgradeJobCancellationManager cancellationManager;
     private readonly ILogger<UpgradeJobRunner> logger;
 
     public UpgradeJobRunner(
         IServiceScopeFactory scopeFactory,
         IUpgradeJobStore jobStore,
+        IUpgradeJobCancellationManager cancellationManager,
         ILogger<UpgradeJobRunner> logger)
     {
         this.scopeFactory = scopeFactory;
         this.jobStore = jobStore;
+        this.cancellationManager = cancellationManager;
         this.logger = logger;
     }
 
     public void Start(string jobId)
     {
-        _ = Task.Run(() => RunAsync(jobId, CancellationToken.None));
+        var cancellationToken = cancellationManager.Register(jobId);
+        _ = Task.Run(() => RunAsync(jobId, cancellationToken));
     }
 
     public void Recover(string jobId)
     {
-        _ = Task.Run(() => RunRecoveryAsync(jobId, CancellationToken.None));
+        var cancellationToken = cancellationManager.Register(jobId);
+        _ = Task.Run(() => RunRecoveryAsync(jobId, cancellationToken));
     }
 
     private async Task RunAsync(string jobId, CancellationToken cancellationToken)
@@ -43,6 +48,11 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         jobStore.MarkRunning(jobId);
         logger.LogInformation("Upgrade job started. JobId: {JobId}. TargetVersion: {TargetVersion}.", job.Id, job.TargetVersion);
 
+        UpgradeDatabaseBackupResult? backupResult = null;
+        KubernetesUpgradeResult? completedKubernetesResult = null;
+        UpgradeRollbackEntry? preparedRollbackEntry = null;
+        UpgradeRollbackEntry? rollbackEntry = null;
+
         try
         {
             using var scope = scopeFactory.CreateScope();
@@ -53,27 +63,6 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
             var historyStore = scope.ServiceProvider.GetRequiredService<IUpgradeHistoryStore>();
             var isCustomPatch = job.UpgradeType == UpgradeJobType.CustomVersionOrPatch;
 
-            jobStore.MarkStageRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "Running pre-upgrade Playwright validation.");
-            jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Starting pre-upgrade Playwright validation.");
-            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Pre-upgrade Playwright validation started.");
-            jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", "Executing pre-upgrade validation tests.");
-            var preUpgradeResult = await playwrightRunner.ExecutePreUpgradeAsync(
-                jobId,
-                progress => UpdatePlaywrightProgress(jobId, UpgradeJobStageName.PreUpgradeValidation, progress),
-                cancellationToken);
-            if (!preUpgradeResult.Succeeded)
-            {
-                jobStore.MarkOperationFailed(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", Safe(preUpgradeResult.Message));
-                FailStageAndJob(jobId, UpgradeJobStageName.PreUpgradeValidation, preUpgradeResult.Message);
-                await UpdateHistoryCompletionAsync(historyStore, jobId, UpgradeJobStatus.Failed, false, null, UpgradeJobStageName.PreUpgradeValidation, preUpgradeResult.Message, cancellationToken);
-                return;
-            }
-
-            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", Safe(preUpgradeResult.Message));
-            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-complete", "Pre-upgrade validation completed successfully.");
-            jobStore.MarkStageSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, Safe(preUpgradeResult.Message));
-
-            UpgradeDatabaseBackupResult backupResult;
             if (isCustomPatch)
             {
                 backupResult = UpgradeDatabaseBackupResult.Skipped(
@@ -88,7 +77,7 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                 jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.DatabaseBackup, "database-impact", "Analyzing database scripts for the selected upgrade range.");
                 jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.DatabaseBackup, "table-discovery", "Identifying cumulative affected tables.");
                 jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.DatabaseBackup, "database-backup", "Backing up affected database tables.");
-                backupResult = await databaseBackupService.BackupAffectedTablesAsync(job.CurrentVersion, job.TargetVersion, cancellationToken);
+                backupResult = await databaseBackupService.BackupAffectedTablesAsync(job.CurrentVersion, job.TargetVersion, jobId, cancellationToken);
                 jobStore.ReplaceStageOperations(jobId, UpgradeJobStageName.DatabaseBackup, BuildDatabaseBackupOperations(backupResult));
                 if (!backupResult.Succeeded)
                 {
@@ -106,6 +95,29 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                         : $"Database backup completed. Version count: {backupResult.AnalyzedVersions.Count}. Backup database count: {backupResult.BackupMappings.Count}. Affected table count: {backupResult.AffectedTables.Count}.");
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+            jobStore.MarkStageRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "Running pre-upgrade Playwright validation.");
+            jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Starting pre-upgrade Playwright validation.");
+            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-start", "Pre-upgrade Playwright validation started.");
+            jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", "Executing pre-upgrade validation tests.");
+            var preUpgradeResult = await playwrightRunner.ExecutePreUpgradeAsync(
+                jobId,
+                progress => UpdatePlaywrightProgress(jobId, UpgradeJobStageName.PreUpgradeValidation, progress),
+                cancellationToken);
+            if (!preUpgradeResult.Succeeded)
+            {
+                jobStore.MarkOperationFailed(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", Safe(preUpgradeResult.Message));
+                await CleanupFailedNewBackupAsync(backupResult, databaseBackupService, cancellationToken);
+                FailStageAndJob(jobId, UpgradeJobStageName.PreUpgradeValidation, preUpgradeResult.Message);
+                await UpdateHistoryCompletionAsync(historyStore, jobId, UpgradeJobStatus.Failed, false, null, UpgradeJobStageName.PreUpgradeValidation, preUpgradeResult.Message, cancellationToken);
+                return;
+            }
+
+            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-tests", Safe(preUpgradeResult.Message));
+            jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, "pre-validation-complete", "Pre-upgrade validation completed successfully.");
+            jobStore.MarkStageSucceeded(jobId, UpgradeJobStageName.PreUpgradeValidation, Safe(preUpgradeResult.Message));
+
+            cancellationToken.ThrowIfCancellationRequested();
             jobStore.MarkStageRunning(jobId, UpgradeJobStageName.KubernetesImageUpgrade, "Updating all applicable Bold BI deployment images.");
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.KubernetesImageUpgrade, "kubernetes-images", "Retrieving target image details.");
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.KubernetesImageUpgrade, "kubernetes-deployments", "Updating applicable Bold BI deployments.");
@@ -114,7 +126,6 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                 UpdateKubernetesProgress(jobId, progress);
             }
 
-            UpgradeRollbackEntry? preparedRollbackEntry = null;
             async Task PersistPreparedRollbackContextAsync(KubernetesUpgradeResult preparedKubernetesResult)
             {
                 if (preparedRollbackEntry is not null ||
@@ -163,6 +174,7 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                     cancellationToken,
                     ReportKubernetesProgress,
                     PersistPreparedRollbackContextAsync);
+            completedKubernetesResult = kubernetesResult;
             jobStore.ReplaceStageOperations(jobId, UpgradeJobStageName.KubernetesImageUpgrade, BuildKubernetesUpgradeOperations(kubernetesResult));
             if (!kubernetesResult.Succeeded)
             {
@@ -221,7 +233,6 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                     ? Safe(kubernetesResult.Message)
                     : $"Kubernetes image upgrade completed. Deployment count: {kubernetesResult.DeploymentResults.Count}.");
 
-            UpgradeRollbackEntry? rollbackEntry = null;
             if (kubernetesResult.Succeeded && !kubernetesResult.Skipped && kubernetesResult.PreviousImages.Count > 0)
             {
                 rollbackEntry = preparedRollbackEntry;
@@ -262,6 +273,7 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                 return;
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             jobStore.MarkStageRunning(jobId, UpgradeJobStageName.PostUpgradeValidation, "Running post-upgrade Playwright validation.");
             jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.PostUpgradeValidation, "post-validation-wait", "Kubernetes image upgrade completed; starting post-upgrade validation.");
             jobStore.MarkOperationRunning(jobId, UpgradeJobStageName.PostUpgradeValidation, "post-validation-tests", "Executing post-upgrade validation tests.");
@@ -297,12 +309,16 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         }
         catch (OperationCanceledException)
         {
-            FailCurrentJob(jobId, "Upgrade job was canceled.");
+            await HandleCancellationAsync(jobId, backupResult, preparedRollbackEntry ?? rollbackEntry, completedKubernetesResult, CancellationToken.None);
         }
         catch (Exception exception)
         {
             logger.LogError(exception, "Upgrade job failed unexpectedly. JobId: {JobId}.", jobId);
             FailCurrentJob(jobId, $"Upgrade job failed unexpectedly: {exception.Message}");
+        }
+        finally
+        {
+            cancellationManager.Complete(jobId);
         }
     }
 
@@ -314,12 +330,18 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
             return;
         }
 
-        if (job.Status is not (UpgradeJobStatus.Queued or UpgradeJobStatus.Running))
+        if (job.Status is not (UpgradeJobStatus.Queued or UpgradeJobStatus.Running or UpgradeJobStatus.Cancelling))
         {
             logger.LogInformation(
                 "Upgrade job recovery skipped because job is already terminal. JobId: {JobId}. Status: {Status}.",
                 jobId,
                 job.Status);
+            return;
+        }
+
+        if (job.Status == UpgradeJobStatus.Cancelling)
+        {
+            await HandleCancellationAsync(jobId, null, null, null, CancellationToken.None);
             return;
         }
 
@@ -383,6 +405,7 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
                     return;
 
                 default:
+                    await CleanupInterruptedPlaywrightSharedStateAsync(job, playwrightRunner, cancellationToken);
                     await FailRecoveredJob(
                         job,
                         historyStore,
@@ -399,6 +422,38 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         {
             logger.LogError(exception, "Upgrade job recovery failed unexpectedly. JobId: {JobId}.", jobId);
             FailCurrentJob(jobId, $"Upgrade job recovery failed unexpectedly: {exception.Message}");
+        }
+        finally
+        {
+            cancellationManager.Complete(jobId);
+        }
+    }
+
+    private async Task CleanupInterruptedPlaywrightSharedStateAsync(
+        UpgradeJob job,
+        IPlaywrightScriptRunner playwrightRunner,
+        CancellationToken cancellationToken)
+    {
+        if (job.CurrentStage is not (UpgradeJobStageName.PreUpgradeValidation or UpgradeJobStageName.PostUpgradeValidation))
+        {
+            return;
+        }
+
+        try
+        {
+            await playwrightRunner.CleanupSharedStateAsync(job.Id, cancellationToken);
+            logger.LogInformation(
+                "Temporary Playwright shared state cleaned up after interrupted validation recovery. JobId: {JobId}. Stage: {Stage}.",
+                job.Id,
+                job.CurrentStage);
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(
+                exception,
+                "Temporary Playwright shared state cleanup failed after interrupted validation recovery. JobId: {JobId}. Stage: {Stage}.",
+                job.Id,
+                job.CurrentStage);
         }
     }
 
@@ -643,7 +698,7 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
             FailureSummary = failureSummary
         }, cancellationToken);
 
-        var databaseRollbackResult = await databaseBackupService.RestoreAffectedTablesAsync(backupResult, cancellationToken);
+        var databaseRollbackResult = await databaseBackupService.RestoreAffectedTablesAsync(backupResult, jobId, "Automatic rollback", cancellationToken);
         if (databaseRollbackResult.Succeeded)
         {
             jobStore.MarkOperationSucceeded(jobId, UpgradeJobStageName.AutomaticRollback, "rollback-database", Safe(databaseRollbackResult.Message));
@@ -706,6 +761,88 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         jobStore.MarkStageFailed(job.Id, job.CurrentStage, safeMessage);
         jobStore.Complete(job.Id, UpgradeJobStatus.Failed, safeMessage);
         await UpdateHistoryCompletionAsync(historyStore, job.Id, UpgradeJobStatus.Failed, false, job.RollbackId, job.CurrentStage, safeMessage, cancellationToken);
+    }
+
+    private async Task HandleCancellationAsync(
+        string jobId,
+        UpgradeDatabaseBackupResult? backupResult,
+        UpgradeRollbackEntry? rollbackEntry,
+        KubernetesUpgradeResult? kubernetesResult,
+        CancellationToken cancellationToken)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var playwrightRunner = scope.ServiceProvider.GetRequiredService<IPlaywrightScriptRunner>();
+        var databaseBackupService = scope.ServiceProvider.GetRequiredService<IUpgradeDatabaseBackupService>();
+        var kubernetesUpgradeService = scope.ServiceProvider.GetRequiredService<IKubernetesUpgradeService>();
+        var rollbackStore = scope.ServiceProvider.GetRequiredService<IUpgradeRollbackStore>();
+        var historyStore = scope.ServiceProvider.GetRequiredService<IUpgradeHistoryStore>();
+
+        if (!jobStore.TryGet(jobId, out var job))
+        {
+            return;
+        }
+
+        var safeMessage = Safe(job.CancellationMessage ?? "Upgrade cancellation requested.");
+        jobStore.MarkCancelling(jobId, safeMessage);
+
+        switch (job.CurrentStage)
+        {
+            case UpgradeJobStageName.KubernetesImageUpgrade:
+            case UpgradeJobStageName.PostUpgradeValidation:
+                rollbackEntry ??= ResolveRollbackEntry(job, rollbackStore);
+                kubernetesResult ??= rollbackEntry?.KubernetesResult;
+                backupResult ??= rollbackEntry?.BackupResult;
+                if (rollbackEntry is not null && backupResult is not null && kubernetesResult is not null)
+                {
+                    await RunAutomaticRollbackAsync(
+                        job,
+                        backupResult,
+                        kubernetesResult,
+                        rollbackEntry,
+                        databaseBackupService,
+                        kubernetesUpgradeService,
+                        rollbackStore,
+                        historyStore,
+                        job.CurrentStage,
+                        "Upgrade cancellation requested after deployment image changes. Running automatic rollback.",
+                        cancellationToken);
+                    return;
+                }
+
+                jobStore.MarkStageCancelled(jobId, job.CurrentStage, "Upgrade cancellation completed before deployment image changes were confirmed.");
+                jobStore.Complete(jobId, UpgradeJobStatus.Cancelled, "Upgrade cancelled. No rollback context was available or required.");
+                await UpdateHistoryCompletionAsync(historyStore, jobId, UpgradeJobStatus.Cancelled, false, job.RollbackId, null, "Upgrade cancelled.", cancellationToken);
+                return;
+
+            case UpgradeJobStageName.PreUpgradeValidation:
+                await playwrightRunner.CleanupSharedStateAsync(jobId, cancellationToken);
+                if (backupResult is not null)
+                {
+                    await CleanupFailedNewBackupAsync(backupResult, databaseBackupService, cancellationToken);
+                }
+
+                jobStore.MarkStageCancelled(jobId, UpgradeJobStageName.PreUpgradeValidation, "Pre-upgrade validation was cancelled by the administrator.");
+                jobStore.Complete(jobId, UpgradeJobStatus.Cancelled, "Upgrade cancelled before deployment images were changed.");
+                await UpdateHistoryCompletionAsync(historyStore, jobId, UpgradeJobStatus.Cancelled, false, null, null, "Upgrade cancelled before deployment images were changed.", cancellationToken);
+                return;
+
+            case UpgradeJobStageName.DatabaseBackup:
+            case UpgradeJobStageName.Queued:
+            default:
+                if (backupResult is not null)
+                {
+                    await CleanupFailedNewBackupAsync(backupResult, databaseBackupService, cancellationToken);
+                }
+
+                if (job.CurrentStage != UpgradeJobStageName.Queued)
+                {
+                    jobStore.MarkStageCancelled(jobId, job.CurrentStage, "Upgrade was cancelled by the administrator.");
+                }
+
+                jobStore.Complete(jobId, UpgradeJobStatus.Cancelled, "Upgrade cancelled before deployment images were changed.");
+                await UpdateHistoryCompletionAsync(historyStore, jobId, UpgradeJobStatus.Cancelled, false, null, null, "Upgrade cancelled before deployment images were changed.", cancellationToken);
+                return;
+        }
     }
 
     private static UpgradeRollbackEntry? ResolveRollbackEntry(UpgradeJob job, IUpgradeRollbackStore rollbackStore)
@@ -901,13 +1038,18 @@ public sealed class UpgradeJobRunner : IUpgradeJobRunner
         {
             var mapping = backupResult.BackupMappings[index];
             var tableCount = mapping.BackupStatus?.TablesSucceeded ?? 0;
+            var operationMessage = mapping.Succeeded
+                ? mapping.BackupStatus is null || string.IsNullOrWhiteSpace(mapping.BackupDatabaseName)
+                    ? mapping.UpgradeCreatedTablesToDrop.Count > 0
+                        ? $"Recorded {mapping.UpgradeCreatedTablesToDrop.Count} upgrade-created table(s) for rollback cleanup. No physical backup database was required."
+                        : "No matching existing affected tables were found. No physical backup database was required."
+                    : $"Backed up {tableCount} table(s). Backup identifier: {mapping.BackupDatabaseName}."
+                : Safe(mapping.Message);
             operations.Add(Operation(
                 $"database-backup-{index + 1}",
                 $"{mapping.OriginalDatabaseName} backup",
                 mapping.Succeeded ? UpgradeJobStageStatus.Succeeded : UpgradeJobStageStatus.Failed,
-                mapping.Succeeded
-                    ? $"Backed up {tableCount} table(s). Backup identifier: {mapping.BackupDatabaseName}."
-                    : Safe(mapping.Message)));
+                operationMessage));
         }
 
         return operations;

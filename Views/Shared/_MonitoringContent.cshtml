@@ -13,6 +13,7 @@
             StageStatus.Passed  => "done",
             StageStatus.Running => "running",
             StageStatus.Failed  => "failed",
+            StageStatus.Cancelled => "cancelled",
             _                   => ""
         };
     }
@@ -22,6 +23,7 @@
         StageStatus.Passed  => "pass",
         StageStatus.Running => "run",
         StageStatus.Failed  => "fail",
+        StageStatus.Cancelled => "fail",
         _                   => "skip"
     };
 
@@ -30,6 +32,7 @@
         StageStatus.Passed  => "OK",
         StageStatus.Running => "...",
         StageStatus.Failed  => "!",
+        StageStatus.Cancelled => "!",
         _                   => "-"
     };
 
@@ -38,6 +41,7 @@
         StageStatus.Passed  => "badge-teal",
         StageStatus.Running => "badge-blue",
         StageStatus.Failed  => "badge-red",
+        StageStatus.Cancelled => "badge-grey",
         _                   => "badge-grey"
     };
 
@@ -46,6 +50,7 @@
         StageStatus.Passed  => "Passed",
         StageStatus.Running => "Running",
         StageStatus.Failed  => "Failed",
+        StageStatus.Cancelled => "Cancelled",
         StageStatus.Skipped => "Skipped",
         _                   => "Pending"
     };
@@ -54,6 +59,8 @@
     {
         UpgradeJobStatus.Completed   => "badge-teal",
         UpgradeJobStatus.Failed      => "badge-red",
+        UpgradeJobStatus.Cancelled   => "badge-grey",
+        UpgradeJobStatus.Cancelling  => "badge-amber",
         UpgradeJobStatus.Running     => "badge-amber",
         UpgradeJobStatus.RollingBack => "badge-blue",
         UpgradeJobStatus.RolledBack  => "badge-grey",
@@ -64,6 +71,8 @@
     {
         UpgradeJobStatus.Completed   => "Completed",
         UpgradeJobStatus.Failed      => "Action required",
+        UpgradeJobStatus.Cancelled   => "Cancelled",
+        UpgradeJobStatus.Cancelling  => "Cancelling",
         UpgradeJobStatus.Running     => "Running",
         UpgradeJobStatus.RollingBack => "Rolling back",
         UpgradeJobStatus.RolledBack  => "Rolled back",
@@ -77,6 +86,7 @@
         stage.Status == StageStatus.Passed  ? $"Passed - {FormatDuration(stage.Duration)}" :
         stage.Status == StageStatus.Running ? "Running..." :
         stage.Status == StageStatus.Failed  ? $"{stage.Checks.Count(c => !c.Passed)} checks failed" :
+        stage.Status == StageStatus.Cancelled ? "Cancelled" :
         stage.Status == StageStatus.Skipped ? "Skipped" :
         "Pending";
 
@@ -98,7 +108,7 @@
         var name = stage?.Name ?? string.Empty;
         return name switch
         {
-            "Pre-Upgrade Validation" => "No database backup or deployment image change should have been applied before this failure.",
+            "Pre-Upgrade Validation" => "Deployment image changes were not applied. Any temporary backup created before validation is cleaned up where possible.",
             "Schema Backup" => "The upgrade was stopped before deployment images were changed. Review the schema backup details and retry after fixing the issue.",
             "Upgrade" => "Rollback is available only if the previous images and database backup were recorded successfully.",
             "Post-Upgrade Validation" => $"Rolling back restores v{job.FromVersion} and the backed-up tables when a valid rollback point is available.",
@@ -108,9 +118,10 @@
 
     var isLatestRollbackable = ViewData["IsLatestRollbackable"] is bool b && b;
     var failedStage = job.Stages.FirstOrDefault(stage => stage.Status == StageStatus.Failed);
+    var canCancel = Model.CanCancelUpgrade;
 }
 
-<div class="job-header">
+<div class="job-header" data-job-status="@JobBadgeLabel(job.Status)" data-can-cancel="@(canCancel ? "true" : "false")">
     <div>
         <div class="eyebrow">@(job.IsRollback ? $"Rollback job - reverting job {job.RevertsJobId}" : "Upgrade job")</div>
         <h1 class="page-title">v@(job.FromVersion) -> v@(job.ToVersion)</h1>
@@ -122,19 +133,21 @@
 </div>
 
 <div class="rail">
-    @for (var index = 0; index < Model.PhaseLabels.Count; index++)
+    @for (var index = 0; index < job.Stages.Count; index++)
     {
+        var railStage = job.Stages[index];
         var railClass = RailClass(index);
         var dotText = railClass == "done" ? "OK" :
             railClass == "running" ? "..." :
             railClass == "failed" ? "!" :
+            railClass == "cancelled" ? "!" :
             (index + 1).ToString();
 
         <div class="rail-step @railClass">
             <div class="line"></div>
             <div class="dot">@dotText</div>
-            <div class="stitle">@Model.PhaseLabels[index]</div>
-            <div class="sstatus">@(job.Stages.Count > index ? FormatStageStatus(job.Stages[index]) : "Pending")</div>
+            <div class="stitle">@railStage.Name</div>
+            <div class="sstatus">@FormatStageStatus(railStage)</div>
         </div>
     }
 </div>
@@ -198,6 +211,24 @@ else if (job.Status == UpgradeJobStatus.Running)
         <div class="txt">
             <b>Upgrade in progress.</b>
             <span>Started by @job.InitiatedBy - @(job.CurrentStage != null ? $"currently running: {job.CurrentStage.Name}" : "preparing...")</span>
+        </div>
+    </div>
+}
+else if (job.Status == UpgradeJobStatus.Cancelling)
+{
+    <div class="banner running">
+        <div class="txt">
+            <b>Cancellation requested.</b>
+            <span>@(job.CancellationMessage ?? "The Upgrade Center is stopping the current operation safely.")</span>
+        </div>
+    </div>
+}
+else if (job.Status == UpgradeJobStatus.Cancelled)
+{
+    <div class="banner">
+        <div class="txt">
+            <b>Upgrade cancelled.</b>
+            <span>@(job.CancellationMessage ?? "The upgrade was cancelled before it completed.")</span>
         </div>
     </div>
 }
@@ -339,14 +370,7 @@ else if (job.Status == UpgradeJobStatus.Running)
                          data-last-sequence="@job.CompleteLogSequence">
                         @foreach (var line in job.CompleteLogLines)
                         {
-                            if (string.IsNullOrWhiteSpace(line))
-                            {
-                                <br />
-                            }
-                            else
-                            {
-                                @line<br />
-                            }
+                            <div class="complete-log-line">@line</div>
                         }
                     </div>
                 </div>

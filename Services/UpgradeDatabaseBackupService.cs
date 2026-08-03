@@ -16,22 +16,25 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
 
     private readonly IUpgradeDatabaseDiscoveryService databaseDiscoveryService;
     private readonly IUpgradeDatabaseScriptImpactService scriptImpactService;
+    private readonly IUpgradeOperationLogStore operationLogStore;
     private readonly DatabaseBackupOptions backupOptions;
     private readonly ILogger<UpgradeDatabaseBackupService> logger;
 
     public UpgradeDatabaseBackupService(
         IUpgradeDatabaseDiscoveryService databaseDiscoveryService,
         IUpgradeDatabaseScriptImpactService scriptImpactService,
+        IUpgradeOperationLogStore operationLogStore,
         IOptions<DatabaseBackupOptions> backupOptions,
         ILogger<UpgradeDatabaseBackupService> logger)
     {
         this.databaseDiscoveryService = databaseDiscoveryService;
         this.scriptImpactService = scriptImpactService;
+        this.operationLogStore = operationLogStore;
         this.backupOptions = backupOptions.Value;
         this.logger = logger;
     }
 
-    public async Task<UpgradeDatabaseBackupResult> BackupAffectedTablesAsync(string currentVersion, string selectedVersion, CancellationToken cancellationToken = default)
+    public async Task<UpgradeDatabaseBackupResult> BackupAffectedTablesAsync(string currentVersion, string selectedVersion, string? jobId = null, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(selectedVersion) || selectedVersion.Equals("Not selected", StringComparison.OrdinalIgnoreCase))
         {
@@ -73,7 +76,10 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 {
                     CurrentVersion = scriptImpact.CurrentVersion,
                     ApplicableVersions = scriptImpact.ApplicableVersions,
-                    DatabaseTypesAnalyzed = scriptImpact.DatabaseTypes
+                    DatabaseTypesAnalyzed = scriptImpact.DatabaseTypes,
+                    ExistingAffectedTables = scriptImpact.ExistingAffectedTables,
+                    CreatedTables = scriptImpact.CreatedTables,
+                    DroppedTables = scriptImpact.DroppedTables
                 };
             }
 
@@ -90,7 +96,10 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 {
                     CurrentVersion = scriptImpact.CurrentVersion,
                     ApplicableVersions = scriptImpact.ApplicableVersions,
-                    DatabaseTypesAnalyzed = scriptImpact.DatabaseTypes
+                    DatabaseTypesAnalyzed = scriptImpact.DatabaseTypes,
+                    ExistingAffectedTables = scriptImpact.ExistingAffectedTables,
+                    CreatedTables = scriptImpact.CreatedTables,
+                    DroppedTables = scriptImpact.DroppedTables
                 };
             }
 
@@ -133,6 +142,37 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
 
                 try
                 {
+                    var backupPlan = await BuildDatabaseBackupPlanAsync(
+                        databaseType,
+                        sourceConnectionString,
+                        allAffectedTables,
+                        scriptImpact.CreatedTables,
+                        jobId,
+                        cancellationToken);
+                    if (backupPlan.TablesToBackup.Count == 0)
+                    {
+                        if (backupPlan.CreatedTablesToDrop.Count > 0)
+                        {
+                            backupMappings.Add(new DatabaseBackupMapping(
+                                true,
+                                $"No existing affected tables required backup. Recorded {backupPlan.CreatedTablesToDrop.Count} upgrade-created table(s) for rollback cleanup.",
+                                databaseTypeName,
+                                validation.DatabaseName,
+                                string.Empty,
+                                sourceConnectionString,
+                                string.Empty,
+                                null,
+                                discoveredDatabase.Identity,
+                                backupPlan.CreatedTablesToDrop));
+                        }
+
+                        logger.LogInformation(
+                            "Physical backup database was not created for {OriginalDatabaseName} because no matching existing affected tables were found. UpgradeCreatedTablesToDrop: {CreatedTableCount}.",
+                            validation.DatabaseName,
+                            backupPlan.CreatedTablesToDrop.Count);
+                        continue;
+                    }
+
                     var occurrence = IncrementNameCount(nameCounts, validation.DatabaseName);
                     var backupDatabaseName = CreateBackupDatabaseName(validation.DatabaseName, occurrence, timestamp);
                     var backupConnection = await CreateBackupConnectionStringAsync(
@@ -141,14 +181,14 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                         backupDatabaseName,
                         cancellationToken);
 
-                    var progress = new LoggerBackupProgress(logger);
+                    var progress = CreateBackupProgress(jobId, "Schema Backup");
                     var engine = new BackupEngine(progress);
                     var options = new BackupOptions
                     {
                         SourceConnectionString = sourceConnectionString,
                         TargetConnectionString = backupConnection.ConnectionString,
                         DatabaseType = databaseType,
-                        IncludeTables = allAffectedTables,
+                        IncludeTables = backupPlan.TablesToBackup,
                         BatchSize = Math.Max(1, backupOptions.BatchSize),
                         DropAndRecreate = backupOptions.DropAndRecreate,
                         DisableFKDuringLoad = backupOptions.DisableForeignKeysDuringLoad
@@ -170,7 +210,8 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                         sourceConnectionString,
                         backupConnection.ConnectionString,
                         status,
-                        discoveredDatabase.Identity));
+                        discoveredDatabase.Identity,
+                        backupPlan.CreatedTablesToDrop));
 
                     logger.LogInformation(
                         "Database backup completed for {OriginalDatabaseName}. Success: {Success}. BackupDatabase: {BackupDatabase}. Tables: {TablesSucceeded}/{TablesAttempted}. Rows: {RowsCopied}. Message: {Message}",
@@ -205,16 +246,30 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 }
             }
 
-            var succeeded = backupMappings.Count == databasesRequiringBackup.Count && backupMappings.All(mapping => mapping.Succeeded);
+            var succeeded = backupMappings.All(mapping => mapping.Succeeded);
+            var physicalBackupCount = backupMappings.Count(mapping =>
+                mapping.Succeeded &&
+                mapping.BackupStatus is not null &&
+                !string.IsNullOrWhiteSpace(mapping.BackupDatabaseName));
+            var cleanupOnlyCount = backupMappings.Count(mapping =>
+                mapping.Succeeded &&
+                mapping.BackupStatus is null &&
+                mapping.UpgradeCreatedTablesToDrop.Count > 0);
             var firstStatus = backupMappings.Select(mapping => mapping.BackupStatus).FirstOrDefault(status => status is not null);
-            var firstBackup = backupMappings.FirstOrDefault(mapping => mapping.Succeeded);
+            var firstBackup = backupMappings.FirstOrDefault(mapping =>
+                mapping.Succeeded &&
+                !string.IsNullOrWhiteSpace(mapping.BackupDatabaseName));
             var resultMessage = succeeded
-                ? "Database backup completed successfully for all databases."
+                ? physicalBackupCount > 0
+                    ? "Database backup completed successfully for all databases with matching affected tables."
+                    : cleanupOnlyCount > 0
+                        ? "No existing affected tables required backup. Upgrade-created tables were recorded for rollback cleanup."
+                        : "No matching existing affected tables were found. Physical database backup was not required."
                 : BuildBackupResultFailureMessage(backupMappings);
 
             return new UpgradeDatabaseBackupResult(
                 succeeded,
-                false,
+                physicalBackupCount == 0 && cleanupOnlyCount == 0,
                 resultMessage,
                 selectedVersion,
                 FormatDatabaseTypes(discoveredDatabases),
@@ -227,7 +282,10 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 backupMappings,
                 scriptImpact.CurrentVersion,
                 scriptImpact.ApplicableVersions,
-                scriptImpact.DatabaseTypes);
+                scriptImpact.DatabaseTypes,
+                scriptImpact.ExistingAffectedTables,
+                scriptImpact.CreatedTables,
+                scriptImpact.DroppedTables);
         }
         catch (OperationCanceledException)
         {
@@ -240,9 +298,10 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         }
     }
 
-    public async Task<UpgradeDatabaseRestoreResult> RestoreAffectedTablesAsync(UpgradeDatabaseBackupResult backupResult, CancellationToken cancellationToken = default)
+    public async Task<UpgradeDatabaseRestoreResult> RestoreAffectedTablesAsync(UpgradeDatabaseBackupResult backupResult, string? jobId = null, string? logStage = null, CancellationToken cancellationToken = default)
     {
-        if (backupResult.BackupSkipped)
+        var hasCreatedTableCleanup = backupResult.BackupMappings.Any(mapping => mapping.UpgradeCreatedTablesToDrop.Count > 0);
+        if (backupResult.BackupSkipped && !hasCreatedTableCleanup)
         {
             return new UpgradeDatabaseRestoreResult(true, "Database restore skipped because no database backup was required for this upgrade.", null, Array.Empty<DatabaseRestoreMapping>());
         }
@@ -264,7 +323,7 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
             var resolvedBackupResult = await ResolveRestoreConnectionStringsAsync(backupResult, cancellationToken);
             foreach (var backupMapping in resolvedBackupResult.BackupMappings)
             {
-                if (!backupMapping.Succeeded || backupMapping.BackupStatus is null)
+                if (!backupMapping.Succeeded)
                 {
                     restoreMappings.Add(new DatabaseRestoreMapping(
                         false,
@@ -289,15 +348,11 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 }
 
                 var sourceValidation = await ValidateSourceDatabaseAsync(databaseType, backupMapping.SourceConnectionString, cancellationToken);
-                var backupValidation = await ValidateSourceDatabaseAsync(databaseType, backupMapping.BackupConnectionString, cancellationToken);
-                if (!sourceValidation.Succeeded || !backupValidation.Succeeded)
+                if (!sourceValidation.Succeeded)
                 {
-                    var validationMessage = !sourceValidation.Succeeded
-                        ? $"Original database validation failed before restore: {sourceValidation.Message}"
-                        : $"Backup database validation failed before restore: {backupValidation.Message}";
                     restoreMappings.Add(new DatabaseRestoreMapping(
                         false,
-                        validationMessage,
+                        $"Original database validation failed before restore: {sourceValidation.Message}",
                         backupMapping.DatabaseType,
                         backupMapping.OriginalDatabaseName,
                         backupMapping.BackupDatabaseName,
@@ -305,7 +360,41 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                     continue;
                 }
 
-                var progress = new LoggerBackupProgress(logger);
+                var createdTableCleanup = await DropUpgradeCreatedTablesAsync(
+                    databaseType,
+                    backupMapping.SourceConnectionString,
+                    backupMapping.UpgradeCreatedTablesToDrop,
+                    jobId,
+                    logStage ?? "Database restore",
+                    cancellationToken);
+                if (backupMapping.BackupStatus is null || string.IsNullOrWhiteSpace(backupMapping.BackupDatabaseName))
+                {
+                    restoreMappings.Add(new DatabaseRestoreMapping(
+                        createdTableCleanup.Succeeded,
+                        createdTableCleanup.Succeeded
+                            ? $"Rollback cleanup completed. {createdTableCleanup.Message} No backed-up table restore was required."
+                            : $"Rollback cleanup failed. {createdTableCleanup.Message}",
+                        backupMapping.DatabaseType,
+                        backupMapping.OriginalDatabaseName,
+                        backupMapping.BackupDatabaseName,
+                        null));
+                    continue;
+                }
+
+                var backupValidation = await ValidateSourceDatabaseAsync(databaseType, backupMapping.BackupConnectionString, cancellationToken);
+                if (!backupValidation.Succeeded)
+                {
+                    restoreMappings.Add(new DatabaseRestoreMapping(
+                        false,
+                        $"Backup database validation failed before restore: {backupValidation.Message}",
+                        backupMapping.DatabaseType,
+                        backupMapping.OriginalDatabaseName,
+                        backupMapping.BackupDatabaseName,
+                        null));
+                    continue;
+                }
+
+                var progress = CreateBackupProgress(jobId, logStage ?? "Database restore");
                 var engine = new RestoreEngine(progress);
                 var options = new RestoreOptions
                 {
@@ -321,12 +410,15 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 await using var backup = ProviderFactory.Create(databaseType);
                 await using var target = ProviderFactory.Create(databaseType);
                 var status = await engine.RunAsync(backup, target, options, cancellationToken);
-                var message = status.Success
+                var mappingSucceeded = createdTableCleanup.Succeeded && status.Success;
+                var message = mappingSucceeded
                     ? "Database restore completed successfully."
-                    : "Database restore failed.";
+                    : createdTableCleanup.Succeeded
+                        ? "Database restore failed."
+                        : $"Database restore failed because upgrade-created table cleanup did not complete. {createdTableCleanup.Message}";
 
                 restoreMappings.Add(new DatabaseRestoreMapping(
-                    status.Success,
+                    mappingSucceeded,
                     message,
                     backupMapping.DatabaseType,
                     backupMapping.OriginalDatabaseName,
@@ -337,7 +429,7 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                     "Database restore completed for {OriginalDatabaseName} from {BackupDatabaseName}. Success: {Success}. Tables: {TablesSucceeded}/{TablesAttempted}. Rows: {RowsRestored}.",
                     backupMapping.OriginalDatabaseName,
                     backupMapping.BackupDatabaseName,
-                    status.Success,
+                    mappingSucceeded,
                     status.TablesSucceeded,
                     status.TablesAttempted,
                     status.TotalRowsRestored);
@@ -374,7 +466,15 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         try
         {
             var resolvedBackupResult = await ResolveRestoreConnectionStringsAsync(backupResult, cancellationToken);
-            foreach (var mapping in resolvedBackupResult.BackupMappings.Where(mapping => !string.IsNullOrWhiteSpace(mapping.BackupDatabaseName)))
+            var physicalBackupMappings = resolvedBackupResult.BackupMappings
+                .Where(mapping => !string.IsNullOrWhiteSpace(mapping.BackupDatabaseName))
+                .ToList();
+            if (physicalBackupMappings.Count == 0)
+            {
+                return new BackupCleanupResult(true, "Backup cleanup skipped because no physical backup databases were recorded.", Array.Empty<BackupCleanupMapping>());
+            }
+
+            foreach (var mapping in physicalBackupMappings)
             {
                 if (!TryParseDatabaseType(mapping.DatabaseType, out var databaseType, out _))
                 {
@@ -441,6 +541,127 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         }
     }
 
+    private async Task<DatabaseBackupPlan> BuildDatabaseBackupPlanAsync(
+        DatabaseType databaseType,
+        string sourceConnectionString,
+        IReadOnlyList<string> affectedTables,
+        IReadOnlyList<string> createdTables,
+        string? jobId,
+        CancellationToken cancellationToken)
+    {
+        await using var source = ProviderFactory.Create(databaseType);
+        await source.OpenAsync(sourceConnectionString, cancellationToken);
+        var availableTables = await source.GetTableNamesAsync(cancellationToken);
+        var existingTables = availableTables.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existingTableLookup = availableTables
+            .GroupBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var tablesToBackup = affectedTables
+            .Where(existingTableLookup.ContainsKey)
+            .Select(table => existingTableLookup[table])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var missingAffectedTables = affectedTables
+            .Where(table => !existingTables.Contains(table))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (var missingTable in missingAffectedTables)
+        {
+            AppendOperationLog(
+                jobId,
+                "Schema Backup",
+                "Warning",
+                "DatabaseBackup",
+                $"Affected table '{missingTable}' was not found in the source database and will be skipped.");
+        }
+
+        if (tablesToBackup.Count == 0)
+        {
+            AppendOperationLog(
+                jobId,
+                "Schema Backup",
+                "Warning",
+                "DatabaseBackup",
+                "None of the requested affected tables were found in the source database. Physical backup database creation was skipped.");
+        }
+
+        var createdTablesToDrop = createdTables
+            .Where(table => !existingTables.Contains(table))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var table in createdTables.Except(createdTablesToDrop, StringComparer.OrdinalIgnoreCase))
+        {
+            AppendOperationLog(
+                jobId,
+                "Schema Backup",
+                "Info",
+                "DatabaseBackup",
+                $"Upgrade script includes CREATE TABLE for '{table}', but the table already exists before upgrade; it will be backed up/restored instead of dropped as a new table.");
+        }
+
+        foreach (var table in createdTablesToDrop)
+        {
+            AppendOperationLog(
+                jobId,
+                "Schema Backup",
+                "Info",
+                "DatabaseBackup",
+                $"Upgrade-created table '{table}' did not exist before upgrade and will be removed during rollback if rollback is required.");
+        }
+
+        return new DatabaseBackupPlan(tablesToBackup, createdTablesToDrop);
+    }
+
+    private async Task<CreatedTableCleanupResult> DropUpgradeCreatedTablesAsync(
+        DatabaseType databaseType,
+        string sourceConnectionString,
+        IReadOnlyList<string> createdTablesToDrop,
+        string? jobId,
+        string logStage,
+        CancellationToken cancellationToken)
+    {
+        if (createdTablesToDrop.Count == 0)
+        {
+            return new CreatedTableCleanupResult(true, "No upgrade-created tables were recorded for cleanup.");
+        }
+
+        var failedTables = new List<string>();
+        await using var target = ProviderFactory.Create(databaseType);
+        await target.OpenAsync(sourceConnectionString, cancellationToken);
+        foreach (var table in createdTablesToDrop.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                AppendOperationLog(jobId, logStage, "Info", "DatabaseRestore", $"Dropping upgrade-created table '{table}' before restoring backed-up tables.");
+                await target.DropTableIfExistsAsync(table, cancellationToken);
+                AppendOperationLog(jobId, logStage, "Info", "DatabaseRestore", $"Upgrade-created table '{table}' was removed successfully.");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                var safeMessage = ToSafeDatabaseMessage(exception.Message);
+                failedTables.Add(table);
+                AppendOperationLog(jobId, logStage, "Error", "DatabaseRestore", $"Failed to remove upgrade-created table '{table}': {safeMessage}");
+                logger.LogError(
+                    exception,
+                    "Failed to remove upgrade-created table {TableName} during rollback. SafeMessage: {SafeMessage}",
+                    table,
+                    safeMessage);
+            }
+        }
+
+        return failedTables.Count == 0
+            ? new CreatedTableCleanupResult(true, $"Removed {createdTablesToDrop.Count} upgrade-created table(s).")
+            : new CreatedTableCleanupResult(false, $"Failed to remove upgrade-created table(s): {string.Join(", ", failedTables)}.");
+    }
+
     private async Task<UpgradeDatabaseBackupResult> ResolveRestoreConnectionStringsAsync(
         UpgradeDatabaseBackupResult backupResult,
         CancellationToken cancellationToken)
@@ -480,10 +701,12 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 continue;
             }
 
-            var backupConnectionString = BuildConnectionStringForDatabase(
-                databaseType,
-                discoveredDatabase.ConnectionString,
-                mapping.BackupDatabaseName);
+            var backupConnectionString = string.IsNullOrWhiteSpace(mapping.BackupDatabaseName)
+                ? string.Empty
+                : BuildConnectionStringForDatabase(
+                    databaseType,
+                    discoveredDatabase.ConnectionString,
+                    mapping.BackupDatabaseName);
 
             resolvedMappings.Add(mapping with
             {
@@ -1085,32 +1308,66 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         return "\"" + password.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
     }
 
+    private IBackupProgress CreateBackupProgress(string? jobId, string stage)
+    {
+        return new LoggerBackupProgress(logger, operationLogStore, jobId, stage);
+    }
+
+    private void AppendOperationLog(string? jobId, string stage, string level, string source, string message)
+    {
+        if (string.IsNullOrWhiteSpace(jobId) || string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        operationLogStore.Append(jobId, stage, level, source, ToSafeDatabaseMessage(message));
+    }
+
     private sealed record DatabaseValidationResult(bool Succeeded, string DatabaseName, string Message);
 
     private sealed record BackupConnectionInfo(string ConnectionString, string DatabaseName);
 
+    private sealed record DatabaseBackupPlan(
+        IReadOnlyList<string> TablesToBackup,
+        IReadOnlyList<string> CreatedTablesToDrop);
+
+    private sealed record CreatedTableCleanupResult(bool Succeeded, string Message);
+
     private sealed class LoggerBackupProgress : IBackupProgress
     {
         private readonly ILogger logger;
+        private readonly IUpgradeOperationLogStore operationLogStore;
+        private readonly string? jobId;
+        private readonly string stage;
 
-        public LoggerBackupProgress(ILogger logger)
+        public LoggerBackupProgress(
+            ILogger logger,
+            IUpgradeOperationLogStore operationLogStore,
+            string? jobId,
+            string stage)
         {
             this.logger = logger;
+            this.operationLogStore = operationLogStore;
+            this.jobId = jobId;
+            this.stage = stage;
         }
 
         public void OnPhaseStarted(string phase)
         {
             logger.LogInformation("Database backup phase: {Phase}", phase);
+            Append("Info", "DatabaseBackup", phase);
         }
 
         public void OnTableStarted(string tableName, int tableIndex, int totalTables)
         {
             logger.LogInformation("Processing table {TableName} ({TableIndex}/{TotalTables}).", tableName, tableIndex, totalTables);
+            Append("Info", "DatabaseBackup", $"Processing table '{tableName}' ({tableIndex}/{totalTables}).");
         }
 
         public void OnTableProgress(string tableName, long rowsCopied)
         {
             logger.LogInformation("Processed {RowsCopied} rows from table {TableName}.", rowsCopied, tableName);
+            Append("Info", "DatabaseBackup", $"Processed {rowsCopied} row(s) from table '{tableName}'.");
         }
 
         public void OnTableCompleted(TableBackupResult result)
@@ -1122,16 +1379,34 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 result.RowsCopied,
                 result.Elapsed,
                 result.ErrorMessage);
+            Append(
+                result.Success ? "Info" : "Error",
+                "DatabaseBackup",
+                result.Success
+                    ? $"Table '{result.TableName}' completed successfully. Rows copied/restored: {result.RowsCopied}."
+                    : $"Table '{result.TableName}' failed. {result.ErrorMessage}");
         }
 
         public void OnWarning(string message)
         {
             logger.LogWarning("Database backup warning: {Message}", message);
+            Append("Warning", "DatabaseBackup", message);
         }
 
         public void OnError(string context, Exception ex)
         {
             logger.LogError(ex, "Database backup error at {Context}.", context);
+            Append("Error", "DatabaseBackup", $"Database backup error at {context}: {ex.Message}");
+        }
+
+        private void Append(string level, string source, string message)
+        {
+            if (string.IsNullOrWhiteSpace(jobId) || string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            operationLogStore.Append(jobId, stage, level, source, ToSafeDatabaseMessage(message));
         }
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Text.Json;
 using System.Threading.Tasks;
 using BoldBI.UpgradeCenter.Models;
 using BoldBI.UpgradeCenter.Models.ViewModels;
@@ -29,6 +30,8 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IUpgradeHistoryStore _historyStore;
         private readonly IUpgradeRollbackStore _rollbackStore;
         private readonly IPlaywrightReportStore _playwrightReportStore;
+        private readonly IPlaywrightReportUploadTokenStore _playwrightReportUploadTokenStore;
+        private readonly IPlaywrightValidationResultStore _playwrightValidationResultStore;
         private readonly IUpgradeOperationLogStore _operationLogStore;
         private readonly IOptions<UpgradeCenterOptions> _options;
 
@@ -42,6 +45,8 @@ namespace BoldBI.UpgradeCenter.Controllers
             IUpgradeHistoryStore historyStore,
             IUpgradeRollbackStore rollbackStore,
             IPlaywrightReportStore playwrightReportStore,
+            IPlaywrightReportUploadTokenStore playwrightReportUploadTokenStore,
+            IPlaywrightValidationResultStore playwrightValidationResultStore,
             IUpgradeOperationLogStore operationLogStore,
             IOptions<UpgradeCenterOptions> options)
         {
@@ -54,6 +59,8 @@ namespace BoldBI.UpgradeCenter.Controllers
             _historyStore = historyStore;
             _rollbackStore = rollbackStore;
             _playwrightReportStore = playwrightReportStore;
+            _playwrightReportUploadTokenStore = playwrightReportUploadTokenStore;
+            _playwrightValidationResultStore = playwrightValidationResultStore;
             _operationLogStore = operationLogStore;
             _options = options;
         }
@@ -248,6 +255,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             ApplyPlaywrightReportLinks(job);
             ApplyCompleteOperationLogs(job);
             var vm = BuildMonitoringViewModel(user, job);
+            vm.CanCancelUpgrade = CanCancelUpgrade(backendJob);
             await ApplyRollbackEligibilityAsync(job);
             return View("Monitor", vm);
         }
@@ -269,8 +277,29 @@ namespace BoldBI.UpgradeCenter.Controllers
             ApplyPlaywrightReportLinks(job);
             ApplyCompleteOperationLogs(job);
             var vm = BuildMonitoringViewModel(user, job);
+            vm.CanCancelUpgrade = CanCancelUpgrade(backendJob);
             await ApplyRollbackEligibilityAsync(job);
             return PartialView("_MonitoringContent", vm);
+        }
+
+        [HttpPost("monitor/{jobId}/cancel")]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> CancelUpgrade(string jobId)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return Forbid();
+
+            try
+            {
+                await _upgradeService.CancelUpgradeAsync(jobId, user.DisplayName);
+                TempData["InfoMessage"] = "Upgrade cancellation was requested. The monitoring page will update as the current stage stops safely.";
+            }
+            catch (InvalidOperationException exception)
+            {
+                TempData["ErrorMessage"] = exception.Message;
+            }
+
+            return RedirectToAction(nameof(Monitor), new { jobId });
         }
 
         [HttpGet("monitor/{jobId}/logs")]
@@ -286,6 +315,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             {
                 isTerminal = backendJob.Status is Services.UpgradeJobStatus.Succeeded
                     or Services.UpgradeJobStatus.Failed
+                    or Services.UpgradeJobStatus.Cancelled
                     or Services.UpgradeJobStatus.RollbackSucceeded
                     or Services.UpgradeJobStatus.RollbackFailed,
                 entries = entries.Select(entry => new
@@ -320,6 +350,101 @@ namespace BoldBI.UpgradeCenter.Controllers
 
             Response.Headers["X-Content-Type-Options"] = "nosniff";
             return File(stream, contentType);
+        }
+
+        [AllowAnonymous]
+        [HttpPost("api/playwright-reports/{jobId}/{stage}")]
+        [DisableRequestSizeLimit]
+        public async Task<IActionResult> UploadPlaywrightReport(string jobId, string stage)
+        {
+            if (!_jobStore.TryGet(jobId, out _))
+            {
+                return NotFound();
+            }
+
+            if (!TryParsePlaywrightStage(stage, out var mode))
+            {
+                return NotFound();
+            }
+
+            if (!_playwrightReportUploadTokenStore.Validate(jobId, mode, ResolveUploadToken()))
+            {
+                return Unauthorized();
+            }
+
+            await using var reportBuffer = new MemoryStream();
+            await Request.Body.CopyToAsync(reportBuffer, HttpContext.RequestAborted);
+            reportBuffer.Position = 0;
+
+            string? safeError;
+            var saved = _playwrightReportStore.TrySaveHtml(jobId, mode, reportBuffer, out safeError);
+            var stageName = mode == PlaywrightValidationMode.Pre
+                ? "Pre-Upgrade Validation"
+                : "Post-Upgrade Validation";
+
+            _operationLogStore.Append(
+                jobId,
+                stageName,
+                saved ? "Info" : "Warning",
+                "PlaywrightReport",
+                saved
+                    ? "Playwright HTML report uploaded and stored for this validation stage."
+                    : $"Playwright HTML report upload was received but could not be stored. {safeError ?? "No additional storage details were available."}");
+
+            return saved
+                ? Created(string.Empty, new { saved = true })
+                : BadRequest(new { saved = false, error = safeError });
+        }
+
+        [AllowAnonymous]
+        [HttpPost("api/playwright-results/{jobId}/{stage}")]
+        public async Task<IActionResult> UploadPlaywrightResult(string jobId, string stage)
+        {
+            if (!_jobStore.TryGet(jobId, out _))
+            {
+                return NotFound();
+            }
+
+            if (!TryParsePlaywrightStage(stage, out var mode))
+            {
+                return NotFound();
+            }
+
+            if (!_playwrightReportUploadTokenStore.Validate(jobId, mode, ResolveUploadToken()))
+            {
+                return Unauthorized();
+            }
+
+            PlaywrightValidationResultSummary? summary;
+            try
+            {
+                summary = await JsonSerializer.DeserializeAsync<PlaywrightValidationResultSummary>(
+                    Request.Body,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
+                    HttpContext.RequestAborted);
+            }
+            catch (JsonException)
+            {
+                return BadRequest(new { saved = false, error = "Invalid Playwright result JSON." });
+            }
+
+            if (summary is null)
+            {
+                return BadRequest(new { saved = false, error = "Playwright result JSON was empty." });
+            }
+
+            _playwrightValidationResultStore.Save(jobId, mode, summary);
+            var stageName = mode == PlaywrightValidationMode.Pre
+                ? "Pre-Upgrade Validation"
+                : "Post-Upgrade Validation";
+            _operationLogStore.Append(
+                jobId,
+                stageName,
+                string.Equals(summary.Status, "Passed", StringComparison.OrdinalIgnoreCase) ? "Info" : "Warning",
+                "PlaywrightResult",
+                summary.ToMessage("Playwright structured result uploaded."));
+
+            return Created(string.Empty, new { saved = true });
         }
 
         [HttpGet("rollback/{jobId}/confirm")]
@@ -477,6 +602,13 @@ namespace BoldBI.UpgradeCenter.Controllers
             return vm;
         }
 
+        private static bool CanCancelUpgrade(Services.UpgradeJob job)
+        {
+            return job.UpgradeType != Services.UpgradeJobType.Rollback
+                && job.Status is Services.UpgradeJobStatus.Running or Services.UpgradeJobStatus.Cancelling
+                && job.CurrentStage != Services.UpgradeJobStageName.AutomaticRollback;
+        }
+
         private void ApplyPlaywrightReportLinks(UiUpgradeJob job)
         {
             foreach (var stage in job.Stages)
@@ -494,6 +626,15 @@ namespace BoldBI.UpgradeCenter.Controllers
             }
         }
 
+        private string ResolveUploadToken()
+        {
+            var token = Request.Headers.Authorization.ToString();
+            const string bearerPrefix = "Bearer ";
+            return token.StartsWith(bearerPrefix, StringComparison.OrdinalIgnoreCase)
+                ? token[bearerPrefix.Length..].Trim()
+                : Request.Headers["X-Upgrade-Center-Report-Token"].ToString();
+        }
+
         private void ApplyCompleteOperationLogs(UiUpgradeJob job)
         {
             var entries = _operationLogStore.List(job.JobId, 1000);
@@ -504,7 +645,7 @@ namespace BoldBI.UpgradeCenter.Controllers
         private static string FormatLogLine(UpgradeOperationLogEntry entry)
         {
             var stage = string.IsNullOrWhiteSpace(entry.Stage) ? "Job" : entry.Stage;
-            return $"[{entry.CreatedAt.UtcDateTime:dd MMM yyyy, HH:mm:ss 'UTC'}] [{entry.Level}] [{stage}] {entry.Message}";
+            return $"[{entry.CreatedAt.UtcDateTime:dd MMM yyyy, HH:mm:ss 'UTC'}] [{entry.Level}] [{stage}]:{Environment.NewLine}{entry.Message}";
         }
 
         private static bool TryParsePlaywrightStage(string stage, out PlaywrightValidationMode mode)

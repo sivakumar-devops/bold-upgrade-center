@@ -7,8 +7,10 @@ public enum UpgradeJobStatus
 {
     Queued,
     Running,
+    Cancelling,
     Succeeded,
     Failed,
+    Cancelled,
     RollbackSucceeded,
     RollbackFailed
 }
@@ -44,6 +46,7 @@ public enum UpgradeJobStageStatus
     Running,
     Succeeded,
     Failed,
+    Cancelled,
     Skipped
 }
 
@@ -73,6 +76,14 @@ public sealed class UpgradeJob
 
     public string? SafeErrorDetails { get; set; }
 
+    public bool CancellationRequested { get; set; }
+
+    public DateTimeOffset? CancellationRequestedAt { get; set; }
+
+    public string? CancellationRequestedBy { get; set; }
+
+    public string? CancellationMessage { get; set; }
+
     public bool RollbackAvailable { get; set; }
 
     public string? RollbackId { get; set; }
@@ -98,7 +109,7 @@ public sealed class UpgradeJob
             }
 
             var completedOperations = operations.Count(operation =>
-                operation.Status is UpgradeJobStageStatus.Succeeded or UpgradeJobStageStatus.Skipped or UpgradeJobStageStatus.Failed);
+                operation.Status is UpgradeJobStageStatus.Succeeded or UpgradeJobStageStatus.Skipped or UpgradeJobStageStatus.Failed or UpgradeJobStageStatus.Cancelled);
 
             return Math.Clamp((int)Math.Round(completedOperations * 100.0 / operations.Count), 0, 100);
         }

@@ -14,6 +14,18 @@ public sealed class PlaywrightExecutionOptions
 
     public int? CompletedJobTtlSeconds { get; set; } = 3600;
 
+    public bool SharedStateVolumeEnabled { get; set; } = true;
+
+    public string? SharedStateStorageClassName { get; set; }
+
+    public string SharedStateStorageSize { get; set; } = "1Gi";
+
+    public string SharedStateAccessMode { get; set; } = "ReadWriteOnce";
+
+    public string SharedStateMountPath { get; set; } = "/app/playwright-shared-state";
+
+    public int? SharedStateFsGroup { get; set; } = 1001;
+
     public string? PassRateThreshold { get; set; } = "100";
 
     public string ReportPath { get; set; } = "/app/test-results/reports.html";
@@ -31,6 +43,10 @@ public sealed class PlaywrightExecutionOptions
     public string PostHtmlReportDirectory { get; set; } = "/app/post-upgrade-test-results";
 
     public string? ReportStoragePath { get; set; }
+
+    public string? ReportUploadBaseUrl { get; set; }
+
+    public string? ResultUploadBaseUrl { get; set; }
 
     public int ReportRetentionJobCount { get; set; } = 7;
 

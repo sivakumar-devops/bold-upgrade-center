@@ -29,8 +29,8 @@ RUN apt-get update \
 
 COPY --from=build /app/publish ./
 
-RUN mkdir -p /app/App_Data/DataProtectionKeys /tmp/boldbi-upgrade-center \
-    && chown -R appuser:appgroup /app /tmp/boldbi-upgrade-center
+RUN mkdir -p /app/App_Data/DataProtectionKeys /app/App_Data/PlaywrightReports \
+    && chown -R appuser:appgroup /app
 
 USER appuser
 

@@ -63,7 +63,7 @@ public sealed class ProductVersionInstallationInfoProvider : IInstallationInfoPr
             return activeJob.CurrentVersion;
         }
 
-        return activeJob.Status is UpgradeJobStatus.Queued or UpgradeJobStatus.Running
+        return activeJob.Status is UpgradeJobStatus.Queued or UpgradeJobStatus.Running or UpgradeJobStatus.Cancelling
             ? activeJob.CurrentVersion
             : actualCurrentVersion;
     }

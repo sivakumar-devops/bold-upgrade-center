@@ -9,6 +9,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
     private readonly IUpgradeJobRunner jobRunner;
     private readonly IUpgradeRollbackStore rollbackStore;
     private readonly IUpgradeRollbackJobRunner rollbackJobRunner;
+    private readonly IUpgradeJobCancellationManager cancellationManager;
     private readonly IInstallationInfoProvider installationInfoProvider;
     private readonly IReleaseVersionProvider releaseVersionProvider;
     private readonly IUpgradeHistoryStore historyStore;
@@ -20,6 +21,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         IUpgradeJobRunner jobRunner,
         IUpgradeRollbackStore rollbackStore,
         IUpgradeRollbackJobRunner rollbackJobRunner,
+        IUpgradeJobCancellationManager cancellationManager,
         IInstallationInfoProvider installationInfoProvider,
         IReleaseVersionProvider releaseVersionProvider,
         IUpgradeHistoryStore historyStore,
@@ -30,6 +32,7 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         this.jobRunner = jobRunner;
         this.rollbackStore = rollbackStore;
         this.rollbackJobRunner = rollbackJobRunner;
+        this.cancellationManager = cancellationManager;
         this.installationInfoProvider = installationInfoProvider;
         this.releaseVersionProvider = releaseVersionProvider;
         this.historyStore = historyStore;
@@ -157,6 +160,40 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         return UpgradeJobViewModelMapper.ToViewModel(job);
     }
 
+    public Task<UiUpgradeJob> CancelUpgradeAsync(string jobId, string requestedBy, CancellationToken ct = default)
+    {
+        if (!jobStore.TryGet(jobId, out var job))
+        {
+            throw new InvalidOperationException("Upgrade job was not found.");
+        }
+
+        if (job.UpgradeType == UpgradeJobType.Rollback)
+        {
+            throw new InvalidOperationException("Rollback operations cannot be cancelled because they are restoring the system to a safe state.");
+        }
+
+        if (job.Status is not (UpgradeJobStatus.Queued or UpgradeJobStatus.Running or UpgradeJobStatus.Cancelling))
+        {
+            throw new InvalidOperationException("This upgrade job is already complete and cannot be cancelled.");
+        }
+
+        if (job.CurrentStage == UpgradeJobStageName.AutomaticRollback)
+        {
+            throw new InvalidOperationException("Cancellation is not available while automatic rollback is running.");
+        }
+
+        var message = BuildCancellationRequestMessage(job);
+        jobStore.RequestCancellation(jobId, requestedBy, message);
+        cancellationManager.RequestCancellation(jobId);
+
+        if (!jobStore.TryGet(jobId, out var updatedJob))
+        {
+            updatedJob = job;
+        }
+
+        return Task.FromResult(UpgradeJobViewModelMapper.ToViewModel(updatedJob));
+    }
+
     public async Task<UiUpgradeJob> StartRollbackAsync(string upgradeJobId, string initiatedBy, CancellationToken ct = default)
     {
         if (jobStore.TryGetLatestActive(out var active))
@@ -228,6 +265,19 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             InitiatedByName = job.InitiatedBy.DisplayName,
             InitiatedByEmail = job.InitiatedBy.Email,
             InitiatedByRole = job.InitiatedBy.Role
+        };
+    }
+
+    private static string BuildCancellationRequestMessage(UpgradeJob job)
+    {
+        return job.CurrentStage switch
+        {
+            UpgradeJobStageName.KubernetesImageUpgrade or UpgradeJobStageName.PostUpgradeValidation =>
+                "Upgrade cancellation requested. Deployment images may already have changed, so automatic rollback will be started if rollback context is available.",
+            UpgradeJobStageName.AutomaticRollback =>
+                "Cancellation request ignored because automatic rollback is already running.",
+            _ =>
+                "Upgrade cancellation requested. Deployment images have not been changed yet; the current operation will be stopped and temporary resources will be cleaned up where possible."
         };
     }
 }

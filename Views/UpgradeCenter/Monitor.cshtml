@@ -6,7 +6,7 @@
     ViewData["Title"] = $"Monitoring - v{Model.Job.FromVersion} -> v{Model.Job.ToVersion}";
     Layout = "~/Views/Shared/_Layout.cshtml";
 
-    var isLive = Model.Job.Status is UpgradeJobStatus.Running or UpgradeJobStatus.RollingBack;
+    var isLive = Model.Job.Status is UpgradeJobStatus.Running or UpgradeJobStatus.Cancelling or UpgradeJobStatus.RollingBack;
 }
 
 <partial name="_Topbar" model="@Model.CurrentUser" />
@@ -16,8 +16,19 @@
         <partial name="_MonitoringContent" model="@Model" />
     </div>
 
-    <div style="margin-top:24px;">
+    <div class="monitor-actions">
         <a href="@Url.Action("Index", "UpgradeCenter")" class="btn btn-ghost">&larr; Back to Upgrade Center</a>
+        @if (Model.CanCancelUpgrade)
+        {
+            <form id="cancel-upgrade-form"
+                  method="post"
+                  action="@Url.Action("CancelUpgrade", "UpgradeCenter", new { jobId = Model.Job.JobId })">
+                @Html.AntiForgeryToken()
+                <button type="submit" class="btn btn-danger" id="cancel-upgrade-button">
+                    Cancel Upgrade
+                </button>
+            </form>
+        }
     </div>
 </div>
 
@@ -33,6 +44,10 @@
         var lastLogSequence = readLastLogSequence();
         var detailsStorageKey = 'upgrade-center:monitor-details:' + jobId;
         var detailsState = readDetailsState();
+        var completeLogAutoScroll = true;
+        var completeLogScrollThreshold = 24;
+        var cancelForm = document.getElementById('cancel-upgrade-form');
+        var cancelButton = document.getElementById('cancel-upgrade-button');
 
         function readDetailsState() {
             try {
@@ -87,19 +102,72 @@
             });
         }
 
+        function isCompleteLogNearBottom(logBox) {
+            if (!logBox) return true;
+
+            return logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight <= completeLogScrollThreshold;
+        }
+
+        function rememberCompleteLogScrollMode() {
+            var logBox = document.getElementById('complete-log-box');
+            if (logBox) {
+                completeLogAutoScroll = isCompleteLogNearBottom(logBox);
+            }
+        }
+
+        function updateMonitoringBody(html) {
+            var template = document.createElement('template');
+            template.innerHTML = html.trim();
+
+            var existingCompleteLogCard = body.querySelector('.complete-log-card');
+            var incomingCompleteLogCard = template.content.querySelector('.complete-log-card');
+            if (existingCompleteLogCard && incomingCompleteLogCard) {
+                incomingCompleteLogCard.replaceWith(existingCompleteLogCard);
+            }
+
+            body.replaceChildren(template.content);
+        }
+
+        function attachCompleteLogScrollHandler() {
+            var logBox = document.getElementById('complete-log-box');
+            if (!logBox) return;
+            if (logBox.dataset.scrollHandlerAttached === 'true') return;
+
+            logBox.addEventListener('scroll', function () {
+                completeLogAutoScroll = isCompleteLogNearBottom(logBox);
+            });
+            logBox.dataset.scrollHandlerAttached = 'true';
+        }
+
+        function syncCancelButton() {
+            if (!cancelForm || !cancelButton || !body) return;
+
+            var header = body.querySelector('.job-header');
+            var canCancel = header && header.dataset.canCancel === 'true';
+            var status = header ? header.dataset.jobStatus || '' : '';
+
+            cancelForm.hidden = !canCancel;
+            cancelButton.disabled = !canCancel || status === 'Cancelling';
+            cancelButton.textContent = status === 'Cancelling' ? 'Cancelling...' : 'Cancel Upgrade';
+        }
+
         function appendLogEntries(entries) {
             var logBox = document.getElementById('complete-log-box');
             if (!logBox || !Array.isArray(entries) || entries.length === 0) return;
 
+            var shouldFollowLatest = completeLogAutoScroll && isCompleteLogNearBottom(logBox);
             entries.forEach(function (entry) {
-                var line = document.createTextNode(entry.line || '');
+                var line = document.createElement('div');
+                line.className = 'complete-log-line';
+                line.textContent = entry.line || '';
                 logBox.appendChild(line);
-                logBox.appendChild(document.createElement('br'));
                 lastLogSequence = Math.max(lastLogSequence, Number(entry.sequence || 0));
             });
 
             logBox.dataset.lastSequence = String(lastLogSequence);
-            scrollCompleteLogToBottom();
+            if (shouldFollowLatest) {
+                scrollCompleteLogToBottom();
+            }
         }
 
         document.addEventListener('toggle', function (event) {
@@ -109,6 +177,7 @@
             detailsState[details.dataset.detailsKey] = details.open;
             saveDetailsState();
             if (details.open && details.dataset.detailsKey === 'complete:' + jobId) {
+                completeLogAutoScroll = true;
                 scrollCompleteLogToBottom();
             }
         }, true);
@@ -116,18 +185,21 @@
         function poll() {
             if (stopped || !body) return;
             rememberDetailsState();
+            rememberCompleteLogScrollMode();
 
             fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
                 .then(function (r) { return r.text(); })
                 .then(function (html) {
-                    body.innerHTML = html;
+                    updateMonitoringBody(html);
                     restoreDetailsState();
+                    attachCompleteLogScrollHandler();
+                    syncCancelButton();
                     lastLogSequence = readLastLogSequence();
-                    if (detailsState['complete:' + jobId]) {
+                    if (detailsState['complete:' + jobId] && completeLogAutoScroll) {
                         scrollCompleteLogToBottom();
                     }
 
-                    var terminalStatuses = ['Completed', 'Action required', 'Rolled back'];
+                    var terminalStatuses = ['Completed', 'Action required', 'Rolled back', 'Cancelled'];
                     var jobBadge = body.querySelector('.job-header .badge');
                     var badgeText = jobBadge && jobBadge.textContent;
                     if (terminalStatuses.some(function (status) { return badgeText && badgeText.includes(status); })) {
@@ -162,8 +234,23 @@
         }
 
         restoreDetailsState();
+        attachCompleteLogScrollHandler();
+        syncCancelButton();
         if (detailsState['complete:' + jobId]) {
             scrollCompleteLogToBottom();
+        }
+        if (cancelForm) {
+            cancelForm.addEventListener('submit', function (event) {
+                if (!confirm('Cancel this upgrade? If deployment images have already changed, the Upgrade Center will start the existing rollback workflow where rollback context is available.')) {
+                    event.preventDefault();
+                    return;
+                }
+
+                if (cancelButton) {
+                    cancelButton.disabled = true;
+                    cancelButton.textContent = 'Cancelling...';
+                }
+            });
         }
         if (!stopped) {
             setTimeout(poll, 5000);

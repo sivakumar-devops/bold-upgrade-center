@@ -23,6 +23,8 @@ internal static class UpgradeJobViewModelMapper
             ReleaseType = job.UpgradeType == UpgradeJobType.CustomVersionOrPatch ? UiReleaseType.CustomPatch : UiReleaseType.Standard,
             RevertsJobId = job.UpgradeType == UpgradeJobType.Rollback ? job.RollbackId ?? job.Id : null,
             RollbackJobId = job.RollbackAvailable ? null : job.RollbackId,
+            CancellationRequested = job.CancellationRequested,
+            CancellationMessage = job.CancellationMessage,
             CompleteLogLines = [],
             Stages = job.Stages
                 .Where(stage => ShouldRenderStage(stage, job.UpgradeType))
@@ -56,6 +58,8 @@ internal static class UpgradeJobViewModelMapper
         {
             "Succeeded" => UiUpgradeJobStatus.Completed,
             "Failed" => UiUpgradeJobStatus.Failed,
+            "Cancelled" => UiUpgradeJobStatus.Cancelled,
+            "Cancelling" => UiUpgradeJobStatus.Cancelling,
             "RollbackSucceeded" => UiUpgradeJobStatus.RolledBack,
             "RollbackFailed" => UiUpgradeJobStatus.Failed,
             "Running" when string.Equals(operationType, UpgradeHistoryOperationTypes.ManualRollback, StringComparison.OrdinalIgnoreCase) ||
@@ -71,6 +75,8 @@ internal static class UpgradeJobViewModelMapper
         {
             UpgradeJobStatus.Succeeded => UiUpgradeJobStatus.Completed,
             UpgradeJobStatus.Failed => UiUpgradeJobStatus.Failed,
+            UpgradeJobStatus.Cancelled => UiUpgradeJobStatus.Cancelled,
+            UpgradeJobStatus.Cancelling => UiUpgradeJobStatus.Cancelling,
             UpgradeJobStatus.RollbackSucceeded => UiUpgradeJobStatus.RolledBack,
             UpgradeJobStatus.RollbackFailed => UiUpgradeJobStatus.Failed,
             UpgradeJobStatus.Running when upgradeType == UpgradeJobType.Rollback => UiUpgradeJobStatus.RollingBack,
@@ -137,6 +143,7 @@ internal static class UpgradeJobViewModelMapper
             UpgradeJobStageStatus.Running => UiStageStatus.Running,
             UpgradeJobStageStatus.Succeeded => UiStageStatus.Passed,
             UpgradeJobStageStatus.Failed => UiStageStatus.Failed,
+            UpgradeJobStageStatus.Cancelled => UiStageStatus.Cancelled,
             UpgradeJobStageStatus.Skipped => UiStageStatus.Skipped,
             _ => UiStageStatus.Pending
         };

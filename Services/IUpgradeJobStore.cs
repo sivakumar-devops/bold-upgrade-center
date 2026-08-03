@@ -32,6 +32,8 @@ public interface IUpgradeJobStore
 
     void MarkStageFailed(string jobId, UpgradeJobStageName stageName, string safeErrorDetails);
 
+    void MarkStageCancelled(string jobId, UpgradeJobStageName stageName, string message);
+
     void ReplaceStageOperations(string jobId, UpgradeJobStageName stageName, IReadOnlyList<UpgradeJobOperation> operations);
 
     void MarkOperationRunning(string jobId, UpgradeJobStageName stageName, string operationId, string? message = null);
@@ -43,6 +45,10 @@ public interface IUpgradeJobStore
     void MarkOperationFailed(string jobId, UpgradeJobStageName stageName, string operationId, string safeErrorDetails);
 
     void MarkRollbackAvailable(string jobId, string rollbackId);
+
+    bool RequestCancellation(string jobId, string requestedBy, string message);
+
+    void MarkCancelling(string jobId, string message);
 
     void Complete(string jobId, UpgradeJobStatus status, string? safeErrorDetails = null);
 }

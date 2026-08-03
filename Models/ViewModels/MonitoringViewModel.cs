@@ -10,9 +10,11 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
 
         public UpgradeJob Job { get; set; } = new();
 
-        public string Phase1Label { get; set; } = "Pre-upgrade";
+        public bool CanCancelUpgrade { get; set; }
 
-        public string Phase2Label { get; set; } = "Schema Backup";
+        public string Phase1Label { get; set; } = "Schema Backup";
+
+        public string Phase2Label { get; set; } = "Pre-upgrade";
 
         public string Phase3Label { get; set; } = "Upgrade";
 

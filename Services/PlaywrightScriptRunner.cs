@@ -53,6 +53,13 @@ public sealed class PlaywrightScriptRunner : IPlaywrightScriptRunner
             : ExecutePostUpgradeAsync(cancellationToken);
     }
 
+    public Task CleanupSharedStateAsync(string upgradeJobId, CancellationToken cancellationToken = default)
+    {
+        return options.UseKubernetesJob
+            ? kubernetesJobService.CleanupSharedStateAsync(upgradeJobId, cancellationToken)
+            : Task.CompletedTask;
+    }
+
     private async Task<PlaywrightScriptResult> ExecuteAsync(
         PlaywrightScriptExecutionOptions scriptOptions,
         string fallbackName,

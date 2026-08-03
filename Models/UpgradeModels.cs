@@ -11,6 +11,8 @@ namespace BoldBI.UpgradeCenter.Models
     {
         Pending,
         Running,
+        Cancelling,
+        Cancelled,
         Completed,
         Failed,
         RolledBack,
@@ -23,6 +25,7 @@ namespace BoldBI.UpgradeCenter.Models
         Running,
         Passed,
         Failed,
+        Cancelled,
         Skipped
     }
 
@@ -178,12 +181,16 @@ namespace BoldBI.UpgradeCenter.Models
         /// </summary>
         public string? RollbackJobId { get; set; }
 
+        public bool CancellationRequested { get; set; }
+
+        public string? CancellationMessage { get; set; }
+
         // ── Convenience helpers ──
 
         public bool IsRollback => RevertsJobId != null;
 
         public JobStage? CurrentStage =>
-            Stages.Find(s => s.Status is StageStatus.Running or StageStatus.Failed);
+            Stages.Find(s => s.Status is StageStatus.Running or StageStatus.Failed or StageStatus.Cancelled);
 
         public bool CanRollBack =>
             Status == UpgradeJobStatus.Completed

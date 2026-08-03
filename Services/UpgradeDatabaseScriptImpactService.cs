@@ -28,6 +28,14 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         new(@"\bREINDEX\s+TABLE\s+(?:CONCURRENTLY\s+)?(?<table>" + QualifiedTablePattern + ")", RegexOptions.IgnoreCase | RegexOptions.Compiled)
     ];
 
+    private static readonly Regex CreateTablePattern = new(
+        @"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?<table>" + QualifiedTablePattern + ")",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex DropTablePattern = new(
+        @"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?<table>" + QualifiedTablePattern + ")",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private readonly HttpClient httpClient;
     private readonly IReleaseVersionProvider releaseVersionProvider;
     private readonly UpgradeCenterOptions options;
@@ -72,6 +80,9 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
                 normalizedTargetVersion,
                 Array.Empty<string>(),
                 FormatDatabaseTypes(databaseTypes),
+                Array.Empty<string>(),
+                Array.Empty<string>(),
+                Array.Empty<string>(),
                 Array.Empty<string>(),
                 new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
                 null);
@@ -118,6 +129,8 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         }
 
         var affectedTables = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var createdTables = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var droppedTables = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         var tableVersionMap = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
         var scriptCache = new Dictionary<string, UpgradeDatabaseScriptResponse?>(StringComparer.OrdinalIgnoreCase);
         string? scriptPreview = null;
@@ -158,7 +171,8 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
                 }
 
                 scriptPreview ??= CreateScriptPreview(scriptInfo.ScriptQuery);
-                var scriptTables = ExtractAffectedTables(scriptInfo.ScriptQuery);
+                var scriptImpact = ExtractSchemaImpact(scriptInfo.ScriptQuery);
+                var scriptTables = scriptImpact.AffectedTables;
                 if (scriptTables.Count == 0)
                 {
                     return Failed(
@@ -166,6 +180,16 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
                         targetVersion,
                         $"Version {FormatVersion(version)} reports database script changes for {databaseType}, but affected table names could not be identified safely.",
                         applicableVersions);
+                }
+
+                foreach (var table in scriptImpact.CreatedTables)
+                {
+                    createdTables.Add(table);
+                }
+
+                foreach (var table in scriptImpact.DroppedTables)
+                {
+                    droppedTables.Add(table);
                 }
 
                 foreach (var table in scriptTables)
@@ -187,6 +211,10 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             pair => pair.Key,
             pair => (IReadOnlyList<string>)pair.Value.ToList(),
             StringComparer.OrdinalIgnoreCase);
+        var existingAffectedTables = affectedTables
+            .Where(table => !createdTables.Contains(table) || droppedTables.Contains(table))
+            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .ToList();
         var message = affectedTables.Count == 0
             ? $"No database script changes were reported for the upgrade range {FormatVersion(normalizedCurrentVersion)} to {FormatVersion(normalizedTargetVersion)}."
             : $"Identified {affectedTables.Count} unique affected table(s) across {applicableVersions.Count} applicable version(s).";
@@ -199,6 +227,9 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             applicableVersions,
             FormatDatabaseTypes(distinctDatabaseTypes),
             affectedTables.ToList(),
+            existingAffectedTables,
+            createdTables.ToList(),
+            droppedTables.ToList(),
             affectedTableVersions,
             scriptPreview);
     }
@@ -251,9 +282,11 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         return !string.IsNullOrWhiteSpace(apiSegment);
     }
 
-    private static IReadOnlyList<string> ExtractAffectedTables(string script)
+    private static SchemaImpact ExtractSchemaImpact(string script)
     {
         var tables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var createdTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var droppedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var cleanedScript = RemoveSqlComments(script);
 
         foreach (var pattern in TablePatterns)
@@ -268,7 +301,30 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             }
         }
 
-        return tables.OrderBy(table => table, StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (Match match in CreateTablePattern.Matches(cleanedScript))
+        {
+            var table = NormalizeTableIdentifier(match.Groups["table"].Value);
+            if (!string.IsNullOrWhiteSpace(table) && !IsSqlKeyword(table))
+            {
+                createdTables.Add(table);
+                tables.Add(table);
+            }
+        }
+
+        foreach (Match match in DropTablePattern.Matches(cleanedScript))
+        {
+            var table = NormalizeTableIdentifier(match.Groups["table"].Value);
+            if (!string.IsNullOrWhiteSpace(table) && !IsSqlKeyword(table))
+            {
+                droppedTables.Add(table);
+                tables.Add(table);
+            }
+        }
+
+        return new SchemaImpact(
+            tables.OrderBy(table => table, StringComparer.OrdinalIgnoreCase).ToList(),
+            createdTables.OrderBy(table => table, StringComparer.OrdinalIgnoreCase).ToList(),
+            droppedTables.OrderBy(table => table, StringComparer.OrdinalIgnoreCase).ToList());
     }
 
     private static string RemoveSqlComments(string script)
@@ -335,7 +391,15 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             applicableVersions ?? Array.Empty<string>(),
             Array.Empty<string>(),
             Array.Empty<string>(),
+            Array.Empty<string>(),
+            Array.Empty<string>(),
+            Array.Empty<string>(),
             new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
             null);
     }
+
+    private sealed record SchemaImpact(
+        IReadOnlyList<string> AffectedTables,
+        IReadOnlyList<string> CreatedTables,
+        IReadOnlyList<string> DroppedTables);
 }

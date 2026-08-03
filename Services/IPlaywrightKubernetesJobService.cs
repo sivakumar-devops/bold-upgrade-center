@@ -7,4 +7,6 @@ public interface IPlaywrightKubernetesJobService
         string upgradeJobId,
         Action<PlaywrightValidationProgress>? progress = null,
         CancellationToken cancellationToken = default);
+
+    Task CleanupSharedStateAsync(string upgradeJobId, CancellationToken cancellationToken = default);
 }

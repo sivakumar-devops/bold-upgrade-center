@@ -15,7 +15,10 @@ public sealed record UpgradeDatabaseBackupResult(
     IReadOnlyList<DatabaseBackupMapping>? DatabaseBackups = null,
     string? CurrentVersion = null,
     IReadOnlyList<string>? ApplicableVersions = null,
-    IReadOnlyList<string>? DatabaseTypesAnalyzed = null)
+    IReadOnlyList<string>? DatabaseTypesAnalyzed = null,
+    IReadOnlyList<string>? ExistingAffectedTables = null,
+    IReadOnlyList<string>? CreatedTables = null,
+    IReadOnlyList<string>? DroppedTables = null)
 {
     public static UpgradeDatabaseBackupResult Failed(string selectedVersion, string message, string? databaseType = null, IReadOnlyList<string>? affectedTables = null)
     {
@@ -35,6 +38,12 @@ public sealed record UpgradeDatabaseBackupResult(
     public IReadOnlyList<string> AnalyzedVersions => ApplicableVersions ?? Array.Empty<string>();
 
     public IReadOnlyList<string> AnalyzedDatabaseTypes => DatabaseTypesAnalyzed ?? Array.Empty<string>();
+
+    public IReadOnlyList<string> ExistingAffectedTableNames => ExistingAffectedTables ?? Array.Empty<string>();
+
+    public IReadOnlyList<string> CreatedTableNames => CreatedTables ?? Array.Empty<string>();
+
+    public IReadOnlyList<string> DroppedTableNames => DroppedTables ?? Array.Empty<string>();
 }
 
 public sealed record DatabaseBackupMapping(
@@ -46,7 +55,11 @@ public sealed record DatabaseBackupMapping(
     string SourceConnectionString,
     string BackupConnectionString,
     BackupStatus? BackupStatus,
-    string? OriginalDatabaseIdentifier = null);
+    string? OriginalDatabaseIdentifier = null,
+    IReadOnlyList<string>? CreatedTablesToDrop = null)
+{
+    public IReadOnlyList<string> UpgradeCreatedTablesToDrop => CreatedTablesToDrop ?? Array.Empty<string>();
+}
 
 public sealed record UpgradeDatabaseRestoreResult(
     bool Succeeded,

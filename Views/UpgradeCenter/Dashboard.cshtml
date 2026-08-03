@@ -231,6 +231,8 @@
                         UpgradeJobStatus.Completed  => ("badge-teal",  "Completed"),
                         UpgradeJobStatus.RolledBack => ("badge-grey",  "Rolled back"),
                         UpgradeJobStatus.Failed     => ("badge-red",   "Failed"),
+                        UpgradeJobStatus.Cancelled  => ("badge-grey",  "Cancelled"),
+                        UpgradeJobStatus.Cancelling => ("badge-amber", "Cancelling"),
                         _                           => ("badge-grey",  entry.Status.ToString())
                     };
 

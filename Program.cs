@@ -80,10 +80,13 @@ builder.Services.AddScoped<IUpgradeUserContextProvider, UpgradeUserContextProvid
 builder.Services.AddScoped<IPlaywrightKubernetesJobService, PlaywrightKubernetesJobService>();
 builder.Services.AddScoped<IPlaywrightScriptRunner, PlaywrightScriptRunner>();
 builder.Services.AddSingleton<IPlaywrightReportStore, PlaywrightReportStore>();
+builder.Services.AddSingleton<IPlaywrightReportUploadTokenStore, InMemoryPlaywrightReportUploadTokenStore>();
+builder.Services.AddSingleton<IPlaywrightValidationResultStore, InMemoryPlaywrightValidationResultStore>();
 builder.Services.AddSingleton<IUpgradeOperationalStateStore, DatabaseUpgradeOperationalStateStore>();
 builder.Services.AddSingleton<IUpgradeOperationLogStore, DatabaseUpgradeOperationLogStore>();
 builder.Services.AddSingleton<IUpgradeRollbackStore, InMemoryUpgradeRollbackStore>();
 builder.Services.AddSingleton<IUpgradeJobStore, InMemoryUpgradeJobStore>();
+builder.Services.AddSingleton<IUpgradeJobCancellationManager, UpgradeJobCancellationManager>();
 builder.Services.AddSingleton<IUpgradeJobRunner, UpgradeJobRunner>();
 builder.Services.AddSingleton<IUpgradeRollbackJobRunner, UpgradeRollbackJobRunner>();
 builder.Services.AddHostedService<UpgradeJobRecoveryService>();

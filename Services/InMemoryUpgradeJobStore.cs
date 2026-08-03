@@ -47,14 +47,6 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             Stages =
             [
                 CreateStage(
-                    UpgradeJobStageName.PreUpgradeValidation,
-                    "Pre-upgrade Playwright validation",
-                    [
-                        CreateOperation("pre-validation-start", "Started Playwright validation"),
-                        CreateOperation("pre-validation-tests", "Executed validation tests"),
-                        CreateOperation("pre-validation-complete", "Validation completed")
-                    ]),
-                CreateStage(
                     UpgradeJobStageName.DatabaseBackup,
                     "Database backup",
                     [
@@ -62,6 +54,14 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                         CreateOperation("database-impact", "Analyzed database impact"),
                         CreateOperation("table-discovery", "Identified affected tables"),
                         CreateOperation("database-backup", "Backed up affected databases")
+                    ]),
+                CreateStage(
+                    UpgradeJobStageName.PreUpgradeValidation,
+                    "Pre-upgrade Playwright validation",
+                    [
+                        CreateOperation("pre-validation-start", "Started Playwright validation"),
+                        CreateOperation("pre-validation-tests", "Executed validation tests"),
+                        CreateOperation("pre-validation-complete", "Validation completed")
                     ]),
                 CreateStage(
                     UpgradeJobStageName.KubernetesImageUpgrade,
@@ -245,7 +245,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
     {
         Update(jobId, job =>
         {
-            job.Status = UpgradeJobStatus.Running;
+            job.Status = job.CancellationRequested ? UpgradeJobStatus.Cancelling : UpgradeJobStatus.Running;
             job.CurrentStage = stageName;
             var stage = GetStage(job, stageName);
             stage.Status = UpgradeJobStageStatus.Running;
@@ -318,6 +318,22 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             }
 
             AppendStageLog(job, stage, "Error", "Stage", $"Stage '{stage.DisplayName}' failed. {safeErrorDetails}");
+        });
+    }
+
+    public void MarkStageCancelled(string jobId, UpgradeJobStageName stageName, string message)
+    {
+        Update(jobId, job =>
+        {
+            var now = DateTimeOffset.UtcNow;
+            var stage = GetStage(job, stageName);
+            stage.Status = UpgradeJobStageStatus.Cancelled;
+            stage.CompletedAt = now;
+            stage.Message = message;
+            stage.SafeErrorDetails = null;
+            job.CurrentStage = stageName;
+            CancelRunningOrPendingOperation(stage, message);
+            AppendStageLog(job, stage, "Warning", "Stage", $"Stage '{stage.DisplayName}' cancelled. {message}");
         });
     }
 
@@ -396,6 +412,40 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         });
     }
 
+    public bool RequestCancellation(string jobId, string requestedBy, string message)
+    {
+        var requested = false;
+        Update(jobId, job =>
+        {
+            if (!IsActive(job) || job.UpgradeType == UpgradeJobType.Rollback)
+            {
+                return;
+            }
+
+            job.CancellationRequested = true;
+            job.CancellationRequestedAt ??= DateTimeOffset.UtcNow;
+            job.CancellationRequestedBy = requestedBy;
+            job.CancellationMessage = message;
+            job.Status = UpgradeJobStatus.Cancelling;
+            AppendJobLog(job, "Warning", "Cancellation", $"{message} Requested by {requestedBy}.");
+            requested = true;
+        });
+
+        return requested;
+    }
+
+    public void MarkCancelling(string jobId, string message)
+    {
+        Update(jobId, job =>
+        {
+            job.CancellationRequested = true;
+            job.CancellationRequestedAt ??= DateTimeOffset.UtcNow;
+            job.CancellationMessage = message;
+            job.Status = UpgradeJobStatus.Cancelling;
+            AppendJobLog(job, "Warning", "Cancellation", message);
+        });
+    }
+
     public void Complete(string jobId, UpgradeJobStatus status, string? safeErrorDetails = null)
     {
         Update(jobId, job =>
@@ -423,7 +473,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
     private static bool IsActive(UpgradeJob job)
     {
-        return job.Status is UpgradeJobStatus.Queued or UpgradeJobStatus.Running;
+        return job.Status is UpgradeJobStatus.Queued or UpgradeJobStatus.Running or UpgradeJobStatus.Cancelling;
     }
 
     private static UpgradeJobStage GetStage(UpgradeJob job, UpgradeJobStageName stageName)
@@ -516,6 +566,17 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         operation.SafeErrorDetails = safeErrorDetails;
     }
 
+    private static void CancelRunningOrPendingOperation(UpgradeJobStage stage, string message)
+    {
+        foreach (var operation in stage.Operations.Where(item => item.Status is UpgradeJobStageStatus.Running or UpgradeJobStageStatus.Pending))
+        {
+            operation.Status = UpgradeJobStageStatus.Cancelled;
+            operation.StartedAt ??= stage.StartedAt ?? DateTimeOffset.UtcNow;
+            operation.CompletedAt = DateTimeOffset.UtcNow;
+            operation.Message ??= message;
+        }
+    }
+
     private void AppendJobLog(UpgradeJob job, string level, string source, string message)
     {
         AppendLog(job.Id, null, level, source, message);
@@ -572,7 +633,12 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
     private static string ResolveLogLevel(UpgradeJobStageStatus status)
     {
-        return status == UpgradeJobStageStatus.Failed ? "Error" : "Info";
+        return status switch
+        {
+            UpgradeJobStageStatus.Failed => "Error",
+            UpgradeJobStageStatus.Cancelled => "Warning",
+            _ => "Info"
+        };
     }
 
     private static string FormatDuration(TimeSpan duration)

@@ -77,12 +77,14 @@
                     <strong>Affected tables</strong>
                     <span>@Model.AffectedTableCount total</span>
                 </div>
-                <ul>
-                    @foreach (var table in Model.AffectedTables)
-                    {
-                        <li>@table</li>
-                    }
-                </ul>
+                <div class="affected-table-list">
+                    <ul>
+                        @foreach (var table in Model.AffectedTables)
+                        {
+                            <li>@table</li>
+                        }
+                    </ul>
+                </div>
                 @if (Model.AffectedTableCount > Model.AffectedTables.Count)
                 {
                     <div class="affected-table-more">

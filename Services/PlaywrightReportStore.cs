@@ -1,5 +1,3 @@
-using System.Formats.Tar;
-using System.IO.Compression;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 
@@ -9,11 +7,8 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
 {
     public const string ReportBeginMarker = "BOLD_UPGRADE_CENTER_PLAYWRIGHT_REPORT_BEGIN";
     public const string ReportEndMarker = "BOLD_UPGRADE_CENTER_PLAYWRIGHT_REPORT_END";
-    public const string ReportArchiveBeginMarker = "BOLD_UPGRADE_CENTER_PLAYWRIGHT_REPORT_ARCHIVE_BEGIN";
-    public const string ReportArchiveEndMarker = "BOLD_UPGRADE_CENTER_PLAYWRIGHT_REPORT_ARCHIVE_END";
 
     private const string ReportFileName = "report.html";
-    private const string MonocartReportFileName = "reports.html";
     private static readonly Regex SafeNamePattern = new("[^a-zA-Z0-9_.-]+", RegexOptions.Compiled);
 
     private readonly string rootPath;
@@ -28,7 +23,7 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
     {
         var configuredPath = options.Value.ReportStoragePath;
         rootPath = string.IsNullOrWhiteSpace(configuredPath)
-            ? Path.Combine(Path.GetTempPath(), "boldbi-upgrade-center", "playwright-reports")
+            ? Path.Combine(environment.ContentRootPath, "App_Data", "PlaywrightReports")
             : ResolvePath(environment.ContentRootPath, configuredPath);
         retentionJobCount = Math.Max(1, options.Value.ReportRetentionJobCount);
         this.logger = logger;
@@ -48,24 +43,14 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
 
             lock (syncRoot)
             {
-                var encodedArchive = ExtractEncodedBlock(logs, ReportArchiveBeginMarker, ReportArchiveEndMarker);
-                if (!string.IsNullOrWhiteSpace(encodedArchive))
+                var encodedReport = ExtractEncodedBlock(logs, ReportBeginMarker, ReportEndMarker);
+                if (string.IsNullOrWhiteSpace(encodedReport))
                 {
-                    SaveArchive(encodedArchive, stageDirectory);
-                }
-                else
-                {
-                    var encodedReport = ExtractEncodedBlock(logs, ReportBeginMarker, ReportEndMarker);
-                    if (string.IsNullOrWhiteSpace(encodedReport))
-                    {
-                        return false;
-                    }
-
-                    Directory.CreateDirectory(stageDirectory);
-                    File.WriteAllBytes(Path.Combine(stageDirectory, ReportFileName), Convert.FromBase64String(encodedReport));
+                    return false;
                 }
 
-                EnsureDefaultReportFile(stageDirectory);
+                Directory.CreateDirectory(stageDirectory);
+                File.WriteAllBytes(Path.Combine(stageDirectory, ReportFileName), Convert.FromBase64String(encodedReport));
                 Directory.SetLastWriteTimeUtc(jobDirectory, DateTime.UtcNow);
                 PruneOldReports(jobDirectory);
             }
@@ -82,6 +67,47 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
             logger.LogWarning(
                 exception,
                 "Playwright HTML report could not be stored. JobId: {JobId}. Stage: {Stage}.",
+                jobId,
+                ToStageSegment(mode));
+            return false;
+        }
+    }
+
+    public bool TrySaveHtml(string jobId, PlaywrightValidationMode mode, Stream htmlStream, out string? safeError)
+    {
+        safeError = null;
+        try
+        {
+            var jobDirectory = GetJobDirectory(jobId);
+            var stageDirectory = GetStageDirectory(jobId, mode);
+
+            lock (syncRoot)
+            {
+                if (Directory.Exists(stageDirectory))
+                {
+                    Directory.Delete(stageDirectory, recursive: true);
+                }
+
+                Directory.CreateDirectory(stageDirectory);
+                using var output = File.Create(Path.Combine(stageDirectory, ReportFileName));
+                htmlStream.CopyTo(output);
+                Directory.SetLastWriteTimeUtc(jobDirectory, DateTime.UtcNow);
+                PruneOldReports(jobDirectory);
+            }
+
+            logger.LogInformation(
+                "Stored uploaded self-contained Playwright HTML report. JobId: {JobId}. Stage: {Stage}. Path: {ReportPath}.",
+                jobId,
+                ToStageSegment(mode),
+                stageDirectory);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            safeError = ToSafeStorageError("uploaded self-contained Playwright HTML report", exception);
+            logger.LogWarning(
+                exception,
+                "Uploaded self-contained Playwright HTML report could not be stored. JobId: {JobId}. Stage: {Stage}.",
                 jobId,
                 ToStageSegment(mode));
             return false;
@@ -157,76 +183,6 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
             .Trim();
     }
 
-    private static void SaveArchive(string encodedArchive, string stageDirectory)
-    {
-        if (Directory.Exists(stageDirectory))
-        {
-            Directory.Delete(stageDirectory, recursive: true);
-        }
-
-        Directory.CreateDirectory(stageDirectory);
-
-        using var archiveStream = new MemoryStream(Convert.FromBase64String(encodedArchive));
-        using var gzipStream = new GZipStream(archiveStream, CompressionMode.Decompress);
-        using var reader = new TarReader(gzipStream);
-        TarEntry? entry;
-        while ((entry = reader.GetNextEntry()) is not null)
-        {
-            if (entry.EntryType is TarEntryType.Directory)
-            {
-                continue;
-            }
-
-            var relativeName = entry.Name.Replace('\\', '/').TrimStart('/');
-            if (string.IsNullOrWhiteSpace(relativeName) ||
-                Path.IsPathRooted(relativeName) ||
-                relativeName.Split('/').Any(segment => segment == ".."))
-            {
-                continue;
-            }
-
-            var destinationPath = Path.GetFullPath(Path.Combine(stageDirectory, relativeName));
-            var stageRoot = Path.GetFullPath(stageDirectory);
-            if (!destinationPath.StartsWith(stageRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-            if (entry.DataStream is null)
-            {
-                File.WriteAllBytes(destinationPath, Array.Empty<byte>());
-                continue;
-            }
-
-            using var output = File.Create(destinationPath);
-            entry.DataStream.CopyTo(output);
-        }
-    }
-
-    private static void EnsureDefaultReportFile(string stageDirectory)
-    {
-        var defaultPath = Path.Combine(stageDirectory, ReportFileName);
-        if (File.Exists(defaultPath))
-        {
-            return;
-        }
-
-        var monocartPath = Path.Combine(stageDirectory, MonocartReportFileName);
-        if (File.Exists(monocartPath))
-        {
-            File.Copy(monocartPath, defaultPath, overwrite: true);
-            return;
-        }
-
-        var indexPath = Directory.EnumerateFiles(stageDirectory, "index.html", SearchOption.AllDirectories)
-            .FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(indexPath))
-        {
-            File.Copy(indexPath, defaultPath, overwrite: true);
-        }
-    }
-
     private string GetReportPath(string jobId, PlaywrightValidationMode mode)
     {
         return Path.Combine(GetStageDirectory(jobId, mode), ReportFileName);
@@ -285,6 +241,14 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
     private static string ToStageSegment(PlaywrightValidationMode mode)
     {
         return mode == PlaywrightValidationMode.Pre ? "pre-upgrade" : "post-upgrade";
+    }
+
+    private static string ToSafeStorageError(string subject, Exception exception)
+    {
+        var message = exception.Message
+            .Replace("\r", " ", StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal);
+        return $"{subject} could not be stored. {exception.GetType().Name}: {message}";
     }
 
     private static string GetContentType(string path)

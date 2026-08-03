@@ -17,6 +17,9 @@ public sealed record UpgradeDatabaseScriptImpactResult(
     IReadOnlyList<string> ApplicableVersions,
     IReadOnlyList<string> DatabaseTypes,
     IReadOnlyList<string> AffectedTables,
+    IReadOnlyList<string> ExistingAffectedTables,
+    IReadOnlyList<string> CreatedTables,
+    IReadOnlyList<string> DroppedTables,
     IReadOnlyDictionary<string, IReadOnlyList<string>> AffectedTableVersions,
     string? ScriptPreview)
 {
