@@ -195,8 +195,8 @@ public sealed class RemoteUmsAuthenticationHandler : AuthenticationHandler<Authe
                 stream,
                 JsonSerializerOptions,
                 cancellationToken);
-            return session is null
-                ? new UmsValidationResult(UmsValidationStatus.Unavailable, null)
+            return session is null || session.Status == false
+                ? new UmsValidationResult(UmsValidationStatus.Completed, null)
                 : new UmsValidationResult(UmsValidationStatus.Completed, session);
         }
 
@@ -232,9 +232,11 @@ public sealed class RemoteUmsAuthenticationHandler : AuthenticationHandler<Authe
         using var adminResponse = await SendCookieValidationRequestAsync(umsUrl, adminPath, cookieHeader, cancellationToken);
         if (adminResponse.StatusCode == HttpStatusCode.OK)
         {
+            var adminValidation = await ReadAdminValidationResultAsync(adminResponse, cancellationToken);
+            var isAdmin = adminValidation?.IsAdmin ?? adminValidation?.Status ?? true;
             return new UmsValidationResult(
                 UmsValidationStatus.Completed,
-                new UpgradeCenterSessionValidationResult(true, true, null, null, null, null));
+                new UpgradeCenterSessionValidationResult(true, isAdmin, null, null, null, null));
         }
 
         if (adminResponse.StatusCode == HttpStatusCode.Forbidden)
@@ -256,6 +258,24 @@ public sealed class RemoteUmsAuthenticationHandler : AuthenticationHandler<Authe
         }
 
         return new UmsValidationResult(UmsValidationStatus.Completed, null);
+    }
+
+    private static async Task<UpgradeCenterAdminValidationResult?> ReadAdminValidationResultAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            return await JsonSerializer.DeserializeAsync<UpgradeCenterAdminValidationResult>(
+                stream,
+                JsonSerializerOptions,
+                cancellationToken);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static bool IsUnavailableStatus(HttpStatusCode statusCode)
@@ -451,7 +471,12 @@ public sealed record UpgradeCenterSessionValidationResult(
     string? UserId,
     string? UserName,
     string? Email,
-    string? DisplayName);
+    string? DisplayName,
+    bool? Status = null);
+
+public sealed record UpgradeCenterAdminValidationResult(
+    bool? Status,
+    bool? IsAdmin);
 
 internal enum UmsValidationStatus
 {
