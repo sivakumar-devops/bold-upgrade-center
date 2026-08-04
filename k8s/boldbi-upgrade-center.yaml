@@ -79,7 +79,7 @@ data:
   releaseVersionsApiUrl: "https://boldbi-release-api.boldbidemo.com/version/json"
   idpApi: "http://id-api-service:6001/api"
   ums: "http://id-ums-service:6002/ums"
-  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v2.6"
+  playwrightRunnerImage: "sivakumar2809/upgrade-center-qa:v2.8"
   playwrightJobTimeoutSeconds: "9000"
   playwrightCompletedJobTtlSeconds: "3600"
   playwrightSharedStateVolumeEnabled: "true"
@@ -115,7 +115,7 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: boldbi-upgrade-center
-          image: sivakumar2809/upgrade-center-ui:v3.7
+          image: sivakumar2809/upgrade-center-ui:v4.0
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

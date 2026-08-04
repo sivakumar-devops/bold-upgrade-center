@@ -13,7 +13,7 @@ builder.Logging.AddDebug();
 var dataProtectionKeysPath = Path.Combine(builder.Environment.ContentRootPath, "App_Data", "DataProtectionKeys");
 Directory.CreateDirectory(dataProtectionKeysPath);
 
-// ── Add services ──────────────────────────────────────────────────────────
+// Add services.
 
 builder.Services.AddControllersWithViews();
 builder.Services.AddHealthChecks();
@@ -130,13 +130,13 @@ app.MapStaticAssets();
 app.MapHealthChecks("/health-check");
 app.MapHealthChecks("/upgrade-center/health-check");
 
-// Default route — redirect / to /upgrade-center
+// Default route: redirect / to /upgrade-center.
 app.MapControllerRoute(
     name: "upgrade-center",
     pattern: "upgrade-center/{action=Index}/{jobId?}",
     defaults: new { controller = "UpgradeCenter" });
 
-// Root path → redirect to upgrade center
+// Root path: redirect to upgrade center.
 app.MapGet("/", () => Results.Redirect("/upgrade-center"));
 
 app.MapControllerRoute(

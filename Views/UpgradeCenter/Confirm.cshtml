@@ -10,9 +10,14 @@
 <partial name="_Topbar" model="@Model.CurrentUser" />
 
 <div class="modal-scrim">
-    <div class="modal-card">
-        <h2>Confirm upgrade</h2>
-        <p class="sub">
+    <div class="modal-card"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="confirm-upgrade-title"
+         aria-describedby="confirm-upgrade-description"
+         tabindex="-1">
+        <h2 id="confirm-upgrade-title">Confirm upgrade</h2>
+        <p class="sub" id="confirm-upgrade-description">
             Review the details below before starting.
             You can monitor every step once the upgrade begins.
         </p>
@@ -136,3 +141,51 @@
         </div>
     </div>
 </div>
+
+@section Scripts {
+<script>
+    (function () {
+        var dialog = document.querySelector('.modal-card[role="dialog"]');
+        if (!dialog) return;
+
+        var focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+        var cancelLink = dialog.querySelector('.modal-actions .btn-secondary');
+
+        function getFocusableItems() {
+            return Array.prototype.slice.call(dialog.querySelectorAll(focusableSelector))
+                .filter(function (element) { return element.offsetParent !== null; });
+        }
+
+        dialog.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && cancelLink) {
+                event.preventDefault();
+                window.location.href = cancelLink.href;
+                return;
+            }
+
+            if (event.key !== 'Tab') return;
+
+            var focusableItems = getFocusableItems();
+            if (focusableItems.length === 0) {
+                event.preventDefault();
+                dialog.focus();
+                return;
+            }
+
+            var first = focusableItems[0];
+            var last = focusableItems[focusableItems.length - 1];
+
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        });
+
+        var initialFocus = dialog.querySelector('.btn-primary') || getFocusableItems()[0] || dialog;
+        initialFocus.focus();
+    })();
+</script>
+}

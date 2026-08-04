@@ -8,6 +8,7 @@
     var boldBiUrl = string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl)
         ? Url.Action("Index", "UpgradeCenter")
         : runtimeConfiguration.IdpBaseUrl;
+    var email = string.IsNullOrWhiteSpace(Model.Email) ? string.Empty : Model.Email;
 }
 
 <div class="product-topbar">
@@ -24,11 +25,19 @@
                 <span>@Model.DisplayName</span>
             </summary>
             <div class="user-menu-panel">
+                <div class="user-menu-title">Profile</div>
                 <div class="user-menu-header">
                     <div class="avatar avatar-large">@Model.Initials</div>
-                    <strong>@Model.DisplayName</strong>
+                    <div class="user-menu-identity">
+                        <strong>@Model.DisplayName</strong>
+                        @if (!string.IsNullOrWhiteSpace(email))
+                        {
+                            <span>@email</span>
+                        }
+                    </div>
                 </div>
-                <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Logout</a>
+                <div class="user-menu-divider"></div>
+                <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Sign out</a>
             </div>
         </details>
     </div>

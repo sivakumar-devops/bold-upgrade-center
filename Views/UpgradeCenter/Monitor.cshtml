@@ -32,6 +32,35 @@
     </div>
 </div>
 
+@if (Model.CanCancelUpgrade)
+{
+    <div class="modal-scrim cancel-dialog" id="cancel-upgrade-dialog" hidden>
+        <div class="modal-card cancel-dialog-card"
+             role="dialog"
+             aria-modal="true"
+             aria-labelledby="cancel-upgrade-title"
+             aria-describedby="cancel-upgrade-description"
+             tabindex="-1">
+            <h2 id="cancel-upgrade-title">Cancel upgrade?</h2>
+            <p class="sub" id="cancel-upgrade-description">
+                If deployment images have already changed, the Upgrade Center will start the existing rollback workflow where rollback context is available.
+            </p>
+            <div class="warning-list">
+                <strong>Before cancelling</strong>
+                <ul>
+                    <li>The current running operation will be asked to stop safely.</li>
+                    <li>If rollback context is available and deployment changes were already applied, rollback may be initiated automatically.</li>
+                    <li>The operation status will continue to update on this monitoring page.</li>
+                </ul>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" id="cancel-upgrade-dialog-close">Proceed with Upgrade</button>
+                <button type="button" class="btn btn-danger" id="cancel-upgrade-dialog-confirm">Cancel upgrade</button>
+            </div>
+        </div>
+    </div>
+}
+
 @section Scripts {
 <script>
     (function () {
@@ -48,6 +77,12 @@
         var completeLogScrollThreshold = 24;
         var cancelForm = document.getElementById('cancel-upgrade-form');
         var cancelButton = document.getElementById('cancel-upgrade-button');
+        var cancelDialog = document.getElementById('cancel-upgrade-dialog');
+        var cancelDialogCard = cancelDialog ? cancelDialog.querySelector('.modal-card') : null;
+        var cancelDialogClose = document.getElementById('cancel-upgrade-dialog-close');
+        var cancelDialogConfirm = document.getElementById('cancel-upgrade-dialog-confirm');
+        var cancelDialogPreviousFocus = null;
+        var cancelEligibilityCheckInProgress = false;
 
         function readDetailsState() {
             try {
@@ -143,12 +178,130 @@
             if (!cancelForm || !cancelButton || !body) return;
 
             var header = body.querySelector('.job-header');
-            var canCancel = header && header.dataset.canCancel === 'true';
+            var canCancel = isCancelCurrentlyAvailable();
             var status = header ? header.dataset.jobStatus || '' : '';
 
             cancelForm.hidden = !canCancel;
             cancelButton.disabled = !canCancel || status === 'Cancelling';
             cancelButton.textContent = status === 'Cancelling' ? 'Cancelling...' : 'Cancel Upgrade';
+        }
+
+        function isCancelCurrentlyAvailable() {
+            if (!body) return false;
+
+            var header = body.querySelector('.job-header');
+            return !!header && header.dataset.canCancel === 'true';
+        }
+
+        function refreshMonitoringBody(html) {
+            updateMonitoringBody(html);
+            restoreDetailsState();
+            attachCompleteLogScrollHandler();
+            syncCancelButton();
+            lastLogSequence = readLastLogSequence();
+            if (detailsState['complete:' + jobId] && completeLogAutoScroll) {
+                scrollCompleteLogToBottom();
+            }
+        }
+
+        function checkCancelEligibilityThenOpenDialog() {
+            if (!cancelForm || !cancelButton || cancelEligibilityCheckInProgress) return;
+
+            cancelEligibilityCheckInProgress = true;
+            cancelButton.disabled = true;
+            cancelButton.textContent = 'Checking...';
+            rememberDetailsState();
+            rememberCompleteLogScrollMode();
+
+            fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                .then(function (r) { return r.text(); })
+                .then(function (html) {
+                    refreshMonitoringBody(html);
+                    if (isCancelCurrentlyAvailable()) {
+                        openCancelDialog();
+                    } else {
+                        closeCancelDialog();
+                    }
+                })
+                .catch(function () {
+                    if (isCancelCurrentlyAvailable()) {
+                        openCancelDialog();
+                    }
+                })
+                .finally(function () {
+                    cancelEligibilityCheckInProgress = false;
+                    syncCancelButton();
+                });
+        }
+
+        function getDialogFocusableItems() {
+            if (!cancelDialogCard) return [];
+
+            var focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+            return Array.prototype.slice.call(cancelDialogCard.querySelectorAll(focusableSelector))
+                .filter(function (element) { return element.offsetParent !== null; });
+        }
+
+        function openCancelDialog() {
+            if (!cancelDialog || !cancelDialogCard) return;
+
+            cancelDialogPreviousFocus = document.activeElement;
+            cancelDialog.hidden = false;
+            document.addEventListener('keydown', handleCancelDialogKeydown);
+
+            var focusTarget = cancelDialogClose || getDialogFocusableItems()[0] || cancelDialogCard;
+            focusTarget.focus();
+        }
+
+        function closeCancelDialog() {
+            if (!cancelDialog) return;
+
+            cancelDialog.hidden = true;
+            document.removeEventListener('keydown', handleCancelDialogKeydown);
+
+            if (cancelDialogPreviousFocus && typeof cancelDialogPreviousFocus.focus === 'function') {
+                cancelDialogPreviousFocus.focus();
+            }
+        }
+
+        function handleCancelDialogKeydown(event) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeCancelDialog();
+                return;
+            }
+
+            if (event.key !== 'Tab' || !cancelDialogCard || cancelDialog.hidden) return;
+
+            var focusableItems = getDialogFocusableItems();
+            if (focusableItems.length === 0) {
+                event.preventDefault();
+                cancelDialogCard.focus();
+                return;
+            }
+
+            var first = focusableItems[0];
+            var last = focusableItems[focusableItems.length - 1];
+
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
+
+        function disableCancelControls() {
+            if (cancelButton) {
+                cancelButton.disabled = true;
+                cancelButton.textContent = 'Cancelling...';
+            }
+
+            if (cancelDialogConfirm) {
+                cancelDialogConfirm.disabled = true;
+                cancelDialogConfirm.textContent = 'Cancelling...';
+            }
         }
 
         function appendLogEntries(entries) {
@@ -190,14 +343,7 @@
             fetch(pollUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
                 .then(function (r) { return r.text(); })
                 .then(function (html) {
-                    updateMonitoringBody(html);
-                    restoreDetailsState();
-                    attachCompleteLogScrollHandler();
-                    syncCancelButton();
-                    lastLogSequence = readLastLogSequence();
-                    if (detailsState['complete:' + jobId] && completeLogAutoScroll) {
-                        scrollCompleteLogToBottom();
-                    }
+                    refreshMonitoringBody(html);
 
                     var terminalStatuses = ['Completed', 'Action required', 'Rolled back', 'Cancelled'];
                     var jobBadge = body.querySelector('.job-header .badge');
@@ -241,14 +387,40 @@
         }
         if (cancelForm) {
             cancelForm.addEventListener('submit', function (event) {
-                if (!confirm('Cancel this upgrade? If deployment images have already changed, the Upgrade Center will start the existing rollback workflow where rollback context is available.')) {
-                    event.preventDefault();
+                if (cancelForm.dataset.confirmed === 'true') {
+                    disableCancelControls();
                     return;
                 }
 
-                if (cancelButton) {
-                    cancelButton.disabled = true;
-                    cancelButton.textContent = 'Cancelling...';
+                event.preventDefault();
+                checkCancelEligibilityThenOpenDialog();
+            });
+        }
+        if (cancelDialogClose) {
+            cancelDialogClose.addEventListener('click', closeCancelDialog);
+        }
+        if (cancelDialog) {
+            cancelDialog.addEventListener('click', function (event) {
+                if (event.target === cancelDialog) {
+                    closeCancelDialog();
+                }
+            });
+        }
+        if (cancelDialogConfirm && cancelForm) {
+            cancelDialogConfirm.addEventListener('click', function () {
+                if (!isCancelCurrentlyAvailable()) {
+                    closeCancelDialog();
+                    syncCancelButton();
+                    return;
+                }
+
+                cancelForm.dataset.confirmed = 'true';
+                disableCancelControls();
+
+                if (typeof cancelForm.requestSubmit === 'function') {
+                    cancelForm.requestSubmit();
+                } else {
+                    cancelForm.submit();
                 }
             });
         }

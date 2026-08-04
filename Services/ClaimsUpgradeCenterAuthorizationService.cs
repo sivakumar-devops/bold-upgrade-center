@@ -16,16 +16,18 @@ public sealed class ClaimsUpgradeCenterAuthorizationService : IUpgradeCenterAuth
                           StringComparison.OrdinalIgnoreCase) ||
                       principal.IsInRole("Admin");
 
+        var email = principal.FindFirst(ClaimTypes.Email)?.Value ?? string.Empty;
         var displayName = ResolveUserName(
             principal.FindFirst(UpgradeCenterClaimTypes.UserName)?.Value,
             principal.FindFirst(ClaimTypes.Name)?.Value,
             principal.Identity?.Name,
-            principal.FindFirst(ClaimTypes.Email)?.Value);
+            email);
 
         var user = new UpgradeCenterUser
         {
             DisplayName = displayName,
             Initials = GetInitials(displayName),
+            Email = email,
             Role = isAdmin ? "UMS Admin" : "User",
             IsAuthorized = principal.Identity?.IsAuthenticated == true && isAdmin
         };

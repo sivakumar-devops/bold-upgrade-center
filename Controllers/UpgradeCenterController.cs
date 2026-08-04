@@ -65,9 +65,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             _options = options;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // GET /upgrade-center  — Dashboard (Screen 2) or Unauthorized (Screen 1)
-        // ─────────────────────────────────────────────────────────────────────
+        // GET /upgrade-center: Dashboard (Screen 2) or Unauthorized (Screen 1).
 
         [HttpGet("")]
         [HttpGet("index")]
@@ -136,9 +134,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return Redirect($"{logoutUrl}?returnUrl={Uri.EscapeDataString(returnUrl)}");
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // GET /upgrade-center/confirm?version=12.4.0  — Confirm modal (Screen 3)
-        // ─────────────────────────────────────────────────────────────────────
+        // GET /upgrade-center/confirm?version=12.4.0: Confirm modal (Screen 3).
 
         [HttpGet("confirm")]
         public async Task<IActionResult> Confirm(
@@ -187,9 +183,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return View("Confirm", vm);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // POST /upgrade-center/start  — Start an upgrade job
-        // ─────────────────────────────────────────────────────────────────────
+        // POST /upgrade-center/start: Start an upgrade job.
 
         [HttpPost("start")]
         [ValidateAntiForgeryToken]
@@ -239,9 +233,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return RedirectToAction(nameof(Monitor), new { jobId = job.JobId });
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // GET /upgrade-center/monitor/{jobId}  — Monitoring page (Screens 4 / 5 / 6)
-        // ─────────────────────────────────────────────────────────────────────
+        // GET /upgrade-center/monitor/{jobId}: Monitoring page (Screens 4 / 5 / 6).
 
         [HttpGet("monitor/{jobId}")]
         public async Task<IActionResult> Monitor(string jobId)
@@ -260,10 +252,8 @@ namespace BoldBI.UpgradeCenter.Controllers
             return View("Monitor", vm);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // GET /upgrade-center/monitor/{jobId}/status  — AJAX polling endpoint
+        // GET /upgrade-center/monitor/{jobId}/status: AJAX polling endpoint
         // Returns a partial view so the page can refresh just the job content.
-        // ─────────────────────────────────────────────────────────────────────
 
         [HttpGet("monitor/{jobId}/status")]
         public async Task<IActionResult> MonitorStatus(string jobId)
@@ -508,9 +498,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return View("ConfirmRollback", vm);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // POST /upgrade-center/rollback/{jobId}  — Start rollback
-        // ─────────────────────────────────────────────────────────────────────
+        // POST /upgrade-center/rollback/{jobId}: Start rollback
 
         [HttpPost("rollback/{jobId}")]
         [ValidateAntiForgeryToken]
@@ -544,9 +532,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return RedirectToAction(nameof(Monitor), new { jobId = rollbackJob.JobId });
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // POST /upgrade-center/validate-patch  — AJAX patch image validation
-        // ─────────────────────────────────────────────────────────────────────
+        // POST /upgrade-center/validate-patch: AJAX patch image validation
 
         [HttpPost("validate-patch")]
         [ValidateAntiForgeryToken]
@@ -574,9 +560,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             return PartialView("_PatchValidationResult", vm);
         }
 
-        // ─────────────────────────────────────────────────────────────────────
         // Private helpers
-        // ─────────────────────────────────────────────────────────────────────
 
         private static string CombineUrl(string baseUrl, string relativePath)
         {

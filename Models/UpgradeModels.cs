@@ -3,9 +3,7 @@ using System.Collections.Generic;
 
 namespace BoldBI.UpgradeCenter.Models
 {
-    // ─────────────────────────────────────────────────────────────────────────
     // Enumerations
-    // ─────────────────────────────────────────────────────────────────────────
 
     public enum UpgradeJobStatus
     {
@@ -35,9 +33,7 @@ namespace BoldBI.UpgradeCenter.Models
         CustomPatch
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Core domain models
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// Represents a Bold BI release available for upgrade.
@@ -114,9 +110,7 @@ namespace BoldBI.UpgradeCenter.Models
         public string Message { get; set; } = string.Empty;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Upgrade job & stages
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// A single named step (pre-upgrade, schema backup, deploy, etc.)
@@ -157,8 +151,8 @@ namespace BoldBI.UpgradeCenter.Models
         public ReleaseType ReleaseType { get; set; } = ReleaseType.Standard;
 
         /// <summary>
-        /// Ordered stages for this job (pre-upgrade → upgrade → post-upgrade,
-        /// or revert deployment → restore schema → verify health for rollback).
+        /// Ordered stages for this job (pre-upgrade -> upgrade -> post-upgrade,
+        /// or revert deployment -> restore schema -> verify health for rollback).
         /// </summary>
         public List<JobStage> Stages { get; set; } = new();
 
@@ -185,7 +179,7 @@ namespace BoldBI.UpgradeCenter.Models
 
         public string? CancellationMessage { get; set; }
 
-        // ── Convenience helpers ──
+        // Convenience helpers.
 
         public bool IsRollback => RevertsJobId != null;
 
@@ -199,23 +193,19 @@ namespace BoldBI.UpgradeCenter.Models
             && (DateTime.UtcNow - (CompletedAt ?? DateTime.UtcNow)).TotalDays <= 7;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // History entry (lightweight, for the History tab)
-    // ─────────────────────────────────────────────────────────────────────────
 
     public class UpgradeHistoryEntry
     {
         public string JobId { get; set; } = string.Empty;
-        public string Label { get; set; } = string.Empty;   // e.g. "v12.2.0 → v12.3.1"
+        public string Label { get; set; } = string.Empty;   // e.g. "v12.2.0 -> v12.3.1"
         public string InitiatedBy { get; set; } = string.Empty;
         public UpgradeJobStatus Status { get; set; }
         public DateTime CompletedAt { get; set; }
         public bool HasJobContext { get; set; }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Installation / environment info
-    // ─────────────────────────────────────────────────────────────────────────
 
     public class InstallationInfo
     {
@@ -236,14 +226,12 @@ namespace BoldBI.UpgradeCenter.Models
 
         /// <summary>
         /// Deployment target descriptor shown in the UI eyebrow.
-        /// e.g. "On-premise · Kubernetes"
+        /// e.g. "On-premise / Kubernetes"
         /// </summary>
         public string DeploymentTarget { get; set; } = string.Empty;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Current user / session context
-    // ─────────────────────────────────────────────────────────────────────────
 
     public class UpgradeCenterUser
     {
@@ -253,6 +241,8 @@ namespace BoldBI.UpgradeCenter.Models
         /// Two-letter initials shown in the avatar chip.
         /// </summary>
         public string Initials { get; set; } = string.Empty;
+
+        public string Email { get; set; } = string.Empty;
 
         public string Role { get; set; } = string.Empty;
 

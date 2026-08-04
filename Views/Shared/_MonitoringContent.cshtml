@@ -129,25 +129,26 @@
             Job ID: @job.JobId - started @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
         </div>
     </div>
-    <span class="badge @JobBadgeClass(job.Status)">@JobBadgeLabel(job.Status)</span>
+    <span class="badge @JobBadgeClass(job.Status)" aria-label="Job status: @JobBadgeLabel(job.Status)">@JobBadgeLabel(job.Status)</span>
 </div>
 
-<div class="rail">
+<div class="rail" role="list" aria-label="Upgrade stage progress">
     @for (var index = 0; index < job.Stages.Count; index++)
     {
         var railStage = job.Stages[index];
         var railClass = RailClass(index);
+        var railStatusLabel = FormatStageStatus(railStage);
         var dotText = railClass == "done" ? "OK" :
             railClass == "running" ? "..." :
             railClass == "failed" ? "!" :
             railClass == "cancelled" ? "!" :
             (index + 1).ToString();
 
-        <div class="rail-step @railClass">
-            <div class="line"></div>
-            <div class="dot">@dotText</div>
+        <div class="rail-step @railClass" role="listitem" aria-label="@railStage.Name: @railStatusLabel">
+            <div class="line" aria-hidden="true"></div>
+            <div class="dot" aria-hidden="true">@dotText</div>
             <div class="stitle">@railStage.Name</div>
-            <div class="sstatus">@FormatStageStatus(railStage)</div>
+            <div class="sstatus">@railStatusLabel</div>
         </div>
     }
 </div>
@@ -242,10 +243,10 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
     var hasHtmlReport = !string.IsNullOrWhiteSpace(stage.HtmlReportUrl);
     var detailsKey = $"stage:{job.JobId}:{stage.Name}";
 
-    <div class="card stage-card">
+    <div class="card stage-card" aria-label="@stage.Name status: @BadgeLabel(stage.Status)">
         <div class="stage-head">
             <div class="stage-head-left">
-                <div class="stage-icon @iconCls">@StageIconLabel(stage.Status)</div>
+                <div class="stage-icon @iconCls" aria-hidden="true">@StageIconLabel(stage.Status)</div>
                 <div>
                     <div class="stage-name">@stage.Name</div>
                     <div class="stage-summary">
@@ -270,7 +271,7 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
                     </div>
                 </div>
             </div>
-            <span class="badge @BadgeClass(stage.Status)">@BadgeLabel(stage.Status)</span>
+            <span class="badge @BadgeClass(stage.Status)" aria-label="@stage.Name status: @BadgeLabel(stage.Status)">@BadgeLabel(stage.Status)</span>
         </div>
 
         @if (hasHtmlReport || hasDetails)

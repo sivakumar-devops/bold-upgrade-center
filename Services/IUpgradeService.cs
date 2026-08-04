@@ -13,7 +13,7 @@ namespace BoldBI.UpgradeCenter.Services
     /// </summary>
     public interface IUpgradeService
     {
-        // ── Catalog ──
+        // Catalog.
 
         /// <summary>
         /// Returns ordered list of releases available for upgrade from the
@@ -25,7 +25,7 @@ namespace BoldBI.UpgradeCenter.Services
             string installedVersion,
             CancellationToken ct = default);
 
-        // ── Patch validation ──
+        // Patch validation.
 
         /// <summary>
         /// Validates generated custom patch images from a patch version and
@@ -36,7 +36,7 @@ namespace BoldBI.UpgradeCenter.Services
             string? imageRepository = null,
             CancellationToken ct = default);
 
-        // ── Upgrade execution ──
+        // Upgrade execution.
 
         /// <summary>
         /// Starts an upgrade job for a standard catalog release.
@@ -62,7 +62,7 @@ namespace BoldBI.UpgradeCenter.Services
             string jobId,
             string requestedBy,
             CancellationToken ct = default);
-        // ── Rollback ──
+        // Rollback.
 
         /// <summary>
         /// Triggers a rollback of the specified completed upgrade job.

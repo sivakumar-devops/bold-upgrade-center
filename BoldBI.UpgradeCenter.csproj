@@ -2,6 +2,12 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>BoldBI.UpgradeCenter</RootNamespace>
+    <AssemblyName>BoldBI.UpgradeCenter</AssemblyName>
+    <Product>Bold BI Upgrade Center</Product>
+    <Company>Syncfusion, Inc.</Company>
+    <Copyright>Copyright (c) 2001-2026 Syncfusion, Inc.</Copyright>
+    <NeutralLanguage>en</NeutralLanguage>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>

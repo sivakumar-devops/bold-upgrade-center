@@ -16,7 +16,7 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
         public bool HasSchemaChanges { get; set; }
 
         /// <summary>
-        /// For custom patches — the raw image reference the admin typed.
+        /// For custom patches: the raw image reference the admin typed.
         /// Null for standard catalog releases.
         /// </summary>
         public string? CustomImageReference { get; set; }
