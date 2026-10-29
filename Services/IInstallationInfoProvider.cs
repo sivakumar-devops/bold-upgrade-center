@@ -1,8 +1,8 @@
 using System.Threading;
 using System.Threading.Tasks;
-using BoldBI.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models;
 
-namespace BoldBI.UpgradeCenter.Services
+namespace Bold.UpgradeCenter.Services
 {
     /// <summary>
     /// Reads the current installation state from the host environment

@@ -1,8 +1,10 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class UpgradeJobRecoveryService : BackgroundService
 {
     private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReconciliationInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan MinimumRecoveryAge = TimeSpan.FromSeconds(30);
 
     private readonly IServiceScopeFactory scopeFactory;
     private readonly ILogger<UpgradeJobRecoveryService> logger;
@@ -26,24 +28,74 @@ public sealed class UpgradeJobRecoveryService : BackgroundService
             return;
         }
 
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await ReconcileActiveJobAsync(stoppingToken);
+
+            try
+            {
+                await Task.Delay(ReconciliationInterval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task ReconcileActiveJobAsync(CancellationToken stoppingToken)
+    {
         try
         {
             using var scope = scopeFactory.CreateScope();
             var jobStore = scope.ServiceProvider.GetRequiredService<IUpgradeJobStore>();
             if (!jobStore.TryGetLatestActive(out var activeJob))
             {
-                logger.LogInformation("No active upgrade job was found during startup recovery.");
+                logger.LogDebug("No active upgrade job was found during recovery reconciliation.");
+                return;
+            }
+
+            var configured = UpgradeExecutionEnvironments.Parse(scope.ServiceProvider.GetRequiredService<IConfiguration>()["UpgradeCenter:ExecutionEnvironment"]);
+            if (UpgradeExecutionEnvironments.Parse(activeJob.ExecutionEnvironment) != configured)
+            {
+                logger.LogError("Active operation belongs to another execution environment. Restore the original configuration before recovery. JobId: {JobId}.", activeJob.Id);
                 return;
             }
 
             logger.LogWarning(
-                "Active upgrade job found during startup recovery. JobId: {JobId}. Stage: {Stage}. Status: {Status}.",
+                "Active upgrade job found during recovery reconciliation. JobId: {JobId}. Stage: {Stage}. Status: {Status}.",
                 activeJob.Id,
                 activeJob.CurrentStage,
                 activeJob.Status);
 
+            if (DateTimeOffset.UtcNow - activeJob.StartedAt < MinimumRecoveryAge)
+            {
+                logger.LogDebug(
+                    "Recovery reconciliation skipped because the active job was started recently. JobId: {JobId}.",
+                    activeJob.Id);
+                return;
+            }
+
+            var executionRegistry = scope.ServiceProvider.GetRequiredService<IUpgradeJobExecutionRegistry>();
+            if (executionRegistry.IsActive(activeJob.Id))
+            {
+                logger.LogDebug(
+                    "Recovery reconciliation skipped because the job is currently owned by an active runner. JobId: {JobId}.",
+                    activeJob.Id);
+                return;
+            }
+
+            if (activeJob.UpgradeType == UpgradeJobType.Rollback)
+            {
+                var rollbackJobRunner = scope.ServiceProvider.GetRequiredService<IUpgradeRollbackJobRunner>();
+                rollbackJobRunner.Recover(activeJob.Id);
+                await Task.CompletedTask;
+                return;
+            }
+
             var jobRunner = scope.ServiceProvider.GetRequiredService<IUpgradeJobRunner>();
             jobRunner.Recover(activeJob.Id);
+            await Task.CompletedTask;
         }
         catch (OperationCanceledException)
         {
@@ -51,7 +103,7 @@ public sealed class UpgradeJobRecoveryService : BackgroundService
         }
         catch (Exception exception)
         {
-            logger.LogError(exception, "Upgrade job startup recovery failed.");
+            logger.LogError(exception, "Upgrade job recovery reconciliation failed.");
         }
     }
 }

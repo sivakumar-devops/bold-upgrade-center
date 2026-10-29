@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using System.Net.Security;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
@@ -10,9 +11,9 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
-public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobService
+public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobService, IPlaywrightRuntimeEnvironmentProvider
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -23,15 +24,22 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         @"(?<key>password|pwd|secret|token|authorization|api[_-]?key|connectionstring)\s*[:=]\s*[""']?[^,""'\r\n]+",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private const string PlaywrightResourceAppName = "bold-upgrade-center-playwright";
+    private const string PlaywrightJobIdAnnotation = "upgrade-center.bold.com/job-id";
+    private const string PlaywrightValidationAnnotation = "upgrade-center.bold.com/validation";
+
     private readonly PlaywrightExecutionOptions playwrightOptions;
     private readonly KubernetesUpgradeOptions kubernetesOptions;
     private readonly IConfiguration configuration;
     private readonly IUpgradeCenterConfigurationProvider configurationProvider;
     private readonly IUpgradeDatabaseDiscoveryService databaseDiscoveryService;
+    private readonly IUpgradeProductContext productContext;
     private readonly IPlaywrightReportStore reportStore;
     private readonly IPlaywrightReportUploadTokenStore reportUploadTokenStore;
     private readonly IPlaywrightValidationResultStore validationResultStore;
     private readonly IUpgradeOperationLogStore operationLogStore;
+    private readonly IPlaywrightRunnerImageProvider runnerImageProvider;
+    private readonly IHostEnvironment hostEnvironment;
     private readonly ILogger<PlaywrightKubernetesJobService> logger;
 
     public PlaywrightKubernetesJobService(
@@ -40,10 +48,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         IConfiguration configuration,
         IUpgradeCenterConfigurationProvider configurationProvider,
         IUpgradeDatabaseDiscoveryService databaseDiscoveryService,
+        IUpgradeProductContext productContext,
         IPlaywrightReportStore reportStore,
         IPlaywrightReportUploadTokenStore reportUploadTokenStore,
         IPlaywrightValidationResultStore validationResultStore,
         IUpgradeOperationLogStore operationLogStore,
+        IPlaywrightRunnerImageProvider runnerImageProvider,
+        IHostEnvironment hostEnvironment,
         ILogger<PlaywrightKubernetesJobService> logger)
     {
         this.playwrightOptions = playwrightOptions.Value;
@@ -51,10 +62,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         this.configuration = configuration;
         this.configurationProvider = configurationProvider;
         this.databaseDiscoveryService = databaseDiscoveryService;
+        this.productContext = productContext;
         this.reportStore = reportStore;
         this.reportUploadTokenStore = reportUploadTokenStore;
         this.validationResultStore = validationResultStore;
         this.operationLogStore = operationLogStore;
+        this.runnerImageProvider = runnerImageProvider;
+        this.hostEnvironment = hostEnvironment;
         this.logger = logger;
     }
 
@@ -62,15 +76,14 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         PlaywrightValidationMode mode,
         string upgradeJobId,
         Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
         CancellationToken cancellationToken = default)
     {
         var startedAt = DateTimeOffset.UtcNow;
-        var modeText = mode == PlaywrightValidationMode.Pre ? "pre" : "post";
-        var displayName = mode == PlaywrightValidationMode.Pre
-            ? "Pre-upgrade Playwright validation"
-            : "Post-upgrade Playwright validation";
+        var modeText = ToModeText(mode);
+        var displayName = ToDisplayName(mode);
 
-        progress?.Invoke(new PlaywrightValidationProgress("playwright-prepare", UpgradeJobStageStatus.Running, $"Preparing {modeText}-upgrade validation."));
+        progress?.Invoke(new PlaywrightValidationProgress("playwright-prepare", UpgradeJobStageStatus.Running, $"Preparing {ToProgressLabel(mode)}."));
 
         var context = ResolveContext();
         if (!context.Succeeded)
@@ -78,17 +91,42 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             return CreateResult(false, null, false, startedAt, displayName, string.Empty, context.Message, context.Message);
         }
 
-        if (string.IsNullOrWhiteSpace(playwrightOptions.RunnerImage))
+        var runnerImage = await runnerImageProvider.GetRunnerImageAsync(runnerImageVersion ?? string.Empty, cancellationToken);
+        if (string.IsNullOrWhiteSpace(runnerImage))
         {
-            const string message = "Playwright runner image is not configured.";
+            var message = string.IsNullOrWhiteSpace(runnerImageVersion)
+                ? $"Playwright runner image could not be resolved because the {ToProgressLabel(mode)} image version is not available."
+                : $"Playwright runner image is not available from release metadata for {ToProgressLabel(mode)} version {runnerImageVersion}.";
             return CreateResult(false, null, false, startedAt, displayName, string.Empty, message, message);
         }
 
         RuntimeConfiguration runtimeConfiguration;
         try
         {
-            runtimeConfiguration = await ResolveRuntimeConfigurationAsync(cancellationToken);
-            var reportUploadToken = reportUploadTokenStore.Register(upgradeJobId, mode);
+            using var recoveryClient = CreateKubernetesHttpClient(context);
+            var recoveryNames = CreatePlaywrightResourceNames(upgradeJobId, modeText);
+            using var existingSecret = await GetOwnedResourceAsync(
+                recoveryClient,
+                $"/api/v1/namespaces/{Uri.EscapeDataString(context.Namespace!)}/secrets/{Uri.EscapeDataString(recoveryNames.SecretName)}",
+                upgradeJobId,
+                modeText,
+                cancellationToken);
+
+            string? existingToken = null;
+            if (existingSecret is not null)
+            {
+                var existingValues = ReadSecretData(existingSecret.RootElement);
+                runtimeConfiguration = new RuntimeConfiguration(
+                    existingValues,
+                    existingValues.Values.Where(value => value.Length >= 4).Distinct(StringComparer.Ordinal).ToList());
+                existingValues.TryGetValue("BOLD_UPGRADE_CENTER_REPORT_UPLOAD_TOKEN", out existingToken);
+            }
+            else
+            {
+                runtimeConfiguration = await ResolveRuntimeConfigurationAsync(cancellationToken);
+            }
+
+            var reportUploadToken = reportUploadTokenStore.Register(upgradeJobId, mode, ResolveUploadTokenTtl(mode), existingToken);
             runtimeConfiguration = runtimeConfiguration.WithPlaywrightUploads(
                 BuildReportUploadUrl(upgradeJobId, mode),
                 BuildResultUploadUrl(upgradeJobId, mode),
@@ -101,39 +139,65 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             return CreateResult(false, null, false, startedAt, displayName, string.Empty, message, message);
         }
 
-        var nameSuffix = CreateResourceNameSuffix(upgradeJobId);
-        var resourceNonce = Guid.NewGuid().ToString("N")[..8];
-        var secretName = $"upgrade-playwright-{modeText}-{nameSuffix}-{resourceNonce}";
-        var jobName = $"upgrade-playwright-{modeText}-{nameSuffix}-{resourceNonce}";
-        var sharedStatePvcName = GetSharedStatePvcName(upgradeJobId);
+        var resourceNames = CreatePlaywrightResourceNames(upgradeJobId, modeText);
+        var secretName = resourceNames.SecretName;
+        var jobName = resourceNames.JobName;
+        var sharedStatePvcName = resourceNames.SharedStatePvcName;
         var labels = new Dictionary<string, string>
         {
-            ["app.kubernetes.io/name"] = "boldbi-upgrade-center-playwright",
-            ["upgrade-center.boldbi.com/job-id"] = nameSuffix,
-            ["upgrade-center.boldbi.com/validation"] = modeText
+            ["app.kubernetes.io/name"] = PlaywrightResourceAppName,
+            [PlaywrightJobIdAnnotation] = resourceNames.ShortJobId,
+            [PlaywrightValidationAnnotation] = modeText
+        };
+        var annotations = new Dictionary<string, string>
+        {
+            [PlaywrightJobIdAnnotation] = upgradeJobId,
+            [PlaywrightValidationAnnotation] = modeText
         };
 
         using var client = CreateKubernetesHttpClient(context);
         var secretCreated = false;
+        var sharedStatePvcCreated = false;
+        var jobCreated = false;
         PlaywrightScriptResult? executionResult = null;
         try
         {
+            using var existingJob = await GetOwnedResourceAsync(
+                client,
+                $"/apis/batch/v1/namespaces/{Uri.EscapeDataString(context.Namespace!)}/jobs/{Uri.EscapeDataString(jobName)}",
+                upgradeJobId,
+                modeText,
+                cancellationToken);
+            if (existingJob is not null &&
+                existingJob.RootElement.GetProperty("metadata").TryGetProperty("creationTimestamp", out var timestamp) &&
+                DateTimeOffset.TryParse(timestamp.GetString(), out var originalStart))
+            {
+                startedAt = originalStart;
+            }
+
+            if (mode == PlaywrightValidationMode.Cleanup)
+            {
+                await StopValidationBeforeCleanupAsync(client, context.Namespace!, upgradeJobId, cancellationToken);
+            }
+
             if (playwrightOptions.SharedStateVolumeEnabled)
             {
-                progress?.Invoke(new PlaywrightValidationProgress("playwright-shared-state", UpgradeJobStageStatus.Running, "Preparing shared Playwright validation state volume."));
-                await CreateOrReuseSharedStatePvcAsync(client, context.Namespace!, sharedStatePvcName, labels, cancellationToken);
-                progress?.Invoke(new PlaywrightValidationProgress("playwright-shared-state", UpgradeJobStageStatus.Succeeded, "Shared Playwright validation state volume is ready."));
+                progress?.Invoke(new PlaywrightValidationProgress("playwright-shared-state", UpgradeJobStageStatus.Running, "Preparing shared Playwright state volume."));
+                await CreateOrReuseSharedStatePvcAsync(client, context.Namespace!, sharedStatePvcName, labels, annotations, cancellationToken);
+                sharedStatePvcCreated = true;
+                progress?.Invoke(new PlaywrightValidationProgress("playwright-shared-state", UpgradeJobStageStatus.Succeeded, "Shared Playwright state volume is ready."));
                 runtimeConfiguration = runtimeConfiguration.WithSharedStateDirectory(GetSharedStateMountPath());
             }
 
             progress?.Invoke(new PlaywrightValidationProgress("playwright-secret", UpgradeJobStageStatus.Running, "Creating temporary Playwright runtime Secret."));
-            await CreateSecretAsync(client, context.Namespace!, secretName, labels, runtimeConfiguration.Environment, cancellationToken);
+            await CreateSecretAsync(client, context.Namespace!, secretName, labels, annotations, runtimeConfiguration.Environment, cancellationToken);
             secretCreated = true;
             progress?.Invoke(new PlaywrightValidationProgress("playwright-secret", UpgradeJobStageStatus.Succeeded, "Temporary runtime Secret created."));
 
-            progress?.Invoke(new PlaywrightValidationProgress("playwright-job", UpgradeJobStageStatus.Running, "Creating Playwright validation Job."));
-            await CreateJobAsync(client, context.Namespace!, jobName, secretName, sharedStatePvcName, labels, modeText, runtimeConfiguration.Environment.Keys, cancellationToken);
-            progress?.Invoke(new PlaywrightValidationProgress("playwright-job", UpgradeJobStageStatus.Succeeded, "Playwright validation Job created."));
+            progress?.Invoke(new PlaywrightValidationProgress("playwright-job", UpgradeJobStageStatus.Running, $"Creating {displayName} Job."));
+            await CreateJobAsync(client, context.Namespace!, jobName, secretName, sharedStatePvcName, labels, annotations, modeText, runnerImage, runtimeConfiguration.Environment.Keys, mode, cancellationToken);
+            jobCreated = true;
+            progress?.Invoke(new PlaywrightValidationProgress("playwright-job", UpgradeJobStageStatus.Succeeded, $"{displayName} Job created."));
 
             progress?.Invoke(new PlaywrightValidationProgress("playwright-runner", UpgradeJobStageStatus.Running, "Waiting for Playwright runner pod."));
             executionResult = await MonitorJobAsync(
@@ -157,12 +221,19 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         }
         catch (Exception exception)
         {
-            var message = $"Playwright validation infrastructure failed: {exception.Message}";
+            var failureMessage = exception is KubernetesApiRequestException kubernetesException
+                ? kubernetesException.PublicMessage
+                : exception.Message;
+            var message = $"Playwright validation infrastructure failed: {failureMessage}";
+            var technicalError = exception is KubernetesApiRequestException kubernetesApiException
+                ? kubernetesApiException.DetailedMessage
+                : message;
             logger.LogWarning(exception, "Playwright Kubernetes Job execution failed. JobName: {JobName}. No sensitive values were logged.", jobName);
-            return CreateResult(false, null, false, startedAt, displayName, string.Empty, message, message);
+            return CreateResult(false, null, false, startedAt, displayName, string.Empty, technicalError, message, jobCreated);
         }
         finally
         {
+            string? cleanupResourceError = null;
             reportUploadTokenStore.Revoke(upgradeJobId, mode);
             if (cancellationToken.IsCancellationRequested)
             {
@@ -177,19 +248,6 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 }
             }
 
-            if (ShouldDeleteSharedStatePvc(mode, executionResult))
-            {
-                try
-                {
-                    await DeletePersistentVolumeClaimAsync(client, context.Namespace!, sharedStatePvcName, CancellationToken.None);
-                    logger.LogInformation("Temporary Playwright shared state PVC deleted. PersistentVolumeClaimName: {PersistentVolumeClaimName}.", sharedStatePvcName);
-                }
-                catch (Exception exception)
-                {
-                    logger.LogWarning(exception, "Temporary Playwright shared state PVC cleanup failed. PersistentVolumeClaimName: {PersistentVolumeClaimName}.", sharedStatePvcName);
-                }
-            }
-
             if (secretCreated)
             {
                 try
@@ -200,7 +258,79 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 catch (Exception exception)
                 {
                     logger.LogWarning(exception, "Temporary Playwright Secret cleanup failed. SecretName: {SecretName}.", secretName);
+                    if (mode == PlaywrightValidationMode.Cleanup)
+                    {
+                        cleanupResourceError = $"Temporary runtime Secret '{secretName}' could not be removed.";
+                    }
                 }
+            }
+
+            if (cleanupResourceError is null && ShouldDeleteSharedStatePvc(mode, executionResult, sharedStatePvcCreated, jobCreated))
+            {
+                try
+                {
+                    await DeletePersistentVolumeClaimAsync(client, context.Namespace!, sharedStatePvcName, CancellationToken.None);
+                    logger.LogInformation("Temporary Playwright shared state PVC deleted. PersistentVolumeClaimName: {PersistentVolumeClaimName}.", sharedStatePvcName);
+                }
+                catch (Exception exception)
+                {
+                    logger.LogWarning(exception, "Temporary Playwright shared state PVC cleanup failed. PersistentVolumeClaimName: {PersistentVolumeClaimName}.", sharedStatePvcName);
+                    if (mode == PlaywrightValidationMode.Cleanup)
+                    {
+                        cleanupResourceError = $"Shared state PVC '{sharedStatePvcName}' could not be removed.";
+                    }
+                }
+            }
+
+            if (cleanupResourceError is not null)
+            {
+                throw new InvalidOperationException(cleanupResourceError + " Manual cleanup is required. Review the application logs for the Kubernetes failure reason.");
+            }
+        }
+    }
+
+    private async Task StopValidationBeforeCleanupAsync(
+        HttpClient client,
+        string kubernetesNamespace,
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        foreach (var validationMode in new[] { "pre", "post" })
+        {
+            var names = CreatePlaywrightResourceNames(jobId, validationMode);
+            using var job = await GetOwnedResourceAsync(
+                client,
+                $"/apis/batch/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/jobs/{Uri.EscapeDataString(names.JobName)}",
+                jobId,
+                validationMode,
+                cancellationToken);
+            if (job is not null && GetJobTerminalCondition(job.RootElement) is not ("Complete" or "Failed"))
+            {
+                await DeleteJobAsync(client, kubernetesNamespace, names.JobName, cancellationToken);
+            }
+
+            var selector = Uri.EscapeDataString($"{PlaywrightJobIdAnnotation}={names.ShortJobId},{PlaywrightValidationAnnotation}={validationMode}");
+            var stopped = false;
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                using var pods = await GetJsonAsync(
+                    client,
+                    $"/api/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/pods?labelSelector={selector}",
+                    cancellationToken);
+                stopped = pods.RootElement.GetProperty("items").EnumerateArray().All(pod =>
+                    TryGetString(pod, "status", "phase") is "Succeeded" or "Failed");
+                if (stopped)
+                {
+                    break;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+            }
+
+            if (!stopped)
+            {
+                throw new InvalidOperationException("Cleanup cannot start because a validation pod has not stopped. Resource deletion cannot be verified safely.");
             }
         }
     }
@@ -240,20 +370,43 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         response.EnsureSuccessStatusCode();
     }
 
-    private async Task<RuntimeConfiguration> ResolveRuntimeConfigurationAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyDictionary<string, string>> ResolveEnvironmentAsync(CancellationToken cancellationToken) =>
+        (await ResolveRuntimeConfigurationAsync(cancellationToken)).Environment;
+
+    internal async Task<RuntimeConfiguration> ResolveRuntimeConfigurationAsync(CancellationToken cancellationToken)
+    {
+        return productContext.Current.Product == UpgradeProduct.BoldReports
+            ? await ResolveBoldReportsRuntimeConfigurationAsync(cancellationToken)
+            : await ResolveBoldBiRuntimeConfigurationAsync(cancellationToken);
+    }
+
+    private async Task<RuntimeConfiguration> ResolveBoldBiRuntimeConfigurationAsync(CancellationToken cancellationToken)
     {
         var runtime = await configurationProvider.GetConfigurationAsync(cancellationToken);
         var masterDatabase = await databaseDiscoveryService.DiscoverMasterDatabaseAsync(cancellationToken);
         var databaseValues = ParseDatabaseValues(masterDatabase);
-        var adminUsername = FirstConfiguredValue(
-            playwrightOptions.AdminUsername,
-            configuration["UpgradeCenter:Playwright:AdminUsername"],
-            configuration["BOLDBI_ADMIN_USERNAME"]);
-        var adminPassword = FirstConfiguredValue(
-            playwrightOptions.AdminPassword,
-            configuration["UpgradeCenter:Playwright:AdminPassword"],
-            configuration["BOLDBI_ADMIN_PASSWORD"]);
+        var adminUsername = ResolveAdminUsername();
+        var adminPassword = ResolveAdminPassword();
         var passRateThreshold = ResolvePassRateThreshold();
+        var workerCount = ResolveWorkerCount();
+        var databaseType = FirstConfiguredValue(
+            playwrightOptions.DbType,
+            configuration["UpgradeCenter:Playwright:DbType"],
+            configuration["BOLDBI_DB_TYPE"],
+            databaseValues.DatabaseType)!;
+        var databaseSsl = await ResolveDatabaseSslAsync(
+            masterDatabase,
+            databaseValues.SslDisposition,
+            cancellationToken);
+        var showDataHub = ResolveShowDataHub(runtime.ShowDataHub);
+        var databaseMaintenance = FirstConfiguredValue(
+            playwrightOptions.DbMaintenance,
+            configuration["UpgradeCenter:Playwright:DbMaintenance"],
+            configuration["BOLDBI_DB_MAINTENANCE"]);
+        var databaseAdditionalParameters = FirstConfiguredValue(
+            playwrightOptions.DbAdditionalParameters,
+            configuration["UpgradeCenter:Playwright:DbAdditionalParameters"],
+            configuration["BOLDBI_DB_ADDITIONAL_PARAMETERS"]);
 
         var values = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -262,14 +415,15 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             ["BOLDBI_ADMIN_PASSWORD"] = Required(adminPassword, "Playwright admin password"),
             ["BOLDBI_API_KEY_ID"] = Required(runtime.InternalAppClientId, "internal app client ID"),
             ["BOLDBI_API_KEY_SECRET"] = Required(runtime.InternalAppClientSecret, "internal app client secret"),
-            ["BOLDBI_DB_HOST"] = Required(databaseValues.Host, "database host"),
-            ["BOLDBI_DB_PORT"] = Required(databaseValues.Port, "database port"),
-            ["BOLDBI_DB_NAME"] = Required(databaseValues.DatabaseName, "database name"),
-            ["BOLDBI_DB_TYPE"] = databaseValues.DatabaseType,
-            ["BOLDBI_DB_USERNAME"] = Required(databaseValues.Username, "database username"),
-            ["BOLDBI_DB_PASSWORD"] = Required(databaseValues.Password, "database password"),
-            ["BOLDBI_DB_SSL"] = databaseValues.SslEnabled ? "true" : "false",
+            ["BOLDBI_SHOW_DATA_HUB"] = showDataHub ? "true" : "false",
+            ["BOLDBI_DB_HOST"] = Required(FirstConfiguredValue(playwrightOptions.DbHost, configuration["UpgradeCenter:Playwright:DbHost"], configuration["BOLDBI_DB_HOST"], databaseValues.Host), "database host"),
+            ["BOLDBI_DB_PORT"] = Required(FirstConfiguredValue(playwrightOptions.DbPort, configuration["UpgradeCenter:Playwright:DbPort"], configuration["BOLDBI_DB_PORT"], databaseValues.Port), "database port"),
+            ["BOLDBI_DB_TYPE"] = databaseType,
+            ["BOLDBI_DB_USERNAME"] = Required(FirstConfiguredValue(playwrightOptions.DbUsername, configuration["UpgradeCenter:Playwright:DbUsername"], configuration["BOLDBI_DB_USERNAME"], databaseValues.Username), "database username"),
+            ["BOLDBI_DB_PASSWORD"] = Required(FirstConfiguredValue(playwrightOptions.DbPassword, configuration["UpgradeCenter:Playwright:DbPassword"], configuration["BOLDBI_DB_PASSWORD"], databaseValues.Password), "database password"),
+            ["BOLDBI_DB_SSL"] = databaseSsl ? "true" : "false",
             ["BOLDBI_PLAYWRIGHT_PASS_THRESHOLD"] = passRateThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["BOLDBI_PLAYWRIGHT_WORKERS"] = workerCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["PLAYWRIGHT_PRE_JUNIT_REPORT_PATH"] = GetConfiguredReportPath(
                 "UpgradeCenter:Playwright:PreJunitReportPath",
                 playwrightOptions.PreJunitReportPath),
@@ -290,16 +444,83 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 playwrightOptions.PostHtmlReportDirectory)
         };
 
-        AddOptional(values, "BOLDBI_DB_MAINTENANCE");
-        AddOptional(values, "BOLDBI_DB_ADDITIONAL_PARAMETERS");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_HOST");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_PORT");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_USERNAME");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_PASSWORD");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_NAME");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_SCHEMA");
-        AddOptional(values, "BOLDBI_TESTDATA_DB_TABLE");
-        AddOptional(values, "BOLDBI_TESTDATA_ETL_DB_NAME");
+        AddOptional(values, "BOLDBI_DB_MAINTENANCE", databaseMaintenance);
+        AddOptional(values, "BOLDBI_DB_ADDITIONAL_PARAMETERS", databaseAdditionalParameters);
+        AddOptional(values, "PLAYWRIGHT_POD_HOLD_SECONDS");
+
+        var redactionValues = values.Values
+            .Where(value => !string.IsNullOrWhiteSpace(value) && value.Length >= 4)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        return new RuntimeConfiguration(values, redactionValues);
+    }
+
+    private async Task<RuntimeConfiguration> ResolveBoldReportsRuntimeConfigurationAsync(CancellationToken cancellationToken)
+    {
+        var runtime = await configurationProvider.GetConfigurationAsync(cancellationToken);
+        var masterDatabase = await databaseDiscoveryService.DiscoverMasterDatabaseAsync(cancellationToken);
+        var databaseValues = ParseDatabaseValues(masterDatabase);
+        var databaseSsl = await ResolveDatabaseSslAsync(
+            masterDatabase,
+            databaseValues.SslDisposition,
+            "BOLDREPORTS_DB_SSL",
+            cancellationToken);
+        var adminUsername = ResolveAdminUsername();
+        var adminPassword = ResolveAdminPassword();
+        var passRateThreshold = ResolvePassRateThreshold("BOLDREPORTS_PLAYWRIGHT_PASS_THRESHOLD", "100");
+        var workerCount = ResolveWorkerCount("BOLDREPORTS_PLAYWRIGHT_WORKERS", "4");
+        var databaseHost = Required(databaseValues.Host, "database host");
+        var databasePort = Required(databaseValues.Port, "database port");
+        var databaseName = Required(databaseValues.DatabaseName, "database name");
+        var databaseUsername = Required(databaseValues.Username, "database username");
+        var databasePassword = Required(databaseValues.Password, "database password");
+        var siteDatabaseName = FirstConfiguredValue(
+            configuration["UpgradeCenter:Playwright:SiteDatabaseName"],
+            configuration["BOLDREPORTS_SITE_DATABASE_NAME"])
+            ?? string.Empty;
+        var singleDbConfiguration = FirstConfiguredValue(
+            configuration["UpgradeCenter:Playwright:SingleDbConfiguration"],
+            configuration["BOLDREPORTS_SINGLE_DB_CONFIGURATION"],
+            (runtime.UseSingleTenantDb ?? true) ? "true" : "false");
+
+        var values = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["BOLDREPORTS_BASE_URL"] = Required(runtime.IdpBaseUrl, "IDP public base URL"),
+            ["BOLDREPORTS_ADMIN_USERNAME"] = Required(adminUsername, "Playwright admin username"),
+            ["BOLDREPORTS_ADMIN_PASSWORD"] = Required(adminPassword, "Playwright admin password"),
+            ["BOLDREPORTS_DB_HOST"] = databaseHost,
+            ["BOLDREPORTS_DB_PORT"] = databasePort,
+            ["BOLDREPORTS_DB_NAME"] = databaseName,
+            ["BOLDREPORTS_SITE_DATABASE_NAME"] = siteDatabaseName,
+            ["BOLDREPORTS_DB_TYPE"] = databaseValues.DatabaseType,
+            ["BOLDREPORTS_DB_USERNAME"] = databaseUsername,
+            ["BOLDREPORTS_DB_PASSWORD"] = databasePassword,
+            ["BOLDREPORTS_DB_SSL"] = databaseSsl ? "true" : "false",
+            ["BOLDREPORTS_SINGLE_DB_CONFIGURATION"] = Required(singleDbConfiguration, "Playwright single database configuration"),
+            ["BOLDREPORTS_PLAYWRIGHT_PASS_THRESHOLD"] = passRateThreshold.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["BOLDREPORTS_PLAYWRIGHT_WORKERS"] = workerCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["PLAYWRIGHT_PRE_JUNIT_REPORT_PATH"] = "/app/Upgrade-results/pre-upgrade-test-results/testresults.json",
+            ["PLAYWRIGHT_POST_JUNIT_REPORT_PATH"] = "/app/Upgrade-results/post-upgrade-test-results/testresults.json",
+            ["PLAYWRIGHT_PRE_HTML_REPORT_PATH"] = "/app/Upgrade-results/pre-upgrade-test-results/index.html",
+            ["PLAYWRIGHT_POST_HTML_REPORT_PATH"] = "/app/Upgrade-results/post-upgrade-test-results/index.html",
+            ["PLAYWRIGHT_PRE_HTML_REPORT_DIR"] = "/app/Upgrade-results/pre-upgrade-test-results",
+            ["PLAYWRIGHT_POST_HTML_REPORT_DIR"] = "/app/Upgrade-results/post-upgrade-test-results",
+            ["BOLDREPORTS_DEDICATED_CLEANUP"] = "true"
+        };
+
+        if (!string.IsNullOrWhiteSpace(runtime.InternalAppClientId))
+        {
+            values["BOLDREPORTS_API_KEY_ID"] = runtime.InternalAppClientId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(runtime.InternalAppClientSecret))
+        {
+            values["BOLDREPORTS_API_KEY_SECRET"] = runtime.InternalAppClientSecret;
+        }
+
+        AddOptional(values, "BOLDREPORTS_SITE_NAME");
+        AddOptional(values, "BOLDREPORTS_SITE_IDENTIFIER");
         AddOptional(values, "PLAYWRIGHT_POD_HOLD_SECONDS");
 
         var redactionValues = values.Values
@@ -312,11 +533,32 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
 
     private int ResolvePassRateThreshold()
     {
+        return ResolvePassRateThreshold("BOLDBI_PLAYWRIGHT_PASS_THRESHOLD", "100");
+    }
+
+    private string? ResolveAdminUsername()
+    {
+        return FirstConfiguredValue(
+            playwrightOptions.AdminUsername,
+            configuration["UpgradeCenter:Playwright:AdminUsername"],
+            configuration["BOLD_ADMIN_USERNAME"]);
+    }
+
+    private string? ResolveAdminPassword()
+    {
+        return FirstConfiguredValue(
+            playwrightOptions.AdminPassword,
+            configuration["UpgradeCenter:Playwright:AdminPassword"],
+            configuration["BOLD_ADMIN_PASSWORD"]);
+    }
+
+    private int ResolvePassRateThreshold(string environmentVariableName, string defaultValue)
+    {
         var rawValue = FirstConfiguredValue(
+            configuration[environmentVariableName],
             configuration["UpgradeCenter:Playwright:PassRateThreshold"],
             playwrightOptions.PassRateThreshold,
-            configuration["BOLDBI_PLAYWRIGHT_PASS_THRESHOLD"],
-            "100");
+            defaultValue);
 
         if (!int.TryParse(rawValue, out var threshold) || threshold < 0 || threshold > 100)
         {
@@ -326,15 +568,299 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         return threshold;
     }
 
+    private int ResolveWorkerCount()
+    {
+        return ResolveWorkerCount("BOLDBI_PLAYWRIGHT_WORKERS", "1");
+    }
+
+    private int ResolveWorkerCount(string environmentVariableName, string defaultValue)
+    {
+        var rawValue = FirstConfiguredValue(
+            configuration[environmentVariableName],
+            configuration["UpgradeCenter:Playwright:WorkerCount"],
+            playwrightOptions.WorkerCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            defaultValue);
+
+        if (!int.TryParse(rawValue, out var workers) || workers < 1)
+        {
+            throw new InvalidOperationException("Playwright worker count must be configured as a positive number.");
+        }
+
+        return workers;
+    }
+
+    private async Task<bool> ResolveDatabaseSslAsync(
+        DiscoveredDatabaseConnection masterDatabase,
+        DatabaseSslDisposition discoveredDisposition,
+        CancellationToken cancellationToken)
+    {
+        return await ResolveDatabaseSslAsync(
+            masterDatabase,
+            discoveredDisposition,
+            "BOLDBI_DB_SSL",
+            cancellationToken);
+    }
+
+    private async Task<bool> ResolveDatabaseSslAsync(
+        DiscoveredDatabaseConnection masterDatabase,
+        DatabaseSslDisposition discoveredDisposition,
+        string environmentVariableName,
+        CancellationToken cancellationToken)
+    {
+        var configuredValue = FirstConfiguredValue(
+            configuration[environmentVariableName],
+            playwrightOptions.DbSsl?.ToString(),
+            configuration["UpgradeCenter:Playwright:DbSsl"]);
+
+        if (!string.IsNullOrWhiteSpace(configuredValue))
+        {
+            return configuredValue.Trim().ToLowerInvariant() switch
+            {
+                "true" or "1" or "yes" or "y" => true,
+                "false" or "0" or "no" or "n" => false,
+                _ => throw new InvalidOperationException("Playwright database SSL value must be configured as true or false.")
+            };
+        }
+
+        if (discoveredDisposition != DatabaseSslDisposition.Ambiguous)
+        {
+            return discoveredDisposition == DatabaseSslDisposition.Enabled;
+        }
+
+        try
+        {
+            var encrypted = await DetectDatabaseEncryptionAsync(masterDatabase, cancellationToken);
+            logger.LogInformation(
+                "Master database transport encryption was detected for an ambiguous SSL mode. DatabaseType: {DatabaseType}. Encrypted: {Encrypted}.",
+                masterDatabase.DatabaseType,
+                encrypted);
+            return encrypted;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            logger.LogWarning(
+                "Unable to determine master database transport encryption for an ambiguous SSL mode. DatabaseType: {DatabaseType}. No connection details were logged.",
+                masterDatabase.DatabaseType);
+            throw new InvalidOperationException(
+                "Unable to determine whether the master database connection is encrypted. Review the database SSL configuration.");
+        }
+    }
+
+    private static Task<bool> DetectDatabaseEncryptionAsync(
+        DiscoveredDatabaseConnection masterDatabase,
+        CancellationToken cancellationToken)
+    {
+        return masterDatabase.DatabaseType switch
+        {
+            DatabaseType.PostgreSQL => DetectPostgreSqlEncryptionAsync(masterDatabase.ConnectionString, cancellationToken),
+            DatabaseType.MySQL => DetectMySqlEncryptionAsync(masterDatabase.ConnectionString, cancellationToken),
+            DatabaseType.MSSQL => DetectSqlServerEncryptionAsync(masterDatabase.ConnectionString, cancellationToken),
+            DatabaseType.Oracle => DetectOracleEncryptionAsync(masterDatabase.ConnectionString, cancellationToken),
+            _ => throw new NotSupportedException($"Database type '{masterDatabase.DatabaseType}' is not supported for SSL detection.")
+        };
+    }
+
+    private static async Task<bool> DetectPostgreSqlEncryptionAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid();",
+            connection)
+        {
+            CommandTimeout = 10
+        };
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return result is bool encrypted
+            ? encrypted
+            : throw new InvalidOperationException("PostgreSQL did not return the active connection encryption state.");
+    }
+
+    private static async Task<bool> DetectMySqlEncryptionAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new MySqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new MySqlCommand("SHOW SESSION STATUS LIKE 'Ssl_cipher';", connection)
+        {
+            CommandTimeout = 10
+        };
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken) || reader.FieldCount < 2)
+        {
+            throw new InvalidOperationException("MySQL did not return the active connection encryption state.");
+        }
+
+        var cipher = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+        return !string.IsNullOrWhiteSpace(cipher);
+    }
+
+    private static async Task<bool> DetectSqlServerEncryptionAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new SqlCommand(
+            "SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID;",
+            connection)
+        {
+            CommandTimeout = 10
+        };
+        var value = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken));
+        if (string.Equals(value, "TRUE", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (string.Equals(value, "FALSE", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        throw new InvalidOperationException("SQL Server did not return the active connection encryption state.");
+    }
+
+    private static async Task<bool> DetectOracleEncryptionAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new OracleConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new OracleCommand(
+            "SELECT SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL') FROM DUAL",
+            connection)
+        {
+            CommandTimeout = 10
+        };
+        var protocol = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken))?.Trim();
+        if (string.Equals(protocol, "tcps", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (string.Equals(protocol, "tcp", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        throw new InvalidOperationException("Oracle did not return a recognized active connection protocol.");
+    }
+
+    private bool ResolveShowDataHub(bool? runtimeValue)
+    {
+        if (runtimeValue.HasValue)
+        {
+            return runtimeValue.Value;
+        }
+
+        var configuredValue = FirstConfiguredValue(
+            configuration["UpgradeCenter:Playwright:ShowDataHub"],
+            configuration["BOLDBI_SHOW_DATA_HUB"]);
+        if (string.IsNullOrWhiteSpace(configuredValue))
+        {
+            logger.LogWarning("ShowDataHub was not available from IDP configuration. BOLDBI_SHOW_DATA_HUB will default to false for the Playwright runner.");
+            return false;
+        }
+
+        return configuredValue.Trim().ToLowerInvariant() switch
+        {
+            "true" or "1" or "yes" or "y" => true,
+            "false" or "0" or "no" or "n" => false,
+            _ => LogInvalidShowDataHubAndDefault(configuredValue)
+        };
+    }
+
+    private bool LogInvalidShowDataHubAndDefault(string configuredValue)
+    {
+        logger.LogWarning("ShowDataHub value '{ShowDataHubValue}' is invalid. BOLDBI_SHOW_DATA_HUB will default to false for the Playwright runner.", configuredValue);
+        return false;
+    }
+
     private string GetConfiguredReportPath(string key, string configuredValue)
     {
         var value = FirstConfiguredValue(configuration[key], configuredValue);
         return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim();
     }
 
+    private static string ToModeText(PlaywrightValidationMode mode)
+    {
+        return mode switch
+        {
+            PlaywrightValidationMode.Post => "post",
+            PlaywrightValidationMode.Cleanup => "cleanup",
+            _ => "pre"
+        };
+    }
+
+    private static string ToDisplayName(PlaywrightValidationMode mode)
+    {
+        return mode switch
+        {
+            PlaywrightValidationMode.Post => "Post-upgrade Playwright validation",
+            PlaywrightValidationMode.Cleanup => "Playwright cleanup",
+            _ => "Pre-upgrade Playwright validation"
+        };
+    }
+
+    private static string ToProgressLabel(PlaywrightValidationMode mode)
+    {
+        return mode switch
+        {
+            PlaywrightValidationMode.Post => "post-upgrade validation",
+            PlaywrightValidationMode.Cleanup => "Playwright cleanup",
+            _ => "pre-upgrade validation"
+        };
+    }
+
+    private int GetJobTimeoutSeconds(PlaywrightValidationMode mode)
+    {
+        if (mode == PlaywrightValidationMode.Cleanup)
+        {
+            var configured = FirstConfiguredValue(
+                configuration["UpgradeCenter:Playwright:CleanupJobTimeoutSeconds"],
+                playwrightOptions.CleanupJobTimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return int.TryParse(configured, out var cleanupTimeout)
+                ? cleanupTimeout
+                : playwrightOptions.CleanupJobTimeoutSeconds;
+        }
+
+        return playwrightOptions.JobTimeoutSeconds;
+    }
+
+    private TimeSpan ResolveUploadTokenTtl(PlaywrightValidationMode mode)
+    {
+        var timeoutSeconds = Math.Max(300, GetJobTimeoutSeconds(mode));
+        return TimeSpan.FromSeconds(timeoutSeconds + 600);
+    }
+
     private void AddOptional(IDictionary<string, string> values, string key)
     {
         var value = configuration[key];
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            values[key] = value.Trim();
+        }
+    }
+
+    public Task<PlaywrightScriptResult> RunCleanupAsync(
+        string upgradeJobId,
+        Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
+        CancellationToken cancellationToken = default)
+    {
+        return RunAsync(PlaywrightValidationMode.Cleanup, upgradeJobId, progress, runnerImageVersion, cancellationToken);
+    }
+
+    private static void AddOptional(IDictionary<string, string> values, string key, string? value)
+    {
         if (!string.IsNullOrWhiteSpace(value))
         {
             values[key] = value.Trim();
@@ -356,6 +882,12 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
     private static DatabaseRuntimeValues ParsePostgreSql(string connectionString)
     {
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
+        var sslDisposition = builder.SslMode switch
+        {
+            SslMode.Disable => DatabaseSslDisposition.Disabled,
+            SslMode.Allow or SslMode.Prefer => DatabaseSslDisposition.Ambiguous,
+            _ => DatabaseSslDisposition.Enabled
+        };
         return new DatabaseRuntimeValues(
             builder.Host,
             builder.Port.ToString(),
@@ -363,12 +895,18 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             "PostgreSQL",
             builder.Username,
             builder.Password,
-            builder.SslMode != SslMode.Disable);
+            sslDisposition);
     }
 
     private static DatabaseRuntimeValues ParseMySql(string connectionString)
     {
         var builder = new MySqlConnectionStringBuilder(connectionString);
+        var sslDisposition = builder.SslMode switch
+        {
+            MySqlSslMode.None => DatabaseSslDisposition.Disabled,
+            MySqlSslMode.Preferred => DatabaseSslDisposition.Ambiguous,
+            _ => DatabaseSslDisposition.Enabled
+        };
         return new DatabaseRuntimeValues(
             builder.Server,
             builder.Port.ToString(),
@@ -376,7 +914,7 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             "MySQL",
             builder.UserID,
             builder.Password,
-            builder.SslMode != MySqlSslMode.None);
+            sslDisposition);
     }
 
     private static DatabaseRuntimeValues ParseSqlServer(string connectionString)
@@ -390,7 +928,9 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             "MSSQL",
             builder.UserID,
             builder.Password,
-            builder.Encrypt);
+            builder.Encrypt
+                ? DatabaseSslDisposition.Enabled
+                : DatabaseSslDisposition.Ambiguous);
     }
 
     private static DatabaseRuntimeValues ParseOracle(string connectionString)
@@ -405,7 +945,22 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             "Oracle",
             builder.UserID,
             builder.Password,
-            false);
+            ResolveOracleSslDisposition(dataSource));
+    }
+
+    private static DatabaseSslDisposition ResolveOracleSslDisposition(string dataSource)
+    {
+        if (Regex.IsMatch(dataSource, @"(?:PROTOCOL\s*=\s*TCPS\b)|(?:^TCPS://)", RegexOptions.IgnoreCase))
+        {
+            return DatabaseSslDisposition.Enabled;
+        }
+
+        if (Regex.IsMatch(dataSource, @"(?:PROTOCOL\s*=\s*TCP\b)|(?:^TCP://)", RegexOptions.IgnoreCase))
+        {
+            return DatabaseSslDisposition.Disabled;
+        }
+
+        return DatabaseSslDisposition.Ambiguous;
     }
 
     private static (string Host, string Port) SplitSqlServerDataSource(string dataSource)
@@ -435,6 +990,7 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         string kubernetesNamespace,
         string secretName,
         IReadOnlyDictionary<string, string> labels,
+        IReadOnlyDictionary<string, string> annotations,
         IReadOnlyDictionary<string, string> values,
         CancellationToken cancellationToken)
     {
@@ -445,7 +1001,8 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             metadata = new
             {
                 name = secretName,
-                labels
+                labels,
+                annotations
             },
             type = "Opaque",
             stringData = values
@@ -455,7 +1012,25 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             $"/api/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/secrets",
             ToJsonContent(body),
             cancellationToken);
-        response.EnsureSuccessStatusCode();
+        if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            using var existing = await GetOwnedResourceAsync(
+                client,
+                $"/api/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/secrets/{Uri.EscapeDataString(secretName)}",
+                annotations[PlaywrightJobIdAnnotation],
+                annotations[PlaywrightValidationAnnotation],
+                cancellationToken);
+            if (existing is not null)
+            {
+                return;
+            }
+        }
+
+        await EnsureKubernetesApiSuccessAsync(
+            response,
+            "creating Playwright runtime Secret",
+            secretName,
+            cancellationToken);
     }
 
     private async Task CreateOrReuseSharedStatePvcAsync(
@@ -463,6 +1038,7 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         string kubernetesNamespace,
         string pvcName,
         IReadOnlyDictionary<string, string> labels,
+        IReadOnlyDictionary<string, string> annotations,
         CancellationToken cancellationToken)
     {
         var spec = new Dictionary<string, object?>
@@ -492,7 +1068,8 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             metadata = new
             {
                 name = pvcName,
-                labels
+                labels,
+                annotations
             },
             spec
         };
@@ -506,7 +1083,11 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             return;
         }
 
-        response.EnsureSuccessStatusCode();
+        await EnsureKubernetesApiSuccessAsync(
+            response,
+            "creating Playwright shared state PersistentVolumeClaim",
+            pvcName,
+            cancellationToken);
     }
 
     private async Task CreateJobAsync(
@@ -516,8 +1097,11 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         string secretName,
         string sharedStatePvcName,
         IReadOnlyDictionary<string, string> labels,
+        IReadOnlyDictionary<string, string> annotations,
         string mode,
+        string runnerImage,
         IEnumerable<string> secretKeys,
+        PlaywrightValidationMode validationMode,
         CancellationToken cancellationToken)
     {
         var env = secretKeys
@@ -562,21 +1146,26 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             }
             : Array.Empty<object?>();
 
+        var containerSpec = new Dictionary<string, object?>
+        {
+            ["name"] = "playwright-runner",
+            ["image"] = runnerImage,
+            ["imagePullPolicy"] = "IfNotPresent",
+            ["args"] = new[] { mode },
+            ["env"] = env,
+            ["volumeMounts"] = volumeMounts
+        };
+
+        var containerResources = BuildContainerResources();
+        if (containerResources is not null)
+        {
+            containerSpec["resources"] = containerResources;
+        }
+
         var podSpec = new Dictionary<string, object?>
         {
             ["restartPolicy"] = "Never",
-            ["containers"] = new object[]
-            {
-                new
-                {
-                    name = "playwright-runner",
-                    image = playwrightOptions.RunnerImage,
-                    imagePullPolicy = "IfNotPresent",
-                    args = new[] { mode },
-                    env,
-                    volumeMounts
-                }
-            }
+            ["containers"] = new object[] { containerSpec }
         };
 
         if (playwrightOptions.SharedStateVolumeEnabled)
@@ -599,12 +1188,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         var spec = new Dictionary<string, object?>
         {
             ["backoffLimit"] = Math.Max(0, playwrightOptions.BackoffLimit),
-            ["activeDeadlineSeconds"] = Math.Max(300, playwrightOptions.JobTimeoutSeconds),
+            ["activeDeadlineSeconds"] = Math.Max(300, GetJobTimeoutSeconds(validationMode)),
             ["template"] = new
             {
                 metadata = new
                 {
-                    labels
+                    labels,
+                    annotations
                 },
                 spec = podSpec
             }
@@ -622,7 +1212,8 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             metadata = new
             {
                 name = jobName,
-                labels
+                labels,
+                annotations
             },
             spec
         };
@@ -631,7 +1222,101 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             $"/apis/batch/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/jobs",
             ToJsonContent(body),
             cancellationToken);
-        response.EnsureSuccessStatusCode();
+        if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            using var existing = await GetOwnedResourceAsync(
+                client,
+                $"/apis/batch/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/jobs/{Uri.EscapeDataString(jobName)}",
+                annotations[PlaywrightJobIdAnnotation],
+                mode,
+                cancellationToken);
+            if (existing is not null)
+            {
+                return;
+            }
+        }
+
+        await EnsureKubernetesApiSuccessAsync(
+            response,
+            "creating Playwright Kubernetes Job",
+            jobName,
+            cancellationToken);
+    }
+
+    private async Task<JsonDocument?> GetOwnedResourceAsync(
+        HttpClient client,
+        string url,
+        string jobId,
+        string mode,
+        CancellationToken cancellationToken)
+    {
+        using var response = await client.GetAsync(url, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+
+        await EnsureKubernetesApiSuccessAsync(response, "reading existing Playwright resource", jobId, cancellationToken);
+        var resource = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        if (resource.RootElement.TryGetProperty("metadata", out var metadata) &&
+            metadata.TryGetProperty("annotations", out var annotations) &&
+            annotations.TryGetProperty(PlaywrightJobIdAnnotation, out var owner) &&
+            owner.GetString() == jobId &&
+            annotations.TryGetProperty(PlaywrightValidationAnnotation, out var validation) &&
+            validation.GetString() == mode)
+        {
+            return resource;
+        }
+
+        resource.Dispose();
+        throw new InvalidOperationException("An existing Playwright resource belongs to a different job or stage and cannot be reused.");
+    }
+
+    private async Task EnsureKubernetesApiSuccessAsync(
+        HttpResponseMessage response,
+        string operation,
+        string resourceName,
+        CancellationToken cancellationToken)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
+        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+        var safeResponseBody = SanitizeKubernetesApiResponse(responseBody);
+        var detailedMessage =
+            $"Kubernetes API request failed while {operation}. Resource: {resourceName}. " +
+            $"Status: {(int)response.StatusCode} ({response.ReasonPhrase}). Response: {safeResponseBody}";
+        var publicMessage =
+            $"Kubernetes API rejected the Playwright resource while {operation}. Resource: {resourceName}. " +
+            "Review the complete operation logs or application logs for the detailed Kubernetes response.";
+
+        logger.LogWarning(
+            "Kubernetes API request failed while {Operation}. Resource: {ResourceName}. StatusCode: {StatusCode}. Response: {ResponseBody}",
+            operation,
+            resourceName,
+            (int)response.StatusCode,
+            safeResponseBody);
+
+        throw new KubernetesApiRequestException(publicMessage, detailedMessage, response.StatusCode);
+    }
+
+    private static string SanitizeKubernetesApiResponse(string? responseBody)
+    {
+        if (string.IsNullOrWhiteSpace(responseBody))
+        {
+            return "No response body was returned by the Kubernetes API.";
+        }
+
+        var sanitized = SensitiveLinePattern.Replace(responseBody, match => $"{match.Groups["key"].Value}=***");
+        sanitized = Regex.Replace(sanitized, @"[\r\n\t]+", " ");
+        sanitized = Regex.Replace(sanitized, @"\s{2,}", " ").Trim();
+
+        const int maxResponseLength = 2000;
+        return sanitized.Length <= maxResponseLength
+            ? sanitized
+            : sanitized[..maxResponseLength] + "...";
     }
 
     private async Task DeletePersistentVolumeClaimAsync(HttpClient client, string kubernetesNamespace, string pvcName, CancellationToken cancellationToken)
@@ -649,7 +1334,55 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             return;
         }
 
-        response.EnsureSuccessStatusCode();
+        await EnsureKubernetesApiSuccessAsync(
+            response,
+            "deleting Playwright shared state PersistentVolumeClaim",
+            pvcName,
+            cancellationToken);
+    }
+
+    private object? BuildContainerResources()
+    {
+        var requests = new Dictionary<string, string>(StringComparer.Ordinal);
+        AddResourceQuantity(
+            requests,
+            "cpu",
+            FirstConfiguredValue(configuration["UpgradeCenter:Playwright:JobCpuRequest"], playwrightOptions.JobCpuRequest));
+        AddResourceQuantity(
+            requests,
+            "memory",
+            FirstConfiguredValue(configuration["UpgradeCenter:Playwright:JobMemoryRequest"], playwrightOptions.JobMemoryRequest));
+
+        var limits = new Dictionary<string, string>(StringComparer.Ordinal);
+        AddResourceQuantity(
+            limits,
+            "cpu",
+            FirstConfiguredValue(configuration["UpgradeCenter:Playwright:JobCpuLimit"], playwrightOptions.JobCpuLimit));
+        AddResourceQuantity(
+            limits,
+            "memory",
+            FirstConfiguredValue(configuration["UpgradeCenter:Playwright:JobMemoryLimit"], playwrightOptions.JobMemoryLimit));
+
+        var resources = new Dictionary<string, object>(StringComparer.Ordinal);
+        if (requests.Count > 0)
+        {
+            resources["requests"] = requests;
+        }
+
+        if (limits.Count > 0)
+        {
+            resources["limits"] = limits;
+        }
+
+        return resources.Count == 0 ? null : resources;
+    }
+
+    private static void AddResourceQuantity(IDictionary<string, string> resources, string name, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            resources[name] = value.Trim();
+        }
     }
 
     private async Task<PlaywrightScriptResult> MonitorJobAsync(
@@ -665,7 +1398,7 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         Action<PlaywrightValidationProgress>? progress,
         CancellationToken cancellationToken)
     {
-        var timeout = TimeSpan.FromSeconds(Math.Max(300, playwrightOptions.JobTimeoutSeconds + 60));
+        var timeout = TimeSpan.FromSeconds(Math.Max(300, GetJobTimeoutSeconds(mode) + 60));
         var pollDelay = TimeSpan.FromSeconds(Math.Clamp(playwrightOptions.JobPollSeconds, 2, 60));
         var deadline = DateTimeOffset.UtcNow.Add(timeout);
         string? podName = null;
@@ -683,7 +1416,7 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 : await GetPodStateAsync(client, kubernetesNamespace, podName, cancellationToken);
 
             lastStateMessage = podState.Message;
-            UpdateRunningProgress(podState, progress);
+            UpdateRunningProgress(podState, mode, progress);
 
             if (condition == "Complete")
             {
@@ -693,10 +1426,12 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 TryCaptureHtmlReport(upgradeJobId, mode, logs);
                 logs = PrepareLogsForDisplay(logs, redactionValues);
                 var resultSummary = TryGetUploadedResultSummary(upgradeJobId, mode) ?? TryParseResultSummary(logs);
-                var successMessage = resultSummary?.ToMessage("Playwright validation completed successfully.")
-                    ?? "Playwright validation completed successfully.";
-                progress?.Invoke(new PlaywrightValidationProgress("playwright-tests", UpgradeJobStageStatus.Succeeded, successMessage));
-                return CreateResult(true, podState.ExitCode ?? 0, false, startedAt, command, logs, string.Empty, successMessage);
+                var successMessage = resultSummary?.ToMessage($"{ToDisplayName(mode)} completed.", mode)
+                    ?? $"{ToDisplayName(mode)} completed successfully.";
+                successMessage = AppendExecutionSummaryContext(successMessage, startedAt, IsHtmlReportSaved(upgradeJobId, mode));
+                var succeeded = IsSuccessfulResult(mode, resultSummary);
+                progress?.Invoke(new PlaywrightValidationProgress("playwright-tests", succeeded ? UpgradeJobStageStatus.Succeeded : UpgradeJobStageStatus.Failed, successMessage));
+                return CreateResult(succeeded, podState.ExitCode ?? 0, false, startedAt, command, logs, string.Empty, successMessage, kubernetesJobCreated: true);
             }
 
             if (condition == "Failed" || podState.IsFailed)
@@ -708,11 +1443,12 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
                 logs = PrepareLogsForDisplay(logs, redactionValues);
                 var resultSummary = TryGetUploadedResultSummary(upgradeJobId, mode) ?? TryParseResultSummary(logs);
                 var message = podState.IsInfrastructureFailure
-                    ? $"Playwright validation infrastructure failed: {podState.Message}"
-                    : $"Playwright validation failed: {podState.Message}";
-                message = resultSummary?.ToMessage(message) ?? message;
+                    ? $"{ToDisplayName(mode)} could not be completed due to an execution error. Review the stage details for more information."
+                    : $"{ToDisplayName(mode)} did not complete successfully. Review the stage details for more information.";
+                message = resultSummary?.ToMessage(message, mode) ?? message;
+                message = AppendExecutionSummaryContext(message, startedAt, IsHtmlReportSaved(upgradeJobId, mode));
                 progress?.Invoke(new PlaywrightValidationProgress("playwright-tests", UpgradeJobStageStatus.Failed, message));
-                return CreateResult(false, podState.ExitCode, false, startedAt, command, logs, string.Empty, message);
+                return CreateResult(false, podState.ExitCode, false, startedAt, command, logs, string.Empty, message, kubernetesJobCreated: true);
             }
 
             await Task.Delay(pollDelay, cancellationToken);
@@ -723,25 +1459,24 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             : await TryReadPodLogsAsync(client, kubernetesNamespace, podName, CancellationToken.None);
         TryCaptureHtmlReport(upgradeJobId, mode, timeoutLogs);
 
-        var timeoutMessage = $"Playwright validation timed out. Last status: {lastStateMessage ?? "status was unavailable"}.";
+        var timeoutMessage = $"{ToDisplayName(mode)} timed out. Last status: {lastStateMessage ?? "status was unavailable"}.";
         progress?.Invoke(new PlaywrightValidationProgress("playwright-tests", UpgradeJobStageStatus.Failed, timeoutMessage));
-        return CreateResult(false, null, true, startedAt, command, PrepareLogsForDisplay(timeoutLogs, redactionValues), string.Empty, timeoutMessage);
+        return CreateResult(false, null, true, startedAt, command, PrepareLogsForDisplay(timeoutLogs, redactionValues), string.Empty, timeoutMessage, kubernetesJobCreated: true);
     }
 
     private void TryCaptureHtmlReport(string upgradeJobId, PlaywrightValidationMode mode, string logs)
     {
+        if (mode == PlaywrightValidationMode.Cleanup)
+        {
+            return;
+        }
+
         var stage = mode == PlaywrightValidationMode.Pre
             ? "Pre-Upgrade Validation"
             : "Post-Upgrade Validation";
 
         if (reportStore.Exists(upgradeJobId, mode))
         {
-            operationLogStore.Append(
-                upgradeJobId,
-                stage,
-                "Info",
-                "PlaywrightReport",
-                "Playwright HTML report is already uploaded and stored for this validation stage.");
             return;
         }
 
@@ -763,11 +1498,39 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             saved ? "Info" : "Warning",
             "PlaywrightReport",
             saved
-                ? "Playwright HTML report captured and stored for this validation stage."
+                ? "Playwright HTML report saved."
                 : "Playwright HTML report was not captured. The expected single-report marker was not found in the Playwright pod logs. Verify that the runner generated and uploaded the configured report path before the pod was cleaned up.");
     }
 
-    private static void UpdateRunningProgress(PodState podState, Action<PlaywrightValidationProgress>? progress)
+    private bool IsHtmlReportSaved(string upgradeJobId, PlaywrightValidationMode mode)
+    {
+        return mode != PlaywrightValidationMode.Cleanup && reportStore.Exists(upgradeJobId, mode);
+    }
+
+    private static string AppendExecutionSummaryContext(string message, DateTimeOffset startedAt, bool htmlReportSaved)
+    {
+        var parts = new List<string>
+        {
+            message.Trim().TrimEnd('.'),
+            $"Duration: {FormatDuration(DateTimeOffset.UtcNow - startedAt)}"
+        };
+
+        if (htmlReportSaved)
+        {
+            parts.Add("HTML report saved");
+        }
+
+        return string.Join(". ", parts) + ".";
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        return duration.TotalSeconds < 60
+            ? $"{Math.Max(0, duration.TotalSeconds):0}s"
+            : $"{(int)Math.Max(0, duration.TotalMinutes)}m {duration.Seconds}s";
+    }
+
+    private static void UpdateRunningProgress(PodState podState, PlaywrightValidationMode mode, Action<PlaywrightValidationProgress>? progress)
     {
         if (progress is null)
         {
@@ -777,7 +1540,9 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         if (podState.Phase.Equals("Running", StringComparison.OrdinalIgnoreCase))
         {
             progress(new PlaywrightValidationProgress("playwright-runner", UpgradeJobStageStatus.Succeeded, "Playwright runner pod is running."));
-            progress(new PlaywrightValidationProgress("playwright-tests", UpgradeJobStageStatus.Running, "Running Playwright validation tests."));
+            progress(new PlaywrightValidationProgress("playwright-tests", UpgradeJobStageStatus.Running, mode == PlaywrightValidationMode.Cleanup
+                ? "Running Playwright cleanup tests."
+                : "Running Playwright validation tests."));
             return;
         }
 
@@ -798,7 +1563,11 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         IReadOnlyDictionary<string, string> labels,
         CancellationToken cancellationToken)
     {
-        var selector = string.Join(",", labels.Select(label => $"{label.Key}={label.Value}"));
+        var selector = string.Join(
+            ",",
+            labels
+                .Where(label => !string.Equals(label.Key, "app.kubernetes.io/name", StringComparison.OrdinalIgnoreCase))
+                .Select(label => $"{label.Key}={label.Value}"));
         using var response = await client.GetAsync(
             $"/api/v1/namespaces/{Uri.EscapeDataString(kubernetesNamespace)}/pods?labelSelector={Uri.EscapeDataString(selector)}",
             cancellationToken);
@@ -925,6 +1694,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         var handler = new HttpClientHandler();
         if (kubernetesOptions.SkipTlsVerify)
         {
+            if (!CanSkipTlsVerify())
+            {
+                logger.LogError("Kubernetes TLS verification bypass was blocked because SkipTlsVerify is enabled without an explicit local development override.");
+                throw new InvalidOperationException("Kubernetes TLS verification cannot be disabled unless an explicit local development override is enabled. Configure the service account certificate authority file instead.");
+            }
+
+            logger.LogWarning("Kubernetes TLS verification is disabled by explicit local development configuration.");
             handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
         }
         else if (File.Exists(kubernetesOptions.CertificateAuthorityPath))
@@ -959,9 +1735,45 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         return client;
     }
 
+    private bool CanSkipTlsVerify()
+    {
+        return kubernetesOptions.AllowSkipTlsVerifyForLocalDevelopment &&
+            IsLocalDevelopmentEnvironment(hostEnvironment.EnvironmentName);
+    }
+
+    private static bool IsLocalDevelopmentEnvironment(string? environmentName)
+    {
+        return string.Equals(environmentName, "Development", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "Dev", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "Local", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "LocalDevelopment", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static HttpContent ToJsonContent(object value)
     {
         return new StringContent(JsonSerializer.Serialize(value, JsonOptions), Encoding.UTF8, "application/json");
+    }
+
+    private static Dictionary<string, string> ReadSecretData(JsonElement secret)
+    {
+        if (!secret.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
+        {
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+        }
+
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var property in data.EnumerateObject())
+        {
+            var encodedValue = property.Value.GetString();
+            if (string.IsNullOrWhiteSpace(encodedValue))
+            {
+                continue;
+            }
+
+            values[property.Name] = Encoding.UTF8.GetString(Convert.FromBase64String(encodedValue));
+        }
+
+        return values;
     }
 
     private static string? GetJobTerminalCondition(JsonElement root)
@@ -1071,8 +1883,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         var baseUrl = FirstConfiguredValue(
             playwrightOptions.ReportUploadBaseUrl,
             configuration["UpgradeCenter:Playwright:ReportUploadBaseUrl"],
-            "http://boldbi-upgrade-center/upgrade-center/api/playwright-reports");
-        var stage = mode == PlaywrightValidationMode.Pre ? "pre-upgrade" : "post-upgrade";
+            "http://bold-upgrade-center/upgrade-center/api/playwright-reports");
+        var stage = mode switch
+        {
+            PlaywrightValidationMode.Post => "post-upgrade",
+            PlaywrightValidationMode.Cleanup => "cleanup",
+            _ => "pre-upgrade"
+        };
         return $"{baseUrl!.TrimEnd('/')}/{Uri.EscapeDataString(upgradeJobId)}/{stage}";
     }
 
@@ -1081,8 +1898,13 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         var baseUrl = FirstConfiguredValue(
             playwrightOptions.ResultUploadBaseUrl,
             configuration["UpgradeCenter:Playwright:ResultUploadBaseUrl"],
-            "http://boldbi-upgrade-center/upgrade-center/api/playwright-results");
-        var stage = mode == PlaywrightValidationMode.Pre ? "pre-upgrade" : "post-upgrade";
+            "http://bold-upgrade-center/upgrade-center/api/playwright-results");
+        var stage = mode switch
+        {
+            PlaywrightValidationMode.Post => "post-upgrade",
+            PlaywrightValidationMode.Cleanup => "cleanup",
+            _ => "pre-upgrade"
+        };
         return $"{baseUrl!.TrimEnd('/')}/{Uri.EscapeDataString(upgradeJobId)}/{stage}";
     }
 
@@ -1096,6 +1918,20 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
 
         sanitized = SensitiveLinePattern.Replace(sanitized, match => $"{match.Groups["key"].Value}=***");
         return sanitized.Length <= 12000 ? sanitized : sanitized[^12000..];
+    }
+
+    private static bool IsSuccessfulResult(PlaywrightValidationMode mode, PlaywrightResultSummary? summary)
+    {
+        if (mode != PlaywrightValidationMode.Cleanup)
+        {
+            return true;
+        }
+
+        return summary is not null &&
+               string.Equals(summary.Status, "Passed", StringComparison.OrdinalIgnoreCase) &&
+               summary.Total > 0 &&
+               summary.Failed == 0 &&
+               summary.Passed + summary.Skipped == summary.Total;
     }
 
     private static PlaywrightResultSummary? TryParseResultSummary(string logs)
@@ -1150,32 +1986,61 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             : null;
     }
 
-    private static string CreateResourceNameSuffix(string jobId)
+    private static PlaywrightResourceNames CreatePlaywrightResourceNames(string jobId, string mode)
     {
-        var normalized = Regex.Replace(jobId.ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            normalized = Guid.NewGuid().ToString("N");
-        }
-
-        return normalized.Length <= 28 ? normalized : normalized[..28].Trim('-');
+        var shortJobId = CreateShortJobId(jobId);
+        return new PlaywrightResourceNames(
+            ShortJobId: shortJobId,
+            JobName: CreateKubernetesName($"pw-{mode}", shortJobId),
+            SecretName: CreateKubernetesName($"pw-secret-{mode}", shortJobId),
+            SharedStatePvcName: GetSharedStatePvcName(jobId));
     }
 
     private static string GetSharedStatePvcName(string jobId)
     {
-        return $"upgrade-pw-state-{CreateResourceNameSuffix(jobId)}";
+        return CreateKubernetesName("pw-state", CreateShortJobId(jobId));
     }
 
-    private bool ShouldDeleteSharedStatePvc(PlaywrightValidationMode mode, PlaywrightScriptResult? result)
+    private static string CreateShortJobId(string jobId)
+    {
+        var normalized = Regex.Replace((jobId ?? string.Empty).ToLowerInvariant(), "[^a-z0-9]+", string.Empty);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            normalized = "job";
+        }
+
+        var prefix = normalized.Length <= 8 ? normalized : normalized[..8];
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(jobId ?? string.Empty)))[..8].ToLowerInvariant();
+        return $"{prefix}-{hash}";
+    }
+
+    private static string CreateKubernetesName(string prefix, string suffix)
+    {
+        var normalizedPrefix = Regex.Replace((prefix ?? string.Empty).ToLowerInvariant(), "[^a-z0-9-]+", "-").Trim('-');
+        var normalizedSuffix = Regex.Replace((suffix ?? string.Empty).ToLowerInvariant(), "[^a-z0-9-]+", "-").Trim('-');
+        var name = $"{normalizedPrefix}-{normalizedSuffix}".Trim('-');
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "pw-job";
+        }
+
+        if (name.Length > 63)
+        {
+            name = name[..63].Trim('-');
+        }
+
+        return Regex.Replace(name, "^[^a-z0-9]+|[^a-z0-9]+$", string.Empty);
+    }
+
+    private bool ShouldDeleteSharedStatePvc(PlaywrightValidationMode mode, PlaywrightScriptResult? result, bool sharedStatePvcCreated, bool jobCreated)
     {
         if (!playwrightOptions.SharedStateVolumeEnabled)
         {
             return false;
         }
 
-        return mode == PlaywrightValidationMode.Post ||
-               result is null ||
-               !result.Succeeded;
+        return mode == PlaywrightValidationMode.Cleanup ||
+               (sharedStatePvcCreated && !jobCreated);
     }
 
     private string GetSharedStateAccessMode()
@@ -1248,7 +2113,8 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         string command,
         string standardOutput,
         string standardError,
-        string message)
+        string message,
+        bool kubernetesJobCreated = false)
     {
         return new PlaywrightScriptResult(
             succeeded,
@@ -1259,10 +2125,11 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
             command,
             standardOutput,
             standardError,
-            message);
+            message,
+            kubernetesJobCreated);
     }
 
-    private sealed record RuntimeConfiguration(
+    internal sealed record RuntimeConfiguration(
         IReadOnlyDictionary<string, string> Environment,
         IReadOnlyList<string> RedactionValues)
     {
@@ -1297,7 +2164,14 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         string DatabaseType,
         string? Username,
         string? Password,
-        bool SslEnabled);
+        DatabaseSslDisposition SslDisposition);
+
+    private enum DatabaseSslDisposition
+    {
+        Disabled,
+        Enabled,
+        Ambiguous
+    }
 
     private sealed record PlaywrightResultSummary(
         int Total,
@@ -1308,9 +2182,36 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         int Threshold,
         string Status)
     {
-        public string ToMessage(string prefix)
+        public string ToMessage(string prefix, PlaywrightValidationMode mode)
         {
-            return $"{prefix} Total: {Total}. Passed: {Passed}. Failed: {Failed}. Skipped: {Skipped}. Pass percentage: {PassPercentage:0.##}%. Threshold: {Threshold}%. Final status: {Status}.";
+            if (mode == PlaywrightValidationMode.Cleanup)
+            {
+                return string.Equals(Status, "Passed", StringComparison.OrdinalIgnoreCase) &&
+                       Total > 0 &&
+                       Failed == 0 &&
+                       Passed + Skipped == Total
+                    ? "Cleanup completed successfully. All validation resources were removed."
+                    : "Cleanup could not be completed. Manual cleanup is required.";
+            }
+
+            var itemName = "tests";
+            var label = "Validation";
+            var skippedText = Skipped > 0 ? $", and {Skipped} were skipped" : string.Empty;
+            var failedText = Failed > 0 ? $", {Failed} failed" : string.Empty;
+
+            if (!string.Equals(Status, "Passed", StringComparison.OrdinalIgnoreCase) &&
+                Failed == 0 &&
+                PassPercentage < Threshold)
+            {
+                return $"{label} did not meet the required pass threshold. {Passed} of {Total} {itemName} passed ({PassPercentage:0.##}%; required: {Threshold}%){skippedText}.";
+            }
+
+            if (!string.Equals(Status, "Passed", StringComparison.OrdinalIgnoreCase) && Failed > 0)
+            {
+                return $"{label} failed. {Passed} of {Total} {itemName} passed{failedText}{skippedText}. Pass rate: {PassPercentage:0.##}%; required: {Threshold}%.";
+            }
+
+            return $"{prefix} {Passed} of {Total} {itemName} passed ({PassPercentage:0.##}%; required: {Threshold}%){failedText}{skippedText}.";
         }
     }
 
@@ -1320,6 +2221,26 @@ public sealed class PlaywrightKubernetesJobService : IPlaywrightKubernetesJobSer
         {
             return new KubernetesRuntimeContext(false, kubernetesNamespace, null, null, message);
         }
+    }
+
+    private sealed record PlaywrightResourceNames(
+        string ShortJobId,
+        string JobName,
+        string SecretName,
+        string SharedStatePvcName);
+
+    private sealed class KubernetesApiRequestException : HttpRequestException
+    {
+        public KubernetesApiRequestException(string publicMessage, string detailedMessage, System.Net.HttpStatusCode statusCode)
+            : base(publicMessage, null, statusCode)
+        {
+            PublicMessage = publicMessage;
+            DetailedMessage = detailedMessage;
+        }
+
+        public string PublicMessage { get; }
+
+        public string DetailedMessage { get; }
     }
 
     private sealed record PodState(

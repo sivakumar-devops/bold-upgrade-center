@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public static class UpgradeHistoryOperationTypes
 {
@@ -22,7 +22,10 @@ public sealed class UpgradeHistoryRecord
 
     public string? ParentJobId { get; set; }
 
+    public string Product { get; set; } = "BI";
+
     public string OperationType { get; set; } = string.Empty;
+
 
     public string? PreviousVersion { get; set; }
 
@@ -71,6 +74,11 @@ public interface IUpgradeHistoryStore
         string? rollbackJobId,
         string? failureStage,
         string? failureSummary,
+        CancellationToken cancellationToken = default);
+
+    Task UpdateStatusAsync(
+        string jobId,
+        string status,
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<UpgradeHistoryRecord>> ListAsync(int take = 50, CancellationToken cancellationToken = default);

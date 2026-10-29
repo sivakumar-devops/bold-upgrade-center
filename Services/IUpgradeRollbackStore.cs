@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeRollbackStore
 {
@@ -25,6 +25,8 @@ public interface IUpgradeRollbackStore
         string? message = null);
 
     void MarkRestoreCompleted(string id, UpgradeDatabaseRestoreResult restoreResult, KubernetesRollbackResult? kubernetesRollbackResult = null);
+
+    void MarkRestoreFailed(string id, string message);
 
     void MarkCleanupCompleted(string id, BackupCleanupResult cleanupResult, bool deleted);
 }

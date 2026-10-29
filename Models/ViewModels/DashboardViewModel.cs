@@ -1,6 +1,7 @@
 using System.Collections.Generic;
+using Bold.UpgradeCenter.Services;
 
-namespace BoldBI.UpgradeCenter.Models.ViewModels
+namespace Bold.UpgradeCenter.Models.ViewModels
 {
     /// <summary>
     /// View-model for the Upgrade Center dashboard (Screen 2).
@@ -11,6 +12,14 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
     {
         public UpgradeCenterUser CurrentUser { get; set; } = new();
         public InstallationInfo Installation { get; set; } = new();
+
+        public UpgradeProductDefinition SelectedProduct { get; set; } = UpgradeProductDefinitions.BoldBi;
+
+        public IReadOnlyList<UpgradeProductDefinition> AvailableProducts { get; set; } = UpgradeProductDefinitions.All;
+
+        public UpgradeDeploymentMode DeploymentMode { get; set; } = UpgradeDeploymentMode.Common;
+
+        public string DeploymentModeSource { get; set; } = string.Empty;
 
         // Available releases tab.
         public List<Release> AvailableReleases { get; set; } = new();

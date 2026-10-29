@@ -1,21 +1,27 @@
-using BoldBI.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class ProductVersionInstallationInfoProvider : IInstallationInfoProvider
 {
     private readonly IProductVersionProvider productVersionProvider;
     private readonly IReleaseVersionProvider releaseVersionProvider;
     private readonly IUpgradeJobStore jobStore;
+    private readonly IUpgradeProductContext productContext;
+    private readonly IConfiguration? configuration;
 
     public ProductVersionInstallationInfoProvider(
         IProductVersionProvider productVersionProvider,
         IReleaseVersionProvider releaseVersionProvider,
-        IUpgradeJobStore jobStore)
+        IUpgradeJobStore jobStore,
+        IUpgradeProductContext productContext,
+        IConfiguration? configuration = null)
     {
         this.productVersionProvider = productVersionProvider;
         this.releaseVersionProvider = releaseVersionProvider;
         this.jobStore = jobStore;
+        this.productContext = productContext;
+        this.configuration = configuration;
     }
 
     public async Task<InstallationInfo> GetInstallationInfoAsync(CancellationToken ct = default)
@@ -29,31 +35,22 @@ public sealed class ProductVersionInstallationInfoProvider : IInstallationInfoPr
             InstalledVersion = displayVersion,
             LatestAvailableVersion = releases.LatestVersion?.Version ?? displayVersion,
             NewerVersionCount = releases.Versions.Count,
-            DeploymentTarget = "On-premise / Kubernetes"
+            DeploymentTarget = UpgradeExecutionEnvironments.Parse(configuration?["UpgradeCenter:ExecutionEnvironment"]) == UpgradeExecutionEnvironment.Ecs ? "AWS / ECS Fargate" : "On-premise / Kubernetes"
         };
     }
 
     private string ResolveDisplayVersion(string actualCurrentVersion)
     {
-        if (jobStore.TryGetLatestActive(out var activeJob))
+        if (jobStore.TryGetLatestActive(out var activeJob) &&
+            string.Equals(
+                UpgradeProductDefinitions.Resolve(activeJob.ProductKey).Key,
+                productContext.Current.Key,
+                StringComparison.OrdinalIgnoreCase))
         {
             return ResolveInProgressDisplayVersion(activeJob, actualCurrentVersion);
         }
 
-        if (!jobStore.TryGetLatest(out var latestJob))
-        {
-            return actualCurrentVersion;
-        }
-
-        return latestJob.Status switch
-        {
-            UpgradeJobStatus.Succeeded when latestJob.UpgradeType != UpgradeJobType.Rollback => actualCurrentVersion,
-            UpgradeJobStatus.RollbackSucceeded => latestJob.UpgradeType == UpgradeJobType.Rollback
-                ? latestJob.TargetVersion
-                : latestJob.CurrentVersion,
-            UpgradeJobStatus.Failed or UpgradeJobStatus.RollbackFailed => latestJob.CurrentVersion,
-            _ => actualCurrentVersion
-        };
+        return actualCurrentVersion;
     }
 
     private static string ResolveInProgressDisplayVersion(UpgradeJob activeJob, string actualCurrentVersion)

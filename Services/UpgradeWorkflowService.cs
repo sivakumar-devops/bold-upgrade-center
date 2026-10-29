@@ -1,7 +1,7 @@
-using BoldBI.UpgradeCenter.Models;
-using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
+using Bold.UpgradeCenter.Models;
+using UiUpgradeJob = Bold.UpgradeCenter.Models.UpgradeJob;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class UpgradeWorkflowService : IUpgradeService
 {
@@ -15,6 +15,9 @@ public sealed class UpgradeWorkflowService : IUpgradeService
     private readonly IUpgradeHistoryStore historyStore;
     private readonly IUpgradeUserContextProvider userContextProvider;
     private readonly ICustomPatchValidationService customPatchValidationService;
+    private readonly IUpgradeEnvironmentEligibilityService upgradeEnvironmentEligibilityService;
+    private readonly IUpgradeProductContext productContext;
+    private readonly ILogger<UpgradeWorkflowService> logger;
 
     public UpgradeWorkflowService(
         IUpgradeJobStore jobStore,
@@ -26,7 +29,10 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         IReleaseVersionProvider releaseVersionProvider,
         IUpgradeHistoryStore historyStore,
         IUpgradeUserContextProvider userContextProvider,
-        ICustomPatchValidationService customPatchValidationService)
+        ICustomPatchValidationService customPatchValidationService,
+        IUpgradeEnvironmentEligibilityService upgradeEnvironmentEligibilityService,
+        IUpgradeProductContext productContext,
+        ILogger<UpgradeWorkflowService> logger)
     {
         this.jobStore = jobStore;
         this.jobRunner = jobRunner;
@@ -38,6 +44,9 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         this.historyStore = historyStore;
         this.userContextProvider = userContextProvider;
         this.customPatchValidationService = customPatchValidationService;
+        this.upgradeEnvironmentEligibilityService = upgradeEnvironmentEligibilityService;
+        this.productContext = productContext;
+        this.logger = logger;
     }
 
     public async Task<List<Release>> GetAvailableReleasesAsync(string installedVersion, CancellationToken ct = default)
@@ -95,6 +104,11 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         };
     }
 
+    public Task<string?> GetDefaultCustomPatchRepositoryAsync(CancellationToken ct = default)
+    {
+        return customPatchValidationService.GetCommonImageRepositoryAsync(ct);
+    }
+
     public async Task<UiUpgradeJob> StartUpgradeAsync(string targetVersion, string initiatedBy, CancellationToken ct = default)
     {
         if (jobStore.TryGetLatestActive(out var active))
@@ -102,15 +116,18 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
         }
 
+        await upgradeEnvironmentEligibilityService.EnsureUpgradeSupportedAsync(ct);
         var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(ct);
         var user = userContextProvider.GetCurrentUser();
+        var product = productContext.Current;
         var job = jobStore.Create(
             currentVersion.InstalledVersion,
             targetVersion,
             UpgradeJobType.AvailableRelease,
-            ["All applicable Bold BI deployments"],
+            [$"All applicable {product.DisplayName} deployments"],
             null,
-            user);
+            user,
+            product.Key);
 
         await historyStore.SaveStartedAsync(CreateHistoryRecord(job), ct);
         jobRunner.Start(job.Id);
@@ -128,7 +145,9 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             throw new InvalidOperationException($"Another upgrade or rollback operation is already running. Active job: {active.Id}.");
         }
 
+        await upgradeEnvironmentEligibilityService.EnsureUpgradeSupportedAsync(ct);
         var currentVersion = await installationInfoProvider.GetInstallationInfoAsync(ct);
+        var product = productContext.Current;
         var validation = await customPatchValidationService.ValidateAsync(
             new CustomPatchValidationRequest
             {
@@ -153,14 +172,15 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             UpgradeJobType.CustomVersionOrPatch,
             customImages.Select(image => image.DeploymentName).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
             customImages,
-            user);
+            user,
+            product.Key);
 
         await historyStore.SaveStartedAsync(CreateHistoryRecord(job), ct);
         jobRunner.Start(job.Id);
         return UpgradeJobViewModelMapper.ToViewModel(job);
     }
 
-    public Task<UiUpgradeJob> CancelUpgradeAsync(string jobId, string requestedBy, CancellationToken ct = default)
+    public async Task<UiUpgradeJob> CancelUpgradeAsync(string jobId, string requestedBy, CancellationToken ct = default)
     {
         if (!jobStore.TryGet(jobId, out var job))
         {
@@ -182,16 +202,26 @@ public sealed class UpgradeWorkflowService : IUpgradeService
             throw new InvalidOperationException("Cancellation is not available while automatic rollback is running.");
         }
 
+        if (job.CurrentStage == UpgradeJobStageName.CleanupJob)
+        {
+            throw new InvalidOperationException("Cancellation is not available while the Playwright cleanup job is running.");
+        }
+
         var message = BuildCancellationRequestMessage(job);
         jobStore.RequestCancellation(jobId, requestedBy, message);
-        cancellationManager.RequestCancellation(jobId);
+        await TryUpdateHistoryStatusAsync(jobId, UpgradeJobStatus.Cancelling.ToString(), ct);
+        var cancellationSignaled = cancellationManager.RequestCancellation(jobId);
+        if (!cancellationSignaled)
+        {
+            jobRunner.Recover(jobId);
+        }
 
         if (!jobStore.TryGet(jobId, out var updatedJob))
         {
             updatedJob = job;
         }
 
-        return Task.FromResult(UpgradeJobViewModelMapper.ToViewModel(updatedJob));
+        return UpgradeJobViewModelMapper.ToViewModel(updatedJob);
     }
 
     public async Task<UiUpgradeJob> StartRollbackAsync(string upgradeJobId, string initiatedBy, CancellationToken ct = default)
@@ -215,6 +245,9 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         }
 
         var user = userContextProvider.GetCurrentUser();
+        var productKey = jobStore.TryGet(upgradeJobId, out var originalJob)
+            ? originalJob.ProductKey
+            : productContext.Current.Key;
         var rollbackDeployments = rollbackEntry.KubernetesResult?.PreviousImages
             .Select(image => image.DeploymentName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -223,13 +256,16 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         var rollbackJob = jobStore.CreateRollback(
             rollbackEntry.TargetVersion ?? rollbackEntry.BackupResult.SelectedVersion,
             rollbackEntry.PreviousVersion ?? "Rollback point",
+            rollbackEntry.Id,
             rollbackDeployments,
-            user);
+            user,
+            productKey);
 
         await historyStore.SaveStartedAsync(new UpgradeHistoryRecord
         {
             JobId = rollbackJob.Id,
             ParentJobId = rollbackEntry.UpgradeJobId,
+            Product = UpgradeProductDefinitions.Resolve(productKey).Key,
             OperationType = UpgradeHistoryOperationTypes.ManualRollback,
             PreviousVersion = rollbackEntry.TargetVersion ?? rollbackEntry.BackupResult.SelectedVersion,
             TargetVersion = rollbackEntry.PreviousVersion ?? "Rollback point",
@@ -253,19 +289,40 @@ public sealed class UpgradeWorkflowService : IUpgradeService
         return new UpgradeHistoryRecord
         {
             JobId = job.Id,
+            Product = UpgradeProductDefinitions.Resolve(job.ProductKey).Key,
             OperationType = job.UpgradeType == UpgradeJobType.CustomVersionOrPatch
                 ? UpgradeHistoryOperationTypes.CustomVersionOrPatchUpgrade
                 : UpgradeHistoryOperationTypes.StandardReleaseUpgrade,
             PreviousVersion = job.CurrentVersion,
             TargetVersion = job.TargetVersion,
             UpgradeType = job.UpgradeType.ToString(),
-            Status = job.Status.ToString(),
+            Status = UpgradeJobStatus.Running.ToString(),
             StartedAt = job.StartedAt,
             InitiatedByUserId = job.InitiatedBy.UserId,
             InitiatedByName = job.InitiatedBy.DisplayName,
             InitiatedByEmail = job.InitiatedBy.Email,
             InitiatedByRole = job.InitiatedBy.Role
         };
+    }
+
+    private async Task TryUpdateHistoryStatusAsync(string jobId, string status, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await historyStore.UpdateStatusAsync(jobId, status, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(
+                exception,
+                "Unable to update Upgrade Center history status. JobId: {JobId}. Status: {Status}.",
+                jobId,
+                status);
+        }
     }
 
     private static string BuildCancellationRequestMessage(UpgradeJob job)

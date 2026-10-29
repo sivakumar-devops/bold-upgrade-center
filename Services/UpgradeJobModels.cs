@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 [JsonConverter(typeof(JsonStringEnumConverter))]
 public enum UpgradeJobStatus
@@ -31,6 +31,7 @@ public enum UpgradeJobStageName
     DatabaseBackup,
     KubernetesImageUpgrade,
     PostUpgradeValidation,
+    CleanupJob,
     AutomaticRollback,
     RollbackDatabaseRestore,
     RollbackImageRevert,
@@ -59,6 +60,10 @@ public sealed class UpgradeJob
     public required string TargetVersion { get; init; }
 
     public required UpgradeJobType UpgradeType { get; init; }
+
+    public string ProductKey { get; init; } = UpgradeProductKeys.BoldBi;
+    public string ExecutionEnvironment { get; init; } = "Kubernetes";
+    public Dictionary<string, EcsValidationExecution> EcsValidationExecutions { get; init; } = [];
 
     public required IReadOnlyList<string> SelectedDeployments { get; init; }
 

@@ -6,7 +6,7 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeOperationalStateStore
 {

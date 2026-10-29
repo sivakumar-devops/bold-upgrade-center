@@ -1,10 +1,10 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using BoldBI.UpgradeCenter.Models;
-using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
+using Bold.UpgradeCenter.Models;
+using UiUpgradeJob = Bold.UpgradeCenter.Models.UpgradeJob;
 
-namespace BoldBI.UpgradeCenter.Services
+namespace Bold.UpgradeCenter.Services
 {
     /// <summary>
     /// Core upgrade orchestration service.
@@ -34,6 +34,9 @@ namespace BoldBI.UpgradeCenter.Services
         Task<PatchValidationResult> ValidatePatchImageAsync(
             string patchVersion,
             string? imageRepository = null,
+            CancellationToken ct = default);
+
+        Task<string?> GetDefaultCustomPatchRepositoryAsync(
             CancellationToken ct = default);
 
         // Upgrade execution.

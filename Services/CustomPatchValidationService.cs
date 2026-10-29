@@ -1,7 +1,7 @@
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class CustomPatchValidationService : ICustomPatchValidationService
 {
@@ -11,19 +11,59 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
     private static readonly Regex ImageTagPattern = new(
         @"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$",
         RegexOptions.Compiled);
+    private static readonly Regex ProductVersionTagPattern = new(
+        @"^v?(?<version>\d+(?:\.\d+){2,})(?:[_.-].*)?$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private readonly IKubernetesUpgradeService kubernetesUpgradeService;
     private readonly IContainerImageRegistryValidator imageRegistryValidator;
     private readonly KubernetesUpgradeOptions kubernetesOptions;
+    private readonly IUpgradeProductContext productContext;
 
     public CustomPatchValidationService(
         IKubernetesUpgradeService kubernetesUpgradeService,
         IContainerImageRegistryValidator imageRegistryValidator,
-        IOptions<KubernetesUpgradeOptions> kubernetesOptions)
+        IOptions<KubernetesUpgradeOptions> kubernetesOptions,
+        IUpgradeProductContext productContext)
     {
         this.kubernetesUpgradeService = kubernetesUpgradeService;
         this.imageRegistryValidator = imageRegistryValidator;
         this.kubernetesOptions = kubernetesOptions.Value;
+        this.productContext = productContext;
+    }
+
+    public async Task<string?> GetCommonImageRepositoryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var validation = await kubernetesUpgradeService.ValidateNamespaceAsync(cancellationToken);
+        if (!validation.Succeeded)
+        {
+            return null;
+        }
+
+        var deployments = validation.DeploymentStatuses
+            .Where(deployment => deployment.IsExpected && deployment.IsAvailable)
+            .ToList();
+        if (deployments.Count == 0)
+        {
+            return null;
+        }
+
+        var repositories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var deployment in deployments)
+        {
+            var container = SelectPrimaryContainer(deployment);
+            if (container is null ||
+                !TryGetImageRepositoryAndName(container.Image, out var repositoryWithName, out _) ||
+                string.IsNullOrWhiteSpace(GetRepositoryRoot(repositoryWithName)))
+            {
+                return null;
+            }
+
+            repositories.Add(GetRepositoryRoot(repositoryWithName)!);
+        }
+
+        return repositories.Count == 1 ? repositories.Single() : null;
     }
 
     public async Task<CustomPatchValidationResponse> ValidateAsync(
@@ -31,12 +71,12 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
         string currentVersion,
         CancellationToken cancellationToken = default)
     {
-        _ = currentVersion;
         var errors = new List<string>();
         var results = new List<CustomPatchImageValidationResult>();
-        var targetVersion = request.TargetVersion?.Trim() ?? string.Empty;
+        var imageTag = request.TargetVersion?.Trim() ?? string.Empty;
+        var targetVersion = ExtractTargetVersion(imageTag, errors);
 
-        ValidateTargetTag(targetVersion, errors);
+        ValidateTargetTag(imageTag, currentVersion, targetVersion, errors);
 
         var validation = await kubernetesUpgradeService.ValidateNamespaceAsync(cancellationToken);
         if (!validation.Succeeded)
@@ -64,7 +104,7 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
         var images = ResolveRequestedImages(request, validation, errors);
         if (!string.IsNullOrWhiteSpace(request.ImageRepository))
         {
-            ValidateRepository(request.ImageRepository!, errors);
+            ValidateRepository(request.ImageRepository!, kubernetesOptions.AllowedImageRepositories, errors);
         }
 
         images = images
@@ -100,7 +140,7 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
             }
             else if (!discoveredTargets.Contains(deploymentName))
             {
-                itemErrors.Add("Deployment is not an available Bold BI upgrade target in the current namespace.");
+                itemErrors.Add($"Deployment is not an available {productContext.Current.DisplayName} upgrade target in the current namespace.");
             }
             else
             {
@@ -144,7 +184,7 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
 
         return new CustomPatchValidationResponse(
             errors.Count == 0 && results.Count > 0 && results.All(result => result.IsValid),
-            targetVersion,
+            targetVersion ?? imageTag,
             results,
             errors.Distinct(StringComparer.OrdinalIgnoreCase).ToList());
     }
@@ -203,17 +243,56 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
         return generatedImages;
     }
 
-    private static void ValidateTargetTag(string targetVersion, List<string> errors)
+    private static string? ExtractTargetVersion(string imageTag, List<string> errors)
     {
-        if (string.IsNullOrWhiteSpace(targetVersion))
+        if (string.IsNullOrWhiteSpace(imageTag))
+        {
+            return null;
+        }
+
+        var match = ProductVersionTagPattern.Match(imageTag);
+        if (!match.Success)
+        {
+            errors.Add("Custom patch version must begin with a valid product version, for example 17.1.11 or 17.1.11_patch.");
+            return null;
+        }
+
+        return match.Groups["version"].Value;
+    }
+
+    private static void ValidateTargetTag(string imageTag, string currentVersion, string? targetVersion, List<string> errors)
+    {
+        if (string.IsNullOrWhiteSpace(imageTag))
         {
             errors.Add("Custom patch version is required.");
             return;
         }
 
-        if (!ImageTagPattern.IsMatch(targetVersion))
+        if (!ImageTagPattern.IsMatch(imageTag))
         {
             errors.Add("Custom patch version must be a valid container image tag.");
+        }
+
+        if (string.IsNullOrWhiteSpace(targetVersion))
+        {
+            return;
+        }
+
+        if (!ProductVersionComparer.TryParse(currentVersion, out var currentParts))
+        {
+            errors.Add("Installed product version is not in a supported version format.");
+            return;
+        }
+
+        if (!ProductVersionComparer.TryParse(targetVersion, out var targetParts))
+        {
+            errors.Add("Custom patch target version is not in a supported version format.");
+            return;
+        }
+
+        if (ProductVersionComparer.Compare(targetParts, currentParts) <= 0)
+        {
+            errors.Add($"Custom patch target version v{targetVersion} must be greater than the currently installed version v{currentVersion.TrimStart('v', 'V')}.");
         }
     }
 
@@ -225,9 +304,16 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
             return;
         }
 
-        if (!ImageReferencePattern.IsMatch(imageReference))
+        if (!ImageReferencePattern.IsMatch(imageReference) ||
+            !ContainerImageRegistryValidator.TryParseImageReference(imageReference, out var registry, out var repository, out _))
         {
             errors.Add("Image reference must include a valid repository/name and tag, for example registry.example.com/boldbi/bi-api:16.1.90-custom.");
+            return;
+        }
+
+        if (!ContainerImageRegistryValidator.TryValidateRegistryAuthorityFormat(registry, out var registryError))
+        {
+            errors.Add(registryError);
             return;
         }
 
@@ -237,22 +323,55 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
             .ToList();
         if (allowedRepositories.Count == 0)
         {
+            errors.Add("Allowed image repository list is not configured.");
             return;
         }
 
-        if (!allowedRepositories.Any(prefix => imageReference.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+        if (!ContainerImageRegistryValidator.IsRepositoryAllowed($"{registry}/{repository}", allowedRepositories))
         {
             errors.Add("Image repository is not in the configured allowed repository list.");
         }
     }
 
-    private static void ValidateRepository(string imageRepository, List<string> errors)
+    private static void ValidateRepository(
+        string imageRepository,
+        IEnumerable<string> allowedRepositories,
+        List<string> errors)
     {
         var trimmed = imageRepository.Trim().TrimEnd('/');
         if (string.IsNullOrWhiteSpace(trimmed) ||
             trimmed.Contains(':', StringComparison.Ordinal) && trimmed.LastIndexOf(':') > trimmed.LastIndexOf('/'))
         {
             errors.Add("Image repository should not include an image tag. Enter only the registry and repository path.");
+            return;
+        }
+
+        var slashIndex = trimmed.IndexOf('/');
+        if (slashIndex <= 0)
+        {
+            errors.Add("Image repository must include a registry host and repository path.");
+            return;
+        }
+
+        var registry = trimmed[..slashIndex];
+        if (!ContainerImageRegistryValidator.TryValidateRegistryAuthorityFormat(registry, out var registryError))
+        {
+            errors.Add(registryError);
+            return;
+        }
+
+        var allowed = allowedRepositories
+            .Where(repository => !string.IsNullOrWhiteSpace(repository))
+            .ToList();
+        if (allowed.Count == 0)
+        {
+            errors.Add("Allowed image repository list is not configured.");
+            return;
+        }
+
+        if (!ContainerImageRegistryValidator.IsRepositoryAllowed(trimmed, allowed))
+        {
+            errors.Add("Image repository is not in the configured allowed repository list.");
         }
     }
 
@@ -295,5 +414,11 @@ public sealed class CustomPatchValidationService : ICustomPatchValidationService
         imageName = trimmed[(lastSlashIndex + 1)..];
         return !string.IsNullOrWhiteSpace(repositoryWithName) &&
                !string.IsNullOrWhiteSpace(imageName);
+    }
+
+    private static string? GetRepositoryRoot(string repositoryWithName)
+    {
+        var lastSlashIndex = repositoryWithName.LastIndexOf('/');
+        return lastSlashIndex > 0 ? repositoryWithName[..lastSlashIndex] : null;
     }
 }

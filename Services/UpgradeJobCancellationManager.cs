@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeJobCancellationManager
 {

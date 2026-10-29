@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeDatabaseScriptImpactService
 {
@@ -21,7 +21,18 @@ public sealed record UpgradeDatabaseScriptImpactResult(
     IReadOnlyList<string> CreatedTables,
     IReadOnlyList<string> DroppedTables,
     IReadOnlyDictionary<string, IReadOnlyList<string>> AffectedTableVersions,
+    IReadOnlyList<UpgradeDatabaseTableImpact> TableImpacts,
     string? ScriptPreview)
 {
     public bool HasSchemaChanges => AffectedTables.Count > 0;
 }
+
+public sealed record UpgradeDatabaseTableImpact(
+    string Component,
+    string ChangeType,
+    string LogicalTableName,
+    string DefaultTablePrefix,
+    IReadOnlyList<string> Versions,
+    string? SchemaName = null,
+    string? SourcePrefix = null,
+    string? BaseTableName = null);

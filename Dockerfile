@@ -3,11 +3,11 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS build
 WORKDIR /src
 
-COPY BoldBI.UpgradeCenter.csproj ./
-RUN dotnet restore BoldBI.UpgradeCenter.csproj
+COPY Bold.UpgradeCenter.csproj ./
+RUN dotnet restore Bold.UpgradeCenter.csproj
 
 COPY . ./
-RUN dotnet publish BoldBI.UpgradeCenter.csproj \
+RUN dotnet publish Bold.UpgradeCenter.csproj \
     --configuration Release \
     --output /app/publish \
     --no-restore \
@@ -36,4 +36,4 @@ USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["dotnet", "BoldBI.UpgradeCenter.dll"]
+ENTRYPOINT ["dotnet", "Bold.UpgradeCenter.dll"]

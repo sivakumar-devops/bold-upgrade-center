@@ -1,16 +1,18 @@
 using System;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using BoldBI.UpgradeCenter.Models;
-using BoldBI.UpgradeCenter.Models.ViewModels;
-using BoldBI.UpgradeCenter.Security;
-using BoldBI.UpgradeCenter.Services;
+using Bold.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models.ViewModels;
+using Bold.UpgradeCenter.Security;
+using Bold.UpgradeCenter.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
-using UiUpgradeJob = BoldBI.UpgradeCenter.Models.UpgradeJob;
+using UiUpgradeJob = Bold.UpgradeCenter.Models.UpgradeJob;
 
-namespace BoldBI.UpgradeCenter.Controllers
+namespace Bold.UpgradeCenter.Controllers
 {
     /// <summary>
     /// Handles all Upgrade Center page navigation and user-initiated actions.
@@ -21,6 +23,8 @@ namespace BoldBI.UpgradeCenter.Controllers
     [Route("upgrade-center")]
     public class UpgradeCenterController : Controller
     {
+        private const int CompleteLogDisplayMessageLimit = 4000;
+
         private readonly IUpgradeService _upgradeService;
         private readonly IUpgradeJobStore _jobStore;
         private readonly IInstallationInfoProvider _installationInfo;
@@ -33,7 +37,11 @@ namespace BoldBI.UpgradeCenter.Controllers
         private readonly IPlaywrightReportUploadTokenStore _playwrightReportUploadTokenStore;
         private readonly IPlaywrightValidationResultStore _playwrightValidationResultStore;
         private readonly IUpgradeOperationLogStore _operationLogStore;
+        private readonly IUpgradeEnvironmentEligibilityService _upgradeEnvironmentEligibilityService;
+        private readonly IUpgradeProductContext _productContext;
+        private readonly IUpgradeDeploymentModeService _deploymentModeService;
         private readonly IOptions<UpgradeCenterOptions> _options;
+        private readonly ILogger<UpgradeCenterController> _logger;
 
         public UpgradeCenterController(
             IUpgradeService upgradeService,
@@ -48,7 +56,11 @@ namespace BoldBI.UpgradeCenter.Controllers
             IPlaywrightReportUploadTokenStore playwrightReportUploadTokenStore,
             IPlaywrightValidationResultStore playwrightValidationResultStore,
             IUpgradeOperationLogStore operationLogStore,
-            IOptions<UpgradeCenterOptions> options)
+            IUpgradeEnvironmentEligibilityService upgradeEnvironmentEligibilityService,
+            IUpgradeProductContext productContext,
+            IUpgradeDeploymentModeService deploymentModeService,
+            IOptions<UpgradeCenterOptions> options,
+            ILogger<UpgradeCenterController> logger)
         {
             _upgradeService  = upgradeService;
             _jobStore        = jobStore;
@@ -62,30 +74,46 @@ namespace BoldBI.UpgradeCenter.Controllers
             _playwrightReportUploadTokenStore = playwrightReportUploadTokenStore;
             _playwrightValidationResultStore = playwrightValidationResultStore;
             _operationLogStore = operationLogStore;
+            _upgradeEnvironmentEligibilityService = upgradeEnvironmentEligibilityService;
+            _productContext = productContext;
+            _deploymentModeService = deploymentModeService;
             _options = options;
+            _logger = logger;
         }
 
         // GET /upgrade-center: Dashboard (Screen 2) or Unauthorized (Screen 1).
 
         [HttpGet("")]
         [HttpGet("index")]
-        public async Task<IActionResult> Index()
+        public async Task<IActionResult> Index(string? product)
         {
             var user = await _authService.GetCurrentUserAsync(User);
 
             if (!user.IsAuthorized)
                 return View("Unauthorized", user);
 
+            var productSelection = await ResolveProductSelectionAsync(product, HttpContext.RequestAborted);
+            var selectedProduct = productSelection.SelectedProduct;
+            if (!string.IsNullOrWhiteSpace(product) &&
+                !string.Equals(productSelection.RequestedProduct.Key, selectedProduct.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
+            }
+
             var installation = await _installationInfo.GetInstallationInfoAsync();
             var releases     = await _upgradeService.GetAvailableReleasesAsync(installation.InstalledVersion);
-            var history      = await GetHistoryEntriesAsync(HttpContext.RequestAborted);
+            var history      = await GetHistoryEntriesForDashboardAsync(selectedProduct, HttpContext.RequestAborted);
             var activeJob    = ResolveActiveJob();
-            var rollbackable = ResolveMostRecentRollbackableJob();
+            var rollbackable = ResolveMostRecentRollbackableJob(selectedProduct.Key);
 
             var vm = new DashboardViewModel
             {
                 CurrentUser        = user,
                 Installation       = installation,
+                SelectedProduct    = selectedProduct,
+                AvailableProducts  = productSelection.AvailableProducts,
+                DeploymentMode     = productSelection.Mode.Mode,
+                DeploymentModeSource = productSelection.Mode.Source,
                 AvailableReleases  = releases,
                 History            = history,
                 ActiveJob          = activeJob,
@@ -96,6 +124,16 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (TempData["ErrorMessage"] is string err)
             {
                 ViewData["ErrorMessage"] = err;
+            }
+            else if (!string.IsNullOrWhiteSpace(productSelection.Mode.WarningMessage))
+            {
+                ViewData["ErrorTitle"] = "Deployment mode auto-detection";
+                ViewData["ErrorMessage"] = productSelection.Mode.WarningMessage;
+            }
+            else if (ViewData["DashboardWarning"] is string warning)
+            {
+                ViewData["ErrorTitle"] = "Information temporarily unavailable";
+                ViewData["ErrorMessage"] = warning;
             }
 
             return View("Dashboard", vm);
@@ -117,6 +155,11 @@ namespace BoldBI.UpgradeCenter.Controllers
         [HttpGet("logout")]
         public async Task<IActionResult> Logout(CancellationToken cancellationToken)
         {
+            if (UpgradeCenterIntegrationModes.Parse(_options.Value.IntegrationMode) == UpgradeCenterIntegrationMode.Standalone)
+            {
+                return RedirectToAction(nameof(StandaloneAuthenticationController.Logout), "StandaloneAuthentication");
+            }
+
             var runtimeConfiguration = await _configurationProvider.GetConfigurationAsync(cancellationToken);
             var idpBaseUrl = runtimeConfiguration.IdpBaseUrl?.TrimEnd('/');
             if (string.IsNullOrWhiteSpace(idpBaseUrl))
@@ -139,10 +182,18 @@ namespace BoldBI.UpgradeCenter.Controllers
         [HttpGet("confirm")]
         public async Task<IActionResult> Confirm(
             string? version,
-            string? imageRef)
+            string? imageRef,
+            string? product)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return View("Unauthorized", user);
+            var productSelection = await ResolveProductSelectionAsync(product, HttpContext.RequestAborted);
+            var selectedProduct = productSelection.SelectedProduct;
+            if (!string.Equals(productSelection.RequestedProduct.Key, selectedProduct.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                TempData["ErrorMessage"] = $"{productSelection.RequestedProduct.DisplayName} upgrade is not available for this deployment.";
+                return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
+            }
 
             var installation = await _installationInfo.GetInstallationInfoAsync();
 
@@ -163,9 +214,11 @@ namespace BoldBI.UpgradeCenter.Controllers
                 impact = await _upgradeImpactService.GetImpactAsync(targetVersion, HttpContext.RequestAborted);
             }
 
+            var eligibility = await _upgradeEnvironmentEligibilityService.CheckAsync(HttpContext.RequestAborted);
             var vm = new ConfirmUpgradeViewModel
             {
                 CurrentUser          = user,
+                SelectedProduct      = selectedProduct,
                 FromVersion          = installation.InstalledVersion,
                 ToVersion            = targetVersion,
                 HasSchemaChanges     = impact?.DatabaseSchemaChangesExpected ?? release?.HasSchemaChanges ?? false,
@@ -177,7 +230,9 @@ namespace BoldBI.UpgradeCenter.Controllers
                 AffectedTableCount   = impact?.AffectedTableCount ?? 0,
                 AffectedTables       = impact?.AffectedTables ?? Array.Empty<string>(),
                 DatabaseTypes        = impact?.DatabaseTypes ?? Array.Empty<string>(),
-                Warnings             = impact?.Warnings ?? Array.Empty<string>()
+                Warnings             = impact?.Warnings ?? Array.Empty<string>(),
+                IsStartBlocked       = !eligibility.IsSupported,
+                StartBlockedMessage  = eligibility.WarningMessage
             };
 
             return View("Confirm", vm);
@@ -191,10 +246,18 @@ namespace BoldBI.UpgradeCenter.Controllers
             string? version,
             string? imageRef,
             string? patchVersion,
-            string? imageRepository)
+            string? imageRepository,
+            string? product)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return View("Unauthorized", user);
+            var productSelection = await ResolveProductSelectionAsync(product, HttpContext.RequestAborted);
+            var selectedProduct = productSelection.SelectedProduct;
+            if (!string.Equals(productSelection.RequestedProduct.Key, selectedProduct.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                TempData["ErrorMessage"] = $"{productSelection.RequestedProduct.DisplayName} upgrade is not available for this deployment.";
+                return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
+            }
 
             // Block new upgrade if any job is already running (single-job constraint).
             var activeJob = ResolveActiveJob();
@@ -203,8 +266,9 @@ namespace BoldBI.UpgradeCenter.Controllers
                 var what = activeJob.IsRollback ? "rollback" : "upgrade";
                 TempData["ErrorMessage"] =
                     $"An {what} is already in progress (job {activeJob.JobId}). " +
+                    "Upgrade Center runs one operation at a time because Bold BI and Bold Reports can share IDP, UMS, ETL, and database resources. " +
                     "Please wait until it finishes before starting a new one.";
-                return RedirectToAction(nameof(Index));
+                return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
             }
 
             UiUpgradeJob job;
@@ -212,17 +276,37 @@ namespace BoldBI.UpgradeCenter.Controllers
             var requestedPatchVersion = !string.IsNullOrWhiteSpace(patchVersion) ? patchVersion : imageRef;
             if (!string.IsNullOrWhiteSpace(requestedPatchVersion))
             {
+                try
+                {
+                    await _upgradeEnvironmentEligibilityService.EnsureUpgradeSupportedAsync(HttpContext.RequestAborted);
+                }
+                catch (InvalidOperationException exception)
+                {
+                    TempData["PatchError"] = exception.Message;
+                    return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
+                }
+
                 var validation = await _upgradeService.ValidatePatchImageAsync(requestedPatchVersion, imageRepository);
                 if (!validation.IsValid)
                 {
                     TempData["PatchError"] = validation.ErrorMessage;
-                    return RedirectToAction(nameof(Index));
+                    return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
                 }
 
                 job = await _upgradeService.StartCustomPatchUpgradeAsync(requestedPatchVersion, imageRepository, user.DisplayName);
             }
             else if (!string.IsNullOrWhiteSpace(version))
             {
+                try
+                {
+                    await _upgradeEnvironmentEligibilityService.EnsureUpgradeSupportedAsync(HttpContext.RequestAborted);
+                }
+                catch (InvalidOperationException exception)
+                {
+                    TempData["ErrorMessage"] = exception.Message;
+                return RedirectToAction(nameof(Index), new { product = selectedProduct.Key });
+                }
+
                 job = await _upgradeService.StartUpgradeAsync(version, user.DisplayName);
             }
             else
@@ -242,6 +326,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (!user.IsAuthorized) return View("Unauthorized", user);
 
             if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound($"Job '{jobId}' not found.");
+            _productContext.SetCurrent(backendJob.ProductKey);
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             ApplyPlaywrightReportLinks(job);
@@ -262,6 +347,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             if (!user.IsAuthorized) return Forbid();
 
             if (!_jobStore.TryGet(jobId, out var backendJob)) return NotFound();
+            _productContext.SetCurrent(backendJob.ProductKey);
 
             var job = UpgradeJobViewModelMapper.ToViewModel(backendJob);
             ApplyPlaywrightReportLinks(job);
@@ -308,12 +394,24 @@ namespace BoldBI.UpgradeCenter.Controllers
                     or Services.UpgradeJobStatus.Cancelled
                     or Services.UpgradeJobStatus.RollbackSucceeded
                     or Services.UpgradeJobStatus.RollbackFailed,
-                entries = entries.Select(entry => new
-                {
-                    sequence = entry.Sequence,
-                    line = FormatLogLine(entry)
-                })
+                entries = entries.Select(entry => ToLogLine(entry, truncateForDisplay: true))
             });
+        }
+
+        [HttpGet("monitor/{jobId}/logs/download")]
+        public async Task<IActionResult> DownloadCompleteLogs(string jobId)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return Forbid();
+
+            if (!_jobStore.TryGet(jobId, out _)) return NotFound();
+
+            var entries = _operationLogStore.ListAll(jobId);
+            var content = entries.Count == 0
+                ? $"No complete operation logs are available for job {jobId}.{Environment.NewLine}"
+                : string.Join(Environment.NewLine + Environment.NewLine, entries.Select(FormatLogLineForDownload));
+            var fileName = $"upgrade-job-{jobId}-complete-logs.txt";
+            return File(Encoding.UTF8.GetBytes(content), "text/plain; charset=utf-8", fileName);
         }
 
         [HttpGet("reports/{jobId}/{stage}/html")]
@@ -357,20 +455,36 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return NotFound();
             }
 
-            if (!_playwrightReportUploadTokenStore.Validate(jobId, mode, ResolveUploadToken()))
-            {
-                return Unauthorized();
-            }
-
             await using var reportBuffer = new MemoryStream();
             await Request.Body.CopyToAsync(reportBuffer, HttpContext.RequestAborted);
             reportBuffer.Position = 0;
+            var reportHash = ComputeSha256Hash(reportBuffer);
+            var uploadAuthorization = _playwrightReportUploadTokenStore.AuthorizeUpload(
+                jobId,
+                mode,
+                PlaywrightUploadKind.Report,
+                ResolveUploadToken(),
+                reportHash);
+            reportBuffer.Position = 0;
+            if (!uploadAuthorization.Succeeded)
+            {
+                LogPlaywrightUploadAuthorizationFailure(jobId, mode, PlaywrightUploadKind.Report, uploadAuthorization);
+                return ToUploadAuthorizationFailure(uploadAuthorization);
+            }
+
+            if (uploadAuthorization.IsDuplicate)
+            {
+                return Ok(new { saved = true, duplicate = true });
+            }
 
             string? safeError;
             var saved = _playwrightReportStore.TrySaveHtml(jobId, mode, reportBuffer, out safeError);
-            var stageName = mode == PlaywrightValidationMode.Pre
-                ? "Pre-Upgrade Validation"
-                : "Post-Upgrade Validation";
+            if (!saved)
+            {
+                _playwrightReportUploadTokenStore.ResetUpload(jobId, mode, PlaywrightUploadKind.Report, reportHash);
+            }
+
+            var stageName = ToPlaywrightStageDisplayName(mode);
 
             _operationLogStore.Append(
                 jobId,
@@ -378,7 +492,7 @@ namespace BoldBI.UpgradeCenter.Controllers
                 saved ? "Info" : "Warning",
                 "PlaywrightReport",
                 saved
-                    ? "Playwright HTML report uploaded and stored for this validation stage."
+                    ? "Playwright HTML report saved."
                     : $"Playwright HTML report upload was received but could not be stored. {safeError ?? "No additional storage details were available."}");
 
             return saved
@@ -400,39 +514,49 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return NotFound();
             }
 
-            if (!_playwrightReportUploadTokenStore.Validate(jobId, mode, ResolveUploadToken()))
+            await using var resultBuffer = new MemoryStream();
+            await Request.Body.CopyToAsync(resultBuffer, HttpContext.RequestAborted);
+            resultBuffer.Position = 0;
+            var resultHash = ComputeSha256Hash(resultBuffer);
+            var uploadAuthorization = _playwrightReportUploadTokenStore.AuthorizeUpload(
+                jobId,
+                mode,
+                PlaywrightUploadKind.Result,
+                ResolveUploadToken(),
+                resultHash);
+            resultBuffer.Position = 0;
+            if (!uploadAuthorization.Succeeded)
             {
-                return Unauthorized();
+                LogPlaywrightUploadAuthorizationFailure(jobId, mode, PlaywrightUploadKind.Result, uploadAuthorization);
+                return ToUploadAuthorizationFailure(uploadAuthorization);
+            }
+
+            if (uploadAuthorization.IsDuplicate)
+            {
+                return Ok(new { saved = true, duplicate = true });
             }
 
             PlaywrightValidationResultSummary? summary;
             try
             {
                 summary = await JsonSerializer.DeserializeAsync<PlaywrightValidationResultSummary>(
-                    Request.Body,
+                    resultBuffer,
                     new JsonSerializerOptions { PropertyNameCaseInsensitive = true },
                     HttpContext.RequestAborted);
             }
             catch (JsonException)
             {
+                _playwrightReportUploadTokenStore.ResetUpload(jobId, mode, PlaywrightUploadKind.Result, resultHash);
                 return BadRequest(new { saved = false, error = "Invalid Playwright result JSON." });
             }
 
             if (summary is null)
             {
+                _playwrightReportUploadTokenStore.ResetUpload(jobId, mode, PlaywrightUploadKind.Result, resultHash);
                 return BadRequest(new { saved = false, error = "Playwright result JSON was empty." });
             }
 
             _playwrightValidationResultStore.Save(jobId, mode, summary);
-            var stageName = mode == PlaywrightValidationMode.Pre
-                ? "Pre-Upgrade Validation"
-                : "Post-Upgrade Validation";
-            _operationLogStore.Append(
-                jobId,
-                stageName,
-                string.Equals(summary.Status, "Passed", StringComparison.OrdinalIgnoreCase) ? "Info" : "Warning",
-                "PlaywrightResult",
-                summary.ToMessage("Playwright structured result uploaded."));
 
             return Created(string.Empty, new { saved = true });
         }
@@ -449,6 +573,7 @@ namespace BoldBI.UpgradeCenter.Controllers
                 var what = activeJob.IsRollback ? "rollback" : "upgrade";
                 TempData["ErrorMessage"] =
                     $"An {what} is already in progress (job {activeJob.JobId}). " +
+                    "Upgrade Center runs one operation at a time because Bold BI and Bold Reports can share IDP, UMS, ETL, and database resources. " +
                     "Please wait until it finishes before starting a rollback.";
                 return RedirectToAction(nameof(Monitor), new { jobId });
             }
@@ -468,6 +593,7 @@ namespace BoldBI.UpgradeCenter.Controllers
             {
                 return NotFound($"Job '{jobId}' not found.");
             }
+            var selectedProduct = _productContext.SetCurrent(backendJob.ProductKey);
 
             var rollbackFromVersion = !string.IsNullOrWhiteSpace(rollbackEntry.TargetVersion)
                 ? rollbackEntry.TargetVersion
@@ -488,7 +614,7 @@ namespace BoldBI.UpgradeCenter.Controllers
                 KubernetesImageCount = rollbackEntry.KubernetesResult?.PreviousImages.Count ?? 0,
                 Warnings =
                 [
-                    $"Bold BI will be restored from v{FormatVersionValue(rollbackFromVersion)} to v{FormatVersionValue(restoreToVersion)}.",
+                    $"{selectedProduct.DisplayName} will be restored from v{FormatVersionValue(rollbackFromVersion)} to v{FormatVersionValue(restoreToVersion)}.",
                     "Database tables captured in the rollback point will be restored to their pre-upgrade state.",
                     "Recorded Kubernetes deployment images will be reverted and rollout health will be validated.",
                     "Do not stop the Upgrade Center pod while rollback is restoring database tables or deployment images."
@@ -514,6 +640,7 @@ namespace BoldBI.UpgradeCenter.Controllers
                 var what = activeJob.IsRollback ? "rollback" : "upgrade";
                 TempData["ErrorMessage"] =
                     $"An {what} is already in progress (job {activeJob.JobId}). " +
+                    "Upgrade Center runs one operation at a time because Bold BI and Bold Reports can share IDP, UMS, ETL, and database resources. " +
                     "Please wait until it finishes before starting a rollback.";
                 return RedirectToAction(nameof(Monitor), new { jobId = jobId });
             }
@@ -528,8 +655,38 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return RedirectToAction(nameof(Monitor), new { jobId = jobId });
             }
 
+            if (_jobStore.TryGet(jobId, out var rollbackSourceJob))
+            {
+                _productContext.SetCurrent(rollbackSourceJob.ProductKey);
+            }
+
             var rollbackJob = await _upgradeService.StartRollbackAsync(jobId, user.DisplayName);
             return RedirectToAction(nameof(Monitor), new { jobId = rollbackJob.JobId });
+        }
+
+        // GET /upgrade-center/custom-patch-repository: current common repository for UI pre-fill
+
+        [HttpGet("custom-patch-repository")]
+        public async Task<IActionResult> GetDefaultCustomPatchRepository(string? product)
+        {
+            var user = await _authService.GetCurrentUserAsync(User);
+            if (!user.IsAuthorized) return Forbid();
+            await ResolveProductSelectionAsync(product, HttpContext.RequestAborted);
+
+            try
+            {
+                var imageRepository = await _upgradeService.GetDefaultCustomPatchRepositoryAsync(HttpContext.RequestAborted);
+                return Json(new { imageRepository = imageRepository ?? string.Empty });
+            }
+            catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(exception, "Unable to determine the current custom patch image repository.");
+                return Json(new { imageRepository = string.Empty });
+            }
         }
 
         // POST /upgrade-center/validate-patch: AJAX patch image validation
@@ -539,10 +696,16 @@ namespace BoldBI.UpgradeCenter.Controllers
         public async Task<IActionResult> ValidatePatch(
             [FromForm] string patchVersion,
             [FromForm] string? imageRepository,
-            [FromForm] string? imageRef)
+            [FromForm] string? imageRef,
+            [FromForm] string? product)
         {
             var user = await _authService.GetCurrentUserAsync(User);
             if (!user.IsAuthorized) return Forbid();
+            var productSelection = await ResolveProductSelectionAsync(product, HttpContext.RequestAborted);
+            if (!string.Equals(productSelection.RequestedProduct.Key, productSelection.SelectedProduct.Key, StringComparison.OrdinalIgnoreCase))
+            {
+                return BadRequest($"{productSelection.RequestedProduct.DisplayName} upgrade is not available for this deployment.");
+            }
 
             var requestedPatchVersion = !string.IsNullOrWhiteSpace(patchVersion) ? patchVersion : imageRef ?? string.Empty;
             var result = await _upgradeService.ValidatePatchImageAsync(requestedPatchVersion, imageRepository);
@@ -561,6 +724,25 @@ namespace BoldBI.UpgradeCenter.Controllers
         }
 
         // Private helpers
+
+        private async Task<ProductSelection> ResolveProductSelectionAsync(string? productKey, CancellationToken cancellationToken)
+        {
+            var mode = await _deploymentModeService.ResolveAsync(cancellationToken);
+            var requestedProduct = UpgradeProductDefinitions.Resolve(productKey);
+            var selectedProduct = mode.AvailableProducts.FirstOrDefault(product =>
+                string.Equals(product.Key, requestedProduct.Key, StringComparison.OrdinalIgnoreCase))
+                ?? mode.AvailableProducts.FirstOrDefault()
+                ?? UpgradeProductDefinitions.BoldBi;
+
+            _productContext.SetCurrent(selectedProduct.Key);
+            return new ProductSelection(requestedProduct, selectedProduct, mode.AvailableProducts, mode);
+        }
+
+        private sealed record ProductSelection(
+            UpgradeProductDefinition RequestedProduct,
+            UpgradeProductDefinition SelectedProduct,
+            IReadOnlyList<UpgradeProductDefinition> AvailableProducts,
+            UpgradeDeploymentModeResult Mode);
 
         private static string CombineUrl(string baseUrl, string relativePath)
         {
@@ -619,17 +801,87 @@ namespace BoldBI.UpgradeCenter.Controllers
                 : Request.Headers["X-Upgrade-Center-Report-Token"].ToString();
         }
 
+        private static string ComputeSha256Hash(Stream stream)
+        {
+            var position = stream.CanSeek ? stream.Position : 0;
+            if (stream.CanSeek)
+            {
+                stream.Position = 0;
+            }
+
+            var hash = Convert.ToHexString(SHA256.HashData(stream));
+            if (stream.CanSeek)
+            {
+                stream.Position = position;
+            }
+
+            return hash;
+        }
+
+        private IActionResult ToUploadAuthorizationFailure(PlaywrightUploadAuthorization authorization)
+        {
+            var message = authorization.FailureReason ?? "Upload authorization failed.";
+            return message.Contains("different upload", StringComparison.OrdinalIgnoreCase)
+                ? Conflict(new { saved = false, error = message })
+                : Unauthorized(new { saved = false, error = message });
+        }
+
+        private void LogPlaywrightUploadAuthorizationFailure(
+            string jobId,
+            PlaywrightValidationMode mode,
+            PlaywrightUploadKind kind,
+            PlaywrightUploadAuthorization authorization)
+        {
+            var uploadKind = kind == PlaywrightUploadKind.Report ? "HTML report" : "result";
+            _operationLogStore.Append(
+                jobId,
+                ToPlaywrightStageDisplayName(mode),
+                "Warning",
+                "PlaywrightUpload",
+                $"Playwright {uploadKind} upload was rejected by Upgrade Center authorization. {authorization.FailureReason ?? "No additional reason was provided."}");
+        }
+
         private void ApplyCompleteOperationLogs(UiUpgradeJob job)
         {
             var entries = _operationLogStore.List(job.JobId, 1000);
-            job.CompleteLogLines = entries.Select(FormatLogLine).ToList();
+            job.CompleteLogEntries = entries.Select(entry => ToLogLine(entry, truncateForDisplay: true)).ToList();
+            job.CompleteLogLines = job.CompleteLogEntries.Select(FormatLogLine).ToList();
             job.CompleteLogSequence = entries.Count == 0 ? 0 : entries.Max(entry => entry.Sequence);
         }
 
-        private static string FormatLogLine(UpgradeOperationLogEntry entry)
+        private static OperationLogLine ToLogLine(UpgradeOperationLogEntry entry, bool truncateForDisplay)
         {
             var stage = string.IsNullOrWhiteSpace(entry.Stage) ? "Job" : entry.Stage;
-            return $"[{entry.CreatedAt.UtcDateTime:dd MMM yyyy, HH:mm:ss 'UTC'}] [{entry.Level}] [{stage}]:{Environment.NewLine}{entry.Message}";
+            var message = entry.Message ?? string.Empty;
+            var isTruncated = false;
+            if (truncateForDisplay && message.Length > CompleteLogDisplayMessageLimit)
+            {
+                message = message[..CompleteLogDisplayMessageLimit] + $"{Environment.NewLine}... log entry truncated in the browser. Use Download Complete Logs for the full content.";
+                isTruncated = true;
+            }
+
+            return new OperationLogLine
+            {
+                Sequence = entry.Sequence,
+                Timestamp = entry.CreatedAt.UtcDateTime.ToString("dd MMM yyyy, HH:mm:ss 'UTC'"),
+                Level = string.IsNullOrWhiteSpace(entry.Level) ? "Info" : entry.Level,
+                Stage = stage,
+                Source = string.IsNullOrWhiteSpace(entry.Source) ? "UpgradeCenter" : entry.Source,
+                Message = message,
+                IsTruncated = isTruncated
+            };
+        }
+
+        private static string FormatLogLine(OperationLogLine entry)
+        {
+            return $"[{entry.Timestamp}] [{entry.Level}] [{entry.Stage}]:{Environment.NewLine}{entry.Message}";
+        }
+
+        private static string FormatLogLineForDownload(UpgradeOperationLogEntry entry)
+        {
+            var stage = string.IsNullOrWhiteSpace(entry.Stage) ? "Job" : entry.Stage;
+            var level = string.IsNullOrWhiteSpace(entry.Level) ? "Info" : entry.Level;
+            return $"[{entry.CreatedAt.UtcDateTime:dd MMM yyyy, HH:mm:ss 'UTC'}] [{level}] [{stage}]{Environment.NewLine}{entry.Message}";
         }
 
         private static bool TryParsePlaywrightStage(string stage, out PlaywrightValidationMode mode)
@@ -646,8 +898,24 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return true;
             }
 
+            if (string.Equals(stage, "cleanup", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = PlaywrightValidationMode.Cleanup;
+                return true;
+            }
+
             mode = PlaywrightValidationMode.Pre;
             return false;
+        }
+
+        private static string ToPlaywrightStageDisplayName(PlaywrightValidationMode mode)
+        {
+            return mode switch
+            {
+                PlaywrightValidationMode.Post => "Post-Upgrade Validation",
+                PlaywrightValidationMode.Cleanup => "Cleanup Job",
+                _ => "Pre-Upgrade Validation"
+            };
         }
 
         /// <summary>
@@ -675,7 +943,7 @@ namespace BoldBI.UpgradeCenter.Controllers
                 : null;
         }
 
-        private UiUpgradeJob? ResolveMostRecentRollbackableJob()
+        private UiUpgradeJob? ResolveMostRecentRollbackableJob(string? productKey = null)
         {
             var latest = _rollbackStore.GetLatest();
             if (latest is null || !latest.CanExecute || string.IsNullOrWhiteSpace(latest.UpgradeJobId))
@@ -688,13 +956,22 @@ namespace BoldBI.UpgradeCenter.Controllers
                 return null;
             }
 
+            if (!string.IsNullOrWhiteSpace(productKey) &&
+                !string.Equals(UpgradeProductDefinitions.Resolve(job.ProductKey).Key, UpgradeProductDefinitions.Resolve(productKey).Key, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
             return UpgradeJobViewModelMapper.ToViewModel(job);
         }
 
-        private async Task<List<UpgradeHistoryEntry>> GetHistoryEntriesAsync(CancellationToken cancellationToken)
+        private async Task<List<UpgradeHistoryEntry>> GetHistoryEntriesAsync(
+            UpgradeProductDefinition selectedProduct,
+            CancellationToken cancellationToken)
         {
             var records = await _historyStore.ListAsync(20, cancellationToken);
             return records
+                .Where(record => IsHistoryRecordForProduct(record, selectedProduct))
                 .Select(record => new UpgradeHistoryEntry
                 {
                     JobId = record.JobId,
@@ -704,9 +981,65 @@ namespace BoldBI.UpgradeCenter.Controllers
                         : record.InitiatedByName,
                     Status = UpgradeJobViewModelMapper.ToViewModelStatus(record.Status, record.OperationType),
                     CompletedAt = (record.CompletedAt ?? record.StartedAt).UtcDateTime,
-                    HasJobContext = _jobStore.TryGet(record.JobId, out _)
+                    HasJobContext = _jobStore.TryGet(record.JobId, out _),
+                    IsAutomaticRollback = IsAutomaticRollbackRecord(record)
                 })
                 .ToList();
+        }
+
+        private async Task<List<UpgradeHistoryEntry>> GetHistoryEntriesForDashboardAsync(
+            UpgradeProductDefinition selectedProduct,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await GetHistoryEntriesAsync(selectedProduct, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Upgrade history could not be loaded for the dashboard. The dashboard will continue without history.");
+                ViewData["DashboardWarning"] = "Upgrade history is temporarily unavailable because the IDP or database configuration is not ready. Please refresh after a few seconds.";
+                return [];
+            }
+        }
+
+        private static bool IsHistoryRecordForProduct(
+            Services.UpgradeHistoryRecord record,
+            UpgradeProductDefinition selectedProduct)
+        {
+            var product = record.Product?.Trim();
+            if (string.IsNullOrWhiteSpace(product))
+            {
+                return selectedProduct.Product == UpgradeProduct.BoldBi;
+            }
+
+            if (selectedProduct.Product == UpgradeProduct.BoldBi)
+            {
+                return product.Equals(UpgradeProductKeys.BoldBi, StringComparison.OrdinalIgnoreCase) ||
+                       product.Equals("BI", StringComparison.OrdinalIgnoreCase) ||
+                       product.Equals("BoldBI", StringComparison.OrdinalIgnoreCase) ||
+                       product.Equals("Bold BI", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return product.Equals(UpgradeProductKeys.BoldReports, StringComparison.OrdinalIgnoreCase) ||
+                   product.Equals("Reports", StringComparison.OrdinalIgnoreCase) ||
+                   product.Equals("BoldReports", StringComparison.OrdinalIgnoreCase) ||
+                   product.Equals("Bold Reports", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsAutomaticRollbackRecord(Services.UpgradeHistoryRecord record)
+        {
+            return string.Equals(record.OperationType, Services.UpgradeHistoryOperationTypes.AutomaticRollback, StringComparison.OrdinalIgnoreCase) ||
+                   (string.Equals(record.Status, Services.UpgradeJobStatus.RollbackSucceeded.ToString(), StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(record.OperationType, Services.UpgradeHistoryOperationTypes.ManualRollback, StringComparison.OrdinalIgnoreCase) &&
+                    (record.FailureSummary?.Contains("Automatic rollback", StringComparison.OrdinalIgnoreCase) == true ||
+                     record.FailureStage is not null));
         }
 
         private static string FormatVersion(string? version)

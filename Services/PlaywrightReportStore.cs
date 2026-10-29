@@ -1,7 +1,7 @@
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class PlaywrightReportStore : IPlaywrightReportStore
 {
@@ -240,7 +240,12 @@ public sealed class PlaywrightReportStore : IPlaywrightReportStore
 
     private static string ToStageSegment(PlaywrightValidationMode mode)
     {
-        return mode == PlaywrightValidationMode.Pre ? "pre-upgrade" : "post-upgrade";
+        return mode switch
+        {
+            PlaywrightValidationMode.Post => "post-upgrade",
+            PlaywrightValidationMode.Cleanup => "cleanup",
+            _ => "pre-upgrade"
+        };
     }
 
     private static string ToSafeStorageError(string subject, Exception exception)

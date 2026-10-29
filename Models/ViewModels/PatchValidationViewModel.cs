@@ -1,6 +1,6 @@
-using BoldBI.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models;
 
-namespace BoldBI.UpgradeCenter.Models.ViewModels
+namespace Bold.UpgradeCenter.Models.ViewModels
 {
     /// <summary>
     /// View-model returned to the Custom Patch tab after an AJAX validate call.

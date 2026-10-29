@@ -4,7 +4,7 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed record UpgradeOperationLogEntry(
     long Sequence,
@@ -22,6 +22,10 @@ public interface IUpgradeOperationLogStore
     IReadOnlyList<UpgradeOperationLogEntry> List(string jobId, int take = 500);
 
     IReadOnlyList<UpgradeOperationLogEntry> ListAfter(string jobId, long afterSequence, int take = 200);
+
+    IReadOnlyList<UpgradeOperationLogEntry> ListAll(string jobId);
+
+    void RetainLatestJobs(int jobCount);
 }
 
 public sealed class DatabaseUpgradeOperationLogStore : IUpgradeOperationLogStore
@@ -56,6 +60,14 @@ public sealed class DatabaseUpgradeOperationLogStore : IUpgradeOperationLogStore
             appendLock.Wait();
             try
             {
+                var safeStage = string.IsNullOrWhiteSpace(stage) ? null : stage.Trim();
+                var safeLevel = Truncate(level, 16);
+                var safeSource = Truncate(source, 64);
+                if (HasDuplicateEntry(database, jobId, safeStage, safeLevel, safeSource, message))
+                {
+                    return;
+                }
+
                 var sequence = GetNextSequence(database, jobId);
                 using var command = CreateCommand(database, $"""
                     INSERT INTO {TableName}
@@ -66,9 +78,9 @@ public sealed class DatabaseUpgradeOperationLogStore : IUpgradeOperationLogStore
 
                 AddParameter(command, database.DatabaseType, "jobid", jobId);
                 AddParameter(command, database.DatabaseType, "sequenceid", sequence);
-                AddParameter(command, database.DatabaseType, "stage", string.IsNullOrWhiteSpace(stage) ? DBNull.Value : stage);
-                AddParameter(command, database.DatabaseType, "loglevel", Truncate(level, 16));
-                AddParameter(command, database.DatabaseType, "source", Truncate(source, 64));
+                AddParameter(command, database.DatabaseType, "stage", safeStage is null ? DBNull.Value : safeStage);
+                AddParameter(command, database.DatabaseType, "loglevel", safeLevel);
+                AddParameter(command, database.DatabaseType, "source", safeSource);
                 AddParameter(command, database.DatabaseType, "message", message);
                 AddParameter(command, database.DatabaseType, "createdat", DateTimeOffset.UtcNow.ToString("O"));
                 command.ExecuteNonQuery();
@@ -117,6 +129,51 @@ public sealed class DatabaseUpgradeOperationLogStore : IUpgradeOperationLogStore
             AddParameter(command, database.DatabaseType, "sequenceid", afterSequence);
             return ReadEntries(command);
         }) ?? Array.Empty<UpgradeOperationLogEntry>();
+    }
+
+    public IReadOnlyList<UpgradeOperationLogEntry> ListAll(string jobId)
+    {
+        return TryRun(database =>
+        {
+            EnsureSchema(database);
+            using var command = CreateCommand(database, $"SELECT jobid, sequenceid, stage, loglevel, source, message, createdat FROM {TableName} WHERE jobid = @jobid ORDER BY sequenceid ASC");
+            AddParameter(command, database.DatabaseType, "jobid", jobId);
+            return ReadEntries(command);
+        }) ?? Array.Empty<UpgradeOperationLogEntry>();
+    }
+
+    public void RetainLatestJobs(int jobCount)
+    {
+        if (jobCount < 1)
+        {
+            return;
+        }
+
+        TryRun(database =>
+        {
+            EnsureSchema(database);
+            using var selectCommand = CreateCommand(database, $"SELECT jobid, MAX(createdat) AS lastcreatedat FROM {TableName} GROUP BY jobid ORDER BY MAX(createdat) DESC");
+            var jobIdsToDelete = new List<string>();
+            using (var reader = selectCommand.ExecuteReader())
+            {
+                var index = 0;
+                while (reader.Read())
+                {
+                    var jobId = reader.GetValue(0).ToString();
+                    if (!string.IsNullOrWhiteSpace(jobId) && index++ >= jobCount)
+                    {
+                        jobIdsToDelete.Add(jobId);
+                    }
+                }
+            }
+
+            foreach (var jobId in jobIdsToDelete)
+            {
+                using var deleteCommand = CreateCommand(database, $"DELETE FROM {TableName} WHERE jobid = @jobid");
+                AddParameter(deleteCommand, database.DatabaseType, "jobid", jobId);
+                deleteCommand.ExecuteNonQuery();
+            }
+        });
     }
 
     private T? TryRun<T>(Func<OperationLogConnection, T> action)
@@ -276,6 +333,44 @@ public sealed class DatabaseUpgradeOperationLogStore : IUpgradeOperationLogStore
         return value is null || value == DBNull.Value
             ? 1
             : Convert.ToInt64(value) + 1;
+    }
+
+    private static bool HasDuplicateEntry(
+        OperationLogConnection database,
+        string jobId,
+        string? stage,
+        string level,
+        string source,
+        string message)
+    {
+        var stageFilter = stage is null ? "stage IS NULL" : "stage = @stage";
+        var sql = database.DatabaseType switch
+        {
+            DatabaseType.MSSQL => $"SELECT TOP (100) message FROM {TableName} WHERE jobid = @jobid AND loglevel = @loglevel AND source = @source AND {stageFilter} ORDER BY sequenceid DESC",
+            DatabaseType.Oracle => $"SELECT message FROM {TableName} WHERE jobid = @jobid AND loglevel = @loglevel AND source = @source AND {stageFilter} ORDER BY sequenceid DESC FETCH FIRST 100 ROWS ONLY",
+            _ => $"SELECT message FROM {TableName} WHERE jobid = @jobid AND loglevel = @loglevel AND source = @source AND {stageFilter} ORDER BY sequenceid DESC LIMIT 100"
+        };
+
+        using var command = CreateCommand(database, sql);
+        AddParameter(command, database.DatabaseType, "jobid", jobId);
+        AddParameter(command, database.DatabaseType, "loglevel", level);
+        AddParameter(command, database.DatabaseType, "source", source);
+        if (stage is not null)
+        {
+            AddParameter(command, database.DatabaseType, "stage", stage);
+        }
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var existingMessage = reader.IsDBNull(0) ? string.Empty : reader.GetValue(0).ToString() ?? string.Empty;
+            if (string.Equals(existingMessage, message, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static IReadOnlyList<UpgradeOperationLogEntry> ReadEntries(DbCommand command)

@@ -1,5 +1,6 @@
-@using BoldBI.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Models
 @model UpgradeCenterUser
+@inject Microsoft.Extensions.Options.IOptions<Bold.UpgradeCenter.Services.UpgradeCenterOptions> Options
 
 @{
     ViewData["Title"] = "Access Denied";
@@ -8,9 +9,10 @@
 
 <div class="product-topbar">
     <div class="brand">
-        <img class="brand-logo" src="~/upgrade-center/images/boldid_main_logo.svg" asp-append-version="true" alt="Bold BI" />
-        <div class="name">Bold BI</div>
+        <img class="brand-logo" src="~/upgrade-center/images/boldid_main_logo.svg" asp-append-version="true" alt="Bold" />
+        <div class="name">Bold</div>
         <div class="crumb">Upgrade Center</div>
+        <span class="beta-badge beta-badge-topbar" aria-label="Beta version">BETA</span>
     </div>
     <div class="user-chip">
         <div class="avatar">@Model.Initials</div>
@@ -29,9 +31,16 @@
         </div>
         <h1>You don't have access to this page</h1>
         <p>
-            The Upgrade Center is available to Bold BI administrators only.
-            If you believe you should have access, contact your UMS administrator.
+            The Upgrade Center is available to authorized administrators only.
+            @if (Bold.UpgradeCenter.Services.UpgradeCenterIntegrationModes.Parse(Options.Value.IntegrationMode) == Bold.UpgradeCenter.Services.UpgradeCenterIntegrationMode.Standalone)
+            {
+                <span>If you believe you should have access, contact your Upgrade Center administrator.</span>
+            }
+            else
+            {
+                <span>If you believe you should have access, contact your UMS administrator.</span>
+            }
         </p>
-        <a href="@(ViewData["ReturnToBoldBiUrl"] as string ?? "/")" class="btn btn-primary">Return to Bold BI</a>
+        <a href="@(ViewData["ReturnToBoldBiUrl"] as string ?? "/")" class="btn btn-primary">Return to application</a>
     </div>
 </div>

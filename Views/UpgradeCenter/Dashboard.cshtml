@@ -1,9 +1,9 @@
-@using BoldBI.UpgradeCenter.Models
-@using BoldBI.UpgradeCenter.Models.ViewModels
+@using Bold.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Models.ViewModels
 @model DashboardViewModel
 
 @{
-    ViewData["Title"] = "Upgrade Center";
+    ViewData["Title"] = $"{Model.SelectedProduct.DisplayName} Upgrade Center";
     Layout = "~/Views/Shared/_Layout.cshtml";
 }
 
@@ -16,20 +16,35 @@
     <div class="top-row">
         <div>
             <div class="eyebrow">@Model.Installation.DeploymentTarget</div>
-            <h1 class="page-title">Upgrade Center</h1>
+            <h1 class="page-title">@Model.SelectedProduct.DisplayName Upgrade Center</h1>
             <p class="page-sub">
                 Check for new releases, apply a delivered custom patch, and monitor every step
                 of the upgrade — with rollback if you need it.
             </p>
         </div>
+        @if (Model.AvailableProducts.Count > 1)
+        {
+            <nav class="product-switcher" aria-label="Upgrade product">
+                @foreach (var product in Model.AvailableProducts)
+                {
+                    var selected = string.Equals(product.Key, Model.SelectedProduct.Key, StringComparison.OrdinalIgnoreCase);
+                    <a class="product-switcher-link @(selected ? "active" : "")"
+                       href="@Url.Action("Index", "UpgradeCenter", new { product = product.Key })"
+                       aria-current="@(selected ? "page" : null)">
+                        @product.DisplayName
+                    </a>
+                }
+            </nav>
+        }
     </div>
 
     <!-- Error / notification banner (from TempData) -->
     @if (ViewData["ErrorMessage"] is string errMsg)
     {
+        var errorTitle = ViewData["ErrorTitle"] as string ?? "Action blocked";
         <div class="banner running" style="background: var(--red-100, #fdecec); border-color: var(--red-300, #f3b9b9);">
             <div class="txt">
-                <b>Action blocked</b>
+                <b>@errorTitle</b>
                 <span>@errMsg</span>
             </div>
         </div>
@@ -145,7 +160,7 @@
                                     else
                                     {
                                         <a class="btn btn-primary"
-                                           href="@Url.Action("Confirm", "UpgradeCenter", new { version = release.Version })">
+                                           href="@Url.Action("Confirm", "UpgradeCenter", new { version = release.Version, product = Model.SelectedProduct.Key })">
                                             Upgrade
                                         </a>
                                     }
@@ -173,7 +188,7 @@
                            name="patchVersion"
                            placeholder="16.1.88" />
                     <div class="hint">
-                        Enter the patch version or image tag provided by Bold BI Support.
+                        Enter the patch version or image tag provided by @Model.SelectedProduct.DisplayName Support.
                     </div>
                 </div>
 
@@ -182,9 +197,9 @@
                     <input type="text"
                            id="imageRepository"
                            name="imageRepository"
-                           placeholder="us-central1-docker.pkg.dev/boldbi-dev-296107/boldbi" />
-                    <div class="hint">
-                        Leave empty to keep the repository and image name from each currently running Bold BI deployment.
+                           placeholder="registry.example.com/@Model.SelectedProduct.Key" />
+                    <div class="hint" id="imageRepositoryHint">
+                        Leave empty to keep the repository and image name from each currently running @Model.SelectedProduct.DisplayName deployment.
                     </div>
                 </div>
 
@@ -196,6 +211,7 @@
                         @if (Model.HasActiveJob) { <text>title="Another upgrade or rollback is currently in progress."</text> }>
                     Upgrade to this patch
                 </button>
+                <input type="hidden" name="product" value="@Model.SelectedProduct.Key" />
 
                 @if (Model.HasActiveJob)
                 {
@@ -208,7 +224,7 @@
                 <div id="patch-validation-result"></div>
 
                 <div class="allow-box">
-                    The Upgrade Center generates one target image per Bold BI deployment, validates
+                    The Upgrade Center generates one target image per @Model.SelectedProduct.DisplayName deployment, validates
                     every required image, and enables upgrade only when all required images are available.
                 </div>
             </form>
@@ -242,7 +258,11 @@
                     <div class="history-row">
                         <div>
                             <b>@entry.Label</b>
-                            <div class="who">@statusBadge.Item2 · initiated by @entry.InitiatedBy</div>
+                            <div class="who">
+                                @(entry.IsAutomaticRollback
+                                    ? $"{statusBadge.Item2} · automatic rollback"
+                                    : $"{statusBadge.Item2} · initiated by {entry.InitiatedBy}")
+                            </div>
                         </div>
                         <div style="display:flex; gap:8px; align-items:center;">
                             <span class="badge @statusBadge.Item1">@statusBadge.Item2</span>
@@ -309,7 +329,29 @@
     const btnPatchUpgrade  = document.getElementById('btn-patch-upgrade');
     const patchVersionInput = document.getElementById('patchVersion');
     const imageRepoInput    = document.getElementById('imageRepository');
+    const imageRepoHint     = document.getElementById('imageRepositoryHint');
     const validationResult = document.getElementById('patch-validation-result');
+
+    async function loadDefaultImageRepository() {
+        try {
+            const response = await fetch('@Url.Action("GetDefaultCustomPatchRepository", "UpgradeCenter", new { product = Model.SelectedProduct.Key })', {
+                headers: { 'Accept': 'application/json' },
+                cache: 'no-store'
+            });
+            if (!response.ok) return;
+
+            const result = await response.json();
+            const imageRepository = String(result.imageRepository || '').trim();
+            if (!imageRepository || imageRepoInput.value.trim()) return;
+
+            imageRepoInput.value = imageRepository;
+            imageRepoHint.textContent = 'Detected from the currently running @Model.SelectedProduct.DisplayName deployments. Change it only when the custom patch is hosted in a different allowed repository.';
+        } catch {
+            // Repository discovery is optional; an empty value preserves current repositories.
+        }
+    }
+
+    loadDefaultImageRepository();
 
     btnValidate.addEventListener('click', async () => {
         const patchVersion = patchVersionInput.value.trim();
@@ -322,6 +364,7 @@
         const formData = new FormData();
         formData.append('patchVersion', patchVersion);
         formData.append('imageRepository', imageRepository);
+        formData.append('product', '@Model.SelectedProduct.Key');
         formData.append('__RequestVerificationToken',
             document.querySelector('input[name="__RequestVerificationToken"]').value);
 

@@ -3,11 +3,11 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text.Encodings.Web;
 using System.Text.Json;
-using BoldBI.UpgradeCenter.Services;
+using Bold.UpgradeCenter.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Security;
+namespace Bold.UpgradeCenter.Security;
 
 public sealed class RemoteUmsAuthenticationHandler : AuthenticationHandler<AuthenticationSchemeOptions>
 {
@@ -349,14 +349,53 @@ public sealed class RemoteUmsAuthenticationHandler : AuthenticationHandler<Authe
 
     private string ResolveReturnUrl(string? idpBaseUrl)
     {
-        var pathAndQuery = Request.PathBase + Request.Path + Request.QueryString;
+        var pathAndQuery = ResolveSafeApplicationPathAndQuery();
         if (TryCreateHttpUri(idpBaseUrl, out var idpUri))
         {
             var publicPathAndQuery = EnsureBasePath(pathAndQuery, idpUri.AbsolutePath);
             return $"{idpUri.GetLeftPart(UriPartial.Authority)}{publicPathAndQuery}";
         }
 
-        return $"{Request.Scheme}://{Request.Host}{pathAndQuery}";
+        return pathAndQuery;
+    }
+
+    private string ResolveSafeApplicationPathAndQuery()
+    {
+        var pathBase = Request.PathBase.HasValue ? Request.PathBase.Value! : string.Empty;
+        var path = Request.Path.HasValue ? Request.Path.Value! : "/upgrade-center";
+        var query = Request.QueryString.HasValue ? Request.QueryString.Value! : string.Empty;
+        var pathAndQuery = $"{pathBase}{path}{query}";
+
+        return IsSafeApplicationPathAndQuery(pathAndQuery)
+            ? pathAndQuery
+            : "/upgrade-center";
+    }
+
+    private bool IsSafeApplicationPathAndQuery(string pathAndQuery)
+    {
+        if (string.IsNullOrWhiteSpace(pathAndQuery) ||
+            pathAndQuery.Contains("://", StringComparison.Ordinal) ||
+            pathAndQuery.Contains("//", StringComparison.Ordinal) ||
+            pathAndQuery.Contains("..", StringComparison.Ordinal) ||
+            pathAndQuery.Contains('\\', StringComparison.Ordinal) ||
+            pathAndQuery.Contains('#', StringComparison.Ordinal) ||
+            pathAndQuery.Any(char.IsControl) ||
+            Uri.TryCreate(pathAndQuery, UriKind.Absolute, out _))
+        {
+            return false;
+        }
+
+        var pathOnly = pathAndQuery.Split('?', 2)[0];
+        if (!pathOnly.StartsWith("/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var normalizedPath = NormalizePath(pathOnly);
+        return normalizedPath.Equals("/upgrade-center", StringComparison.OrdinalIgnoreCase) ||
+            normalizedPath.StartsWith("/upgrade-center/", StringComparison.OrdinalIgnoreCase) ||
+            normalizedPath.EndsWith("/upgrade-center", StringComparison.OrdinalIgnoreCase) ||
+            normalizedPath.Contains("/upgrade-center/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string RemoveBasePath(string loginPath, string idpBasePath)

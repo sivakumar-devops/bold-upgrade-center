@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace BoldBI.UpgradeCenter.Security;
+namespace Bold.UpgradeCenter.Security;
 
 public sealed record AdminContinuationUser(
     string UserId,

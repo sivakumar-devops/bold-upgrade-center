@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IPlaywrightKubernetesJobService
 {
@@ -6,6 +6,13 @@ public interface IPlaywrightKubernetesJobService
         PlaywrightValidationMode mode,
         string upgradeJobId,
         Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
+        CancellationToken cancellationToken = default);
+
+    Task<PlaywrightScriptResult> RunCleanupAsync(
+        string upgradeJobId,
+        Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
         CancellationToken cancellationToken = default);
 
     Task CleanupSharedStateAsync(string upgradeJobId, CancellationToken cancellationToken = default);

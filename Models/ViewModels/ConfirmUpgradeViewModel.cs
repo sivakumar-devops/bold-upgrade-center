@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Models.ViewModels
+namespace Bold.UpgradeCenter.Models.ViewModels
 {
     /// <summary>
     /// View-model for the Confirm Upgrade modal (Screen 3).
@@ -6,6 +6,8 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
     public class ConfirmUpgradeViewModel
     {
         public UpgradeCenterUser CurrentUser { get; set; } = new();
+
+        public Services.UpgradeProductDefinition SelectedProduct { get; set; } = Services.UpgradeProductDefinitions.BoldBi;
 
         public string FromVersion { get; set; } = string.Empty;
         public string ToVersion { get; set; } = string.Empty;
@@ -32,5 +34,9 @@ namespace BoldBI.UpgradeCenter.Models.ViewModels
         public IReadOnlyList<string> DatabaseTypes { get; set; } = Array.Empty<string>();
 
         public IReadOnlyList<string> Warnings { get; set; } = Array.Empty<string>();
+
+        public bool IsStartBlocked { get; set; }
+
+        public string? StartBlockedMessage { get; set; }
     }
 }

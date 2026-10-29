@@ -1,5 +1,5 @@
-@using BoldBI.UpgradeCenter.Models
-@using BoldBI.UpgradeCenter.Models.ViewModels
+@using Bold.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Models.ViewModels
 @model ConfirmUpgradeViewModel
 
 @{
@@ -112,6 +112,17 @@
             </div>
         }
 
+        @if (Model.IsStartBlocked && !string.IsNullOrWhiteSpace(Model.StartBlockedMessage))
+        {
+            <div class="upgrade-blocker" role="alert">
+                <span class="upgrade-blocker-icon">!</span>
+                <div>
+                    <strong>Upgrade unavailable</strong>
+                    <div>@Model.StartBlockedMessage</div>
+                </div>
+            </div>
+        }
+
         @if (Model.ReleaseType == ReleaseType.CustomPatch && !string.IsNullOrWhiteSpace(Model.CustomImageReference))
         {
             <div class="modal-note" style="background:var(--amber-100);">
@@ -125,7 +136,7 @@
 
         <div class="modal-actions">
             <a class="btn btn-secondary"
-               href="@Url.Action("Index", "UpgradeCenter")">
+               href="@Url.Action("Index", "UpgradeCenter", new { product = Model.SelectedProduct.Key })">
                 Cancel
             </a>
 
@@ -136,7 +147,12 @@
                 @Html.AntiForgeryToken()
                 <input type="hidden" name="version" value="@Model.ToVersion" />
                 <input type="hidden" name="imageRef" value="@Model.CustomImageReference" />
-                <button type="submit" class="btn btn-primary">Start upgrade</button>
+                <input type="hidden" name="product" value="@Model.SelectedProduct.Key" />
+                <button type="submit"
+                        class="btn btn-primary"
+                        disabled="@Model.IsStartBlocked">
+                    Start upgrade
+                </button>
             </form>
         </div>
     </div>

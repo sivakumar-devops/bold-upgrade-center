@@ -1,8 +1,8 @@
 using System.Security.Claims;
-using BoldBI.UpgradeCenter.Models;
-using BoldBI.UpgradeCenter.Security;
+using Bold.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Security;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class ClaimsUpgradeCenterAuthorizationService : IUpgradeCenterAuthorizationService
 {
@@ -28,7 +28,9 @@ public sealed class ClaimsUpgradeCenterAuthorizationService : IUpgradeCenterAuth
             DisplayName = displayName,
             Initials = GetInitials(displayName),
             Email = email,
-            Role = isAdmin ? "UMS Admin" : "User",
+            Role = isAdmin
+                ? (principal.Identity?.AuthenticationType == UpgradeCenterAuthenticationDefaults.StandaloneScheme ? "Upgrade Center Admin" : "UMS Admin")
+                : "User",
             IsAuthorized = principal.Identity?.IsAuthenticated == true && isAdmin
         };
 

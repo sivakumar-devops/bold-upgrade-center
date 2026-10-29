@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Security;
+namespace Bold.UpgradeCenter.Security;
 
 public static class UpgradeCenterPolicies
 {
@@ -8,6 +8,8 @@ public static class UpgradeCenterPolicies
 public static class UpgradeCenterAuthenticationDefaults
 {
     public const string Scheme = "UpgradeCenterRemoteUms";
+
+    public const string StandaloneScheme = "UpgradeCenterStandalone";
 }
 
 public static class UpgradeCenterClaimTypes

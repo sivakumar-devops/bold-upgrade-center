@@ -3,7 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
 {
@@ -14,15 +14,18 @@ public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
 
     private readonly HttpClient httpClient;
     private readonly UpgradeCenterOptions options;
+    private readonly IUpgradeProductContext productContext;
     private readonly ILogger<BoldBiReleaseVersionProvider> logger;
 
     public BoldBiReleaseVersionProvider(
         HttpClient httpClient,
         IOptions<UpgradeCenterOptions> options,
+        IUpgradeProductContext productContext,
         ILogger<BoldBiReleaseVersionProvider> logger)
     {
         this.httpClient = httpClient;
         this.options = options.Value;
+        this.productContext = productContext;
         this.logger = logger;
     }
 
@@ -30,15 +33,17 @@ public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
     {
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, options.ReleaseVersionsApiUrl);
+            var product = productContext.Current;
+            var releaseVersionsApiUrl = ResolveReleaseVersionsApiUrl(product);
+            using var request = new HttpRequestMessage(HttpMethod.Get, releaseVersionsApiUrl);
             request.Headers.UserAgent.ParseAdd("Bold-Upgrade-Center/1.0");
             request.Headers.Accept.ParseAdd("application/json");
 
-            logger.LogInformation("Fetching Bold BI release versions from {ReleaseVersionsApiUrl}.", options.ReleaseVersionsApiUrl);
+            logger.LogInformation("Fetching {ProductName} release versions from {ReleaseVersionsApiUrl}.", product.DisplayName, releaseVersionsApiUrl);
             using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
-                var errorMessage = $"Bold BI release API request failed with status {(int)response.StatusCode}.";
+                var errorMessage = $"{product.DisplayName} release API request failed with status {(int)response.StatusCode}.";
                 logger.LogWarning(errorMessage);
                 return new ReleaseVersionSummary(Array.Empty<ReleaseVersionInfo>(), null, VersionComparisonState.Unknown, errorMessage);
             }
@@ -59,15 +64,16 @@ public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
             var comparison = CompareCurrentWithLatest(currentVersion, latestVersion);
             if (latestVersion is not null && !ProductVersionComparer.TryParse(currentVersion, out _))
             {
-                const string errorMessage = "Unable to compare available versions because the installed Bold BI version is not in a supported version format.";
-                logger.LogWarning("Installed Bold BI version could not be parsed for upgrade comparison. CurrentVersion: {CurrentVersion}.", currentVersion);
+                var errorMessage = $"Unable to compare available versions because the installed {product.DisplayName} version is not in a supported version format.";
+                logger.LogWarning("Installed {ProductName} version could not be parsed for upgrade comparison. CurrentVersion: {CurrentVersion}.", product.DisplayName, currentVersion);
                 return new ReleaseVersionSummary(Array.Empty<ReleaseVersionInfo>(), null, VersionComparisonState.Unknown, errorMessage);
             }
 
             var newerVersions = FilterNewerVersions(currentVersion, allVersions);
             logger.LogInformation(
-                "Fetched {VersionCount} Bold BI release versions. NewerVersionCount: {NewerVersionCount}. LatestVersion: {LatestVersion}. ComparisonState: {ComparisonState}.",
+                "Fetched {VersionCount} {ProductName} release versions. NewerVersionCount: {NewerVersionCount}. LatestVersion: {LatestVersion}. ComparisonState: {ComparisonState}.",
                 allVersions.Count,
+                product.DisplayName,
                 newerVersions.Count,
                 latestVersion?.Version ?? "Unavailable",
                 comparison);
@@ -80,17 +86,19 @@ public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
         }
         catch (Exception exception)
         {
-            logger.LogError(exception, "Unable to fetch Bold BI release versions from release API.");
+            var product = productContext.Current;
+            logger.LogError(exception, "Unable to fetch {ProductName} release versions from release API.", product.DisplayName);
             return new ReleaseVersionSummary(
                 Array.Empty<ReleaseVersionInfo>(),
                 null,
                 VersionComparisonState.Unknown,
-                "Unable to fetch available versions from Bold BI release API.");
+                $"Unable to fetch available versions from {product.DisplayName} release API.");
         }
     }
 
     private ReleaseVersionInfo ToReleaseVersionInfo(BoldBiReleaseVersion releaseVersion)
     {
+        var product = productContext.Current;
         var version = NormalizeVersion(releaseVersion.Version ?? string.Empty);
         var release = releaseVersion.Releases?
             .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item.ReleaseDate) || !string.IsNullOrWhiteSpace(item.ReleaseNotesUrl));
@@ -98,9 +106,32 @@ public sealed class BoldBiReleaseVersionProvider : IReleaseVersionProvider
         return new ReleaseVersionInfo(
             version,
             version,
-            $"{options.ProductName} {version}",
+            $"{product.DisplayName} {version}",
             release?.ReleaseNotesUrl?.Trim() ?? string.Empty,
             ParseReleaseDate(release?.ReleaseDate));
+    }
+
+    private string ResolveReleaseVersionsApiUrl(UpgradeProductDefinition product)
+    {
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(options.BiReleaseVersionsApiUrl))
+        {
+            return options.BiReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(options.ReleaseVersionsApiUrl))
+        {
+            return options.ReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldReports &&
+            !string.IsNullOrWhiteSpace(options.ReportsReleaseVersionsApiUrl))
+        {
+            return options.ReportsReleaseVersionsApiUrl;
+        }
+
+        return product.ReleaseVersionsApiUrl;
     }
 
     private static VersionComparisonState CompareCurrentWithLatest(string currentVersion, ReleaseVersionInfo? latestVersion)

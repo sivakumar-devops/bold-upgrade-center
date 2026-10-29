@@ -16,6 +16,7 @@ secrets.json
 *.pfx
 
 # Logs and temporary files
+App_Data/
 logs/
 *.log
 TestResults/

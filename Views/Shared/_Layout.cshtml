@@ -3,10 +3,11 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Bold BI Upgrade Center</title>
+    <title>@(ViewData["Title"] ?? "Bold Upgrade Center")</title>
     <link rel="stylesheet" href="~/upgrade-center/css/upgrade-center.css" asp-append-version="true" />
+    @await RenderSectionAsync("Styles", required: false)
 </head>
-<body>
+<body class="@ViewData["BodyClass"]">
     @RenderBody()
     @await RenderSectionAsync("Scripts", required: false)
 </body>

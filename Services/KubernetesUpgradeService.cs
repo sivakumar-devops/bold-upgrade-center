@@ -7,7 +7,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
 {
@@ -18,6 +18,7 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
         "bi-jobs-deployment",
         "bi-web-deployment",
         "bold-ai-deployment",
+        "bold-mcp-deployment",
         "bold-etl-deployment",
         "id-api-deployment",
         "id-ums-deployment",
@@ -27,6 +28,7 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
     private static readonly IReadOnlyList<string> DefaultOptionalDeployments =
     [
         "bold-ai-deployment",
+        "bold-mcp-deployment",
         "bold-etl-deployment"
     ];
 
@@ -40,17 +42,23 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
     private readonly HttpClient releaseHttpClient;
     private readonly UpgradeCenterOptions upgradeCenterOptions;
     private readonly KubernetesUpgradeOptions options;
+    private readonly IUpgradeProductContext productContext;
+    private readonly IHostEnvironment hostEnvironment;
     private readonly ILogger<KubernetesUpgradeService> logger;
 
     public KubernetesUpgradeService(
         HttpClient releaseHttpClient,
         IOptions<UpgradeCenterOptions> upgradeCenterOptions,
         IOptions<KubernetesUpgradeOptions> options,
+        IUpgradeProductContext productContext,
+        IHostEnvironment hostEnvironment,
         ILogger<KubernetesUpgradeService> logger)
     {
         this.releaseHttpClient = releaseHttpClient;
         this.upgradeCenterOptions = upgradeCenterOptions.Value;
         this.options = options.Value;
+        this.productContext = productContext;
+        this.hostEnvironment = hostEnvironment;
         this.logger = logger;
     }
 
@@ -120,7 +128,22 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
         var targetDeployments = ResolveTargetDeployments(scope, deploymentName, validation, imageMap);
         if (targetDeployments.Count == 0)
         {
-            return KubernetesUpgradeResult.Failed("No matching Bold BI Kubernetes deployments were available for upgrade.", scope, deploymentName, validation);
+            return KubernetesUpgradeResult.Failed($"No matching {productContext.Current.DisplayName} Kubernetes deployments were available for upgrade.", scope, deploymentName, validation);
+        }
+
+        var missingRequiredImages = validation.DeploymentStatuses
+            .Where(deployment => deployment.IsExpected && deployment.IsRequired && deployment.IsAvailable)
+            .Where(deployment => !imageMap.ContainsKey(deployment.DeploymentName))
+            .Select(deployment => deployment.DeploymentName)
+            .OrderBy(deployment => deployment, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (missingRequiredImages.Count > 0)
+        {
+            return KubernetesUpgradeResult.Failed(
+                $"{productContext.Current.DisplayName} release metadata is missing image mapping for required deployment(s): {string.Join(", ", missingRequiredImages)}.",
+                scope,
+                deploymentName,
+                validation);
         }
 
         return await UpgradeResolvedDeploymentsAsync(
@@ -190,7 +213,7 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
             .ToList();
         if (targetDeployments.Count == 0)
         {
-            return KubernetesUpgradeResult.Failed("No matching Bold BI Kubernetes deployments were available for custom patch upgrade.", KubernetesUpgradeScope.Bulk, validation: validation);
+            return KubernetesUpgradeResult.Failed($"No matching {productContext.Current.DisplayName} Kubernetes deployments were available for custom patch upgrade.", KubernetesUpgradeScope.Bulk, validation: validation);
         }
 
         var missingRequiredImages = validation.DeploymentStatuses
@@ -231,6 +254,34 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
         var message = succeeded
             ? "Kubernetes deployment images were rolled back successfully."
             : "Kubernetes deployment image rollback failed for one or more deployments.";
+
+        return new KubernetesRollbackResult(succeeded, false, message, context.Namespace, results);
+    }
+
+    public async Task<KubernetesRollbackResult> ReconcileRollbackAsync(
+        KubernetesUpgradeResult upgradeResult,
+        CancellationToken cancellationToken = default,
+        Action<KubernetesDeploymentProgress>? progress = null)
+    {
+        if (upgradeResult.PreviousImages.Count == 0)
+        {
+            return KubernetesRollbackResult.CreateSkipped("Kubernetes rollback reconciliation skipped because no previous deployment image mapping is available.");
+        }
+
+        var context = ResolveContext();
+        if (!context.Succeeded)
+        {
+            return new KubernetesRollbackResult(false, false, context.Message, context.Namespace, Array.Empty<KubernetesDeploymentRollbackResult>());
+        }
+
+        using var client = CreateKubernetesHttpClient(context);
+        var results = await Task.WhenAll(upgradeResult.PreviousImages.Select(snapshot =>
+            ReconcileRollbackDeploymentAsync(client, context.Namespace!, snapshot, cancellationToken, progress)));
+
+        var succeeded = results.Length == upgradeResult.PreviousImages.Count && results.All(result => result.Succeeded);
+        var message = succeeded
+            ? "Kubernetes deployment rollback rollouts were reconciled successfully."
+            : "Kubernetes deployment rollback reconciliation detected one or more unhealthy deployments.";
 
         return new KubernetesRollbackResult(succeeded, false, message, context.Namespace, results);
     }
@@ -753,11 +804,16 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
             var message = rollout.Succeeded
                 ? "Deployment image restored and rollout became healthy."
                 : $"Deployment image was restored, but rollout did not become healthy: {rollout.Message}";
+            var timedOut = IsRolloutTimeout(rollout.Message);
             progress?.Invoke(new KubernetesDeploymentProgress(
                 KubernetesDeploymentProgressKind.Rollback,
                 snapshot.DeploymentName,
-                rollout.Succeeded ? KubernetesDeploymentProgressStatus.RollbackCompleted : KubernetesDeploymentProgressStatus.RollbackFailed,
-                message));
+                rollout.Succeeded
+                    ? KubernetesDeploymentProgressStatus.RollbackCompleted
+                    : timedOut
+                        ? KubernetesDeploymentProgressStatus.RollbackWaitingForRollout
+                        : KubernetesDeploymentProgressStatus.RollbackFailed,
+                timedOut ? $"{message} Rechecking actual Kubernetes rollout state." : message));
 
             if (rollout.Succeeded)
             {
@@ -804,6 +860,74 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
                 snapshot.Image,
                 message);
         }
+    }
+
+    private async Task<KubernetesDeploymentRollbackResult> ReconcileRollbackDeploymentAsync(
+        HttpClient client,
+        string kubernetesNamespace,
+        KubernetesDeploymentImageSnapshot snapshot,
+        CancellationToken cancellationToken,
+        Action<KubernetesDeploymentProgress>? progress)
+    {
+        try
+        {
+            progress?.Invoke(new KubernetesDeploymentProgress(
+                KubernetesDeploymentProgressKind.Rollback,
+                snapshot.DeploymentName,
+                KubernetesDeploymentProgressStatus.RollbackWaitingForRollout,
+                "Rechecking reverted deployment rollout status."));
+
+            await GetDeploymentAsync(client, kubernetesNamespace, snapshot.DeploymentName, cancellationToken);
+            var rollout = await WaitForDeploymentRolloutAsync(
+                client,
+                kubernetesNamespace,
+                snapshot.DeploymentName,
+                snapshot.ContainerName,
+                snapshot.Image,
+                cancellationToken);
+
+            var message = rollout.Succeeded
+                ? "Deployment image restore was verified and rollout is healthy."
+                : $"Deployment image restore was rechecked, but rollout is not healthy: {rollout.Message}";
+            progress?.Invoke(new KubernetesDeploymentProgress(
+                KubernetesDeploymentProgressKind.Rollback,
+                snapshot.DeploymentName,
+                rollout.Succeeded ? KubernetesDeploymentProgressStatus.RollbackCompleted : KubernetesDeploymentProgressStatus.RollbackFailed,
+                message));
+
+            return new KubernetesDeploymentRollbackResult(
+                rollout.Succeeded,
+                snapshot.DeploymentName,
+                snapshot.ContainerName,
+                snapshot.Image,
+                message);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Kubernetes rollback reconciliation failed for deployment {Deployment}.", snapshot.DeploymentName);
+            var message = $"Deployment rollback reconciliation failed: {exception.Message}";
+            progress?.Invoke(new KubernetesDeploymentProgress(
+                KubernetesDeploymentProgressKind.Rollback,
+                snapshot.DeploymentName,
+                KubernetesDeploymentProgressStatus.RollbackFailed,
+                message));
+            return new KubernetesDeploymentRollbackResult(
+                false,
+                snapshot.DeploymentName,
+                snapshot.ContainerName,
+                snapshot.Image,
+                message);
+        }
+    }
+
+    private static bool IsRolloutTimeout(string? message)
+    {
+        return !string.IsNullOrWhiteSpace(message) &&
+               message.Contains("did not become healthy within", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<KubernetesDeploymentUpgradeResult> ReconcileDeploymentRolloutAsync(
@@ -957,6 +1081,13 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
         var handler = new HttpClientHandler();
         if (options.SkipTlsVerify)
         {
+            if (!CanSkipTlsVerify())
+            {
+                logger.LogError("Kubernetes TLS verification bypass was blocked because SkipTlsVerify is enabled without an explicit local development override.");
+                throw new InvalidOperationException("Kubernetes TLS verification cannot be disabled unless an explicit local development override is enabled. Configure the service account certificate authority file instead.");
+            }
+
+            logger.LogWarning("Kubernetes TLS verification is disabled by explicit local development configuration.");
             handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
         }
         else if (File.Exists(options.CertificateAuthorityPath))
@@ -989,6 +1120,20 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", context.Token);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
         return client;
+    }
+
+    private bool CanSkipTlsVerify()
+    {
+        return options.AllowSkipTlsVerifyForLocalDevelopment &&
+            IsLocalDevelopmentEnvironment(hostEnvironment.EnvironmentName);
+    }
+
+    private static bool IsLocalDevelopmentEnvironment(string? environmentName)
+    {
+        return string.Equals(environmentName, "Development", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "Dev", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "Local", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(environmentName, "LocalDevelopment", StringComparison.OrdinalIgnoreCase);
     }
 
     private KubernetesNamespaceValidationResult BuildValidationResult(string kubernetesNamespace, IReadOnlyList<KubernetesDeploymentResource> deployments)
@@ -1082,11 +1227,12 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
             .ToList();
 
         var succeeded = required.Count > 0 && missingRequired.Count == 0;
+        var productName = productContext.Current.DisplayName;
         var message = succeeded
-            ? $"Namespace '{kubernetesNamespace}' contains all required Bold BI deployments. Optional missing deployment count: {missingOptional.Count}."
+            ? $"Namespace '{kubernetesNamespace}' contains all required {productName} deployments. Optional missing deployment count: {missingOptional.Count}."
             : missingRequired.Count > 0
-                ? $"Namespace '{kubernetesNamespace}' is missing required Bold BI deployment(s): {string.Join(", ", missingRequired)}."
-                : $"Namespace '{kubernetesNamespace}' does not contain the required Bold BI deployment list.";
+                ? $"Namespace '{kubernetesNamespace}' is missing required {productName} deployment(s): {string.Join(", ", missingRequired)}."
+                : $"Namespace '{kubernetesNamespace}' does not contain the required {productName} deployment list.";
 
         return new KubernetesNamespaceValidationResult(
             succeeded,
@@ -1214,7 +1360,7 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
     {
         var configured = options.ExpectedDeployments.Count > 0
             ? options.ExpectedDeployments
-            : DefaultExpectedDeployments;
+            : productContext.Current.ExpectedDeployments;
 
         return configured
             .Where(deployment => !string.IsNullOrWhiteSpace(deployment))
@@ -1227,7 +1373,7 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
     {
         var configured = options.OptionalDeployments.Count > 0
             ? options.OptionalDeployments
-            : DefaultOptionalDeployments;
+            : productContext.Current.OptionalDeployments;
 
         return configured
             .Where(deployment => !string.IsNullOrWhiteSpace(deployment))
@@ -1273,16 +1419,17 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
             .ToList();
     }
 
-    private static IReadOnlyList<IReadOnlyList<KubernetesDeploymentUpgradeWorkItem>> ResolveDeploymentGroups(
+    private IReadOnlyList<IReadOnlyList<KubernetesDeploymentUpgradeWorkItem>> ResolveDeploymentGroups(
         IReadOnlyList<KubernetesDeploymentUpgradeWorkItem> workItems)
     {
         var byName = workItems.ToDictionary(item => item.DeploymentName, StringComparer.OrdinalIgnoreCase);
         var grouped = new List<IReadOnlyList<KubernetesDeploymentUpgradeWorkItem>>();
         var assigned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        AddGroup(["id-web-deployment", "id-api-deployment", "id-ums-deployment"]);
-        AddGroup(["bi-web-deployment", "bi-api-deployment", "bi-jobs-deployment"]);
-        AddGroup(["bi-dataservice-deployment", "bold-ai-deployment", "bold-etl-deployment"]);
+        foreach (var deploymentGroup in productContext.Current.RolloutGroups)
+        {
+            AddGroup(deploymentGroup);
+        }
 
         var remaining = workItems
             .Where(item => !assigned.Contains(item.DeploymentName))
@@ -1345,10 +1492,34 @@ public sealed class KubernetesUpgradeService : IKubernetesUpgradeService
 
     private string BuildVersionApiUri(string selectedVersion, params string[] segments)
     {
-        var baseUri = upgradeCenterOptions.ReleaseVersionsApiUrl.TrimEnd('/');
+        var product = productContext.Current;
+        var baseUri = ResolveReleaseVersionsApiUrl(product).TrimEnd('/');
         var escapedVersion = Uri.EscapeDataString(selectedVersion.Trim());
         var suffix = string.Join("/", segments.Select(segment => Uri.EscapeDataString(segment.Trim('/'))));
         return $"{baseUri}/{escapedVersion}/{suffix}";
+    }
+
+    private string ResolveReleaseVersionsApiUrl(UpgradeProductDefinition product)
+    {
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(upgradeCenterOptions.BiReleaseVersionsApiUrl))
+        {
+            return upgradeCenterOptions.BiReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(upgradeCenterOptions.ReleaseVersionsApiUrl))
+        {
+            return upgradeCenterOptions.ReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldReports &&
+            !string.IsNullOrWhiteSpace(upgradeCenterOptions.ReportsReleaseVersionsApiUrl))
+        {
+            return upgradeCenterOptions.ReportsReleaseVersionsApiUrl;
+        }
+
+        return product.ReleaseVersionsApiUrl;
     }
 
     private static string? ResolveInClusterApiServer()

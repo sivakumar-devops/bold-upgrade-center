@@ -1,0 +1,181 @@
+.standalone-login-page {
+    font-family: "RobotoRegular", var(--sans);
+}
+
+.standalone-login-wrap {
+    display: grid;
+    place-items: center;
+    min-height: 100vh;
+    min-height: 100svh;
+    padding: 32px 20px;
+}
+
+/* Match the IDP account panel without importing its SSO-dependent layout. */
+.standalone-login-panel {
+    width: 100%;
+    max-width: 492px;
+    min-width: 0;
+    padding: 72px;
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    background: var(--card);
+    text-align: center;
+}
+
+.standalone-login-brand {
+    margin-bottom: 28px;
+}
+
+.standalone-login-brand img {
+    display: block;
+    width: auto;
+    max-width: 200px;
+    height: 48px;
+    margin: 0 auto;
+}
+
+.standalone-login-panel h1 {
+    margin-bottom: 28px;
+    font-family: inherit;
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.standalone-login-form {
+    text-align: left;
+}
+
+.standalone-login-field {
+    margin-bottom: 24px;
+}
+
+.standalone-login-field label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--ink-700);
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.standalone-login-field input {
+    width: 100%;
+    min-width: 0;
+    height: 40px;
+    padding: 9px 12px;
+    border: 1px solid #b3b3b3;
+    border-radius: 4px;
+    background: var(--card);
+    color: var(--ink-900);
+    font: inherit;
+    font-size: 14px;
+    outline: none;
+}
+
+.standalone-login-field input:focus {
+    border-color: var(--blue-600);
+    box-shadow: 0 0 0 1px var(--blue-600);
+}
+
+.standalone-login-field input.input-validation-error {
+    border-color: var(--red-600);
+}
+
+.standalone-password-field {
+    position: relative;
+}
+
+.standalone-password-field input {
+    padding-right: 44px;
+}
+
+.standalone-password-toggle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--ink-600);
+}
+
+.standalone-password-toggle[hidden],
+.standalone-password-toggle[aria-pressed="false"] .password-slash,
+.standalone-login-form .standalone-auth-error.field-validation-valid,
+.standalone-login-form .standalone-auth-error.validation-summary-valid {
+    display: none;
+}
+
+.standalone-password-toggle:hover {
+    color: var(--ink-900);
+}
+
+.standalone-password-toggle:focus-visible,
+.standalone-login-submit:focus-visible {
+    outline: 2px solid var(--blue-600);
+    outline-offset: 3px;
+}
+
+.standalone-login-submit {
+    width: 100%;
+    min-height: 40px;
+    padding: 9px 16px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: var(--blue-600);
+    color: #fff;
+    font-family: inherit;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 22px;
+}
+
+.standalone-login-submit:hover {
+    background: var(--blue-500);
+}
+
+.standalone-login-form .standalone-auth-error {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.standalone-login-form .validation-summary-errors {
+    margin: 0 0 20px;
+    padding: 10px 12px;
+    border: 1px solid #ffc5c1;
+    border-radius: 4px;
+    background: var(--red-100);
+}
+
+.standalone-login-form .validation-summary-errors ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.standalone-login-beta {
+    margin-top: 24px;
+}
+
+@media (max-width: 540px) {
+    .standalone-login-wrap {
+        padding: 24px 16px;
+    }
+
+    .standalone-login-panel {
+        padding: 40px 24px;
+    }
+}
+
+@media (max-height: 600px) {
+    .standalone-login-wrap {
+        align-items: start;
+    }
+}

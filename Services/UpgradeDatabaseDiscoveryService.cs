@@ -3,7 +3,7 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeDatabaseDiscoveryService
 {
@@ -18,7 +18,9 @@ public sealed record DiscoveredDatabaseConnection(
     string ConnectionString,
     string DatabaseName,
     string? TenantId,
-    string Identity);
+    string Identity,
+    string? SchemaName = null,
+    string? TablePrefix = null);
 
 public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryService
 {
@@ -27,17 +29,20 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
     private readonly IUpgradeCenterConfigurationProvider configurationProvider;
     private readonly IIdpPrivateKeyProvider privateKeyProvider;
     private readonly IBoldConnectionStringDecryptor decryptor;
+    private readonly IUpgradeProductContext productContext;
     private readonly ILogger<UpgradeDatabaseDiscoveryService> logger;
 
     public UpgradeDatabaseDiscoveryService(
         IUpgradeCenterConfigurationProvider configurationProvider,
         IIdpPrivateKeyProvider privateKeyProvider,
         IBoldConnectionStringDecryptor decryptor,
+        IUpgradeProductContext productContext,
         ILogger<UpgradeDatabaseDiscoveryService> logger)
     {
         this.configurationProvider = configurationProvider;
         this.privateKeyProvider = privateKeyProvider;
         this.decryptor = decryptor;
+        this.productContext = productContext;
         this.logger = logger;
     }
 
@@ -66,7 +71,9 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
         var runtimeConfiguration = await configurationProvider.GetConfigurationAsync(cancellationToken);
         var encryptedPrivateKey = await privateKeyProvider.GetEncryptedPrivateKeyAsync(cancellationToken);
         var tokenKeyMaterial = decryptor.GetTokenKeyMaterial(runtimeConfiguration.MachineKeyDecryptionKey!, encryptedPrivateKey);
-        var tenantRows = await ReadTenantDatabaseRowsAsync(masterDatabaseType, masterConnectionString, tenantInfoTableName, cancellationToken);
+        var selectedProduct = productContext.Current;
+        var tenantTypeId = selectedProduct.TenantTypeId;
+        var tenantRows = await ReadTenantDatabaseRowsAsync(masterDatabaseType, masterConnectionString, tenantInfoTableName, tenantTypeId, cancellationToken);
         foreach (var tenantRow in tenantRows)
         {
             if (string.IsNullOrWhiteSpace(tenantRow.EncryptedConnectionString))
@@ -85,12 +92,16 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
                 tenantDatabaseType,
                 tenantConnectionString,
                 tenantDatabaseName,
-                tenantRow.TenantId));
+                tenantRow.TenantId,
+                tenantRow.SchemaName,
+                tenantRow.Prefix));
         }
 
         var uniqueDatabases = GetUniqueDatabases(discoveredDatabases);
         logger.LogInformation(
-            "Database discovery completed. MasterDatabaseIncluded: {MasterDatabaseIncluded}. TenantRows: {TenantRows}. UniqueDatabases: {UniqueDatabases}. DuplicatesSkipped: {DuplicatesSkipped}.",
+            "Database discovery completed. Product: {Product}. TenantTypeId: {TenantTypeId}. MasterDatabaseIncluded: {MasterDatabaseIncluded}. TenantRows: {TenantRows}. UniqueDatabases: {UniqueDatabases}. DuplicatesSkipped: {DuplicatesSkipped}.",
+            selectedProduct.Key,
+            tenantTypeId,
             uniqueDatabases.Any(database => database.Role.Equals("master", StringComparison.OrdinalIgnoreCase)),
             tenantRows.Count,
             uniqueDatabases.Count,
@@ -112,7 +123,14 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
             decryptor.DecryptConnectionString(runtimeConfiguration.EncryptedMasterDatabaseConnectionString!, tokenKeyMaterial));
         var masterDatabaseName = GetDatabaseName(masterDatabaseType, masterConnectionString);
 
-        return CreateDiscoveredDatabase("master", masterDatabaseType, masterConnectionString, masterDatabaseName, null);
+        return CreateDiscoveredDatabase(
+            "master",
+            masterDatabaseType,
+            masterConnectionString,
+            masterDatabaseName,
+            null,
+            runtimeConfiguration.MasterDatabaseSchemaName,
+            runtimeConfiguration.MasterDatabaseTablePrefix);
     }
 
     private static void ValidateRuntimeConfiguration(UpgradeCenterRuntimeConfiguration runtimeConfiguration)
@@ -178,14 +196,14 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
         };
     }
 
-    private async Task<IReadOnlyList<TenantDatabaseRow>> ReadTenantDatabaseRowsAsync(DatabaseType databaseType, string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<TenantDatabaseRow>> ReadTenantDatabaseRowsAsync(DatabaseType databaseType, string connectionString, string tenantInfoTableName, int tenantTypeId, CancellationToken cancellationToken)
     {
         return databaseType switch
         {
-            DatabaseType.PostgreSQL => await ReadPostgreSqlTenantRowsAsync(connectionString, tenantInfoTableName, cancellationToken),
-            DatabaseType.MSSQL => await ReadSqlServerTenantRowsAsync(connectionString, tenantInfoTableName, cancellationToken),
-            DatabaseType.MySQL => await ReadMySqlTenantRowsAsync(connectionString, tenantInfoTableName, cancellationToken),
-            DatabaseType.Oracle => await ReadOracleTenantRowsAsync(connectionString, tenantInfoTableName, cancellationToken),
+            DatabaseType.PostgreSQL => await ReadPostgreSqlTenantRowsAsync(connectionString, tenantInfoTableName, tenantTypeId, cancellationToken),
+            DatabaseType.MSSQL => await ReadSqlServerTenantRowsAsync(connectionString, tenantInfoTableName, tenantTypeId, cancellationToken),
+            DatabaseType.MySQL => await ReadMySqlTenantRowsAsync(connectionString, tenantInfoTableName, tenantTypeId, cancellationToken),
+            DatabaseType.Oracle => await ReadOracleTenantRowsAsync(connectionString, tenantInfoTableName, tenantTypeId, cancellationToken),
             _ => Array.Empty<TenantDatabaseRow>()
         };
     }
@@ -226,76 +244,82 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
         return await command.ExecuteScalarAsync(cancellationToken) as string;
     }
 
-    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadPostgreSqlTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
+    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadPostgreSqlTenantRowsAsync(string connectionString, string tenantInfoTableName, int tenantTypeId, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuotePostgreSqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND isactive = 1;";
+        var query = $"SELECT id, connectionstring, databasetype, schemaname, prefix FROM {QuotePostgreSqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND isactive = 1 AND isdeleted = 0 AND tenanttypeid = @tenantTypeId;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new NpgsqlCommand(query, connection);
+        command.Parameters.AddWithValue("tenantTypeId", tenantTypeId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2)));
+            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2), reader.GetValue(3), reader.GetValue(4)));
         }
 
         return rows;
     }
 
-    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadSqlServerTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
+    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadSqlServerTenantRowsAsync(string connectionString, string tenantInfoTableName, int tenantTypeId, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteSqlServerIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1;";
+        var query = $"SELECT id, connectionstring, databasetype, SchemaName, Prefix FROM {QuoteSqlServerIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1 AND IsDeleted = 0 AND TenantTypeId = @tenantTypeId;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new SqlCommand(query, connection);
+        command.Parameters.AddWithValue("@tenantTypeId", tenantTypeId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2)));
+            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2), reader.GetValue(3), reader.GetValue(4)));
         }
 
         return rows;
     }
 
-    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadMySqlTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
+    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadMySqlTenantRowsAsync(string connectionString, string tenantInfoTableName, int tenantTypeId, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteMySqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1;";
+        var query = $"SELECT id, connectionstring, databasetype, SchemaName, Prefix FROM {QuoteMySqlIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1 AND IsDeleted = 0 AND TenantTypeId = @tenantTypeId;";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new MySqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new MySqlCommand(query, connection);
+        command.Parameters.AddWithValue("@tenantTypeId", tenantTypeId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2)));
+            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2), reader.GetValue(3), reader.GetValue(4)));
         }
 
         return rows;
     }
 
-    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadOracleTenantRowsAsync(string connectionString, string tenantInfoTableName, CancellationToken cancellationToken)
+    private static async Task<IReadOnlyList<TenantDatabaseRow>> ReadOracleTenantRowsAsync(string connectionString, string tenantInfoTableName, int tenantTypeId, CancellationToken cancellationToken)
     {
-        var query = $"SELECT id, connectionstring, databasetype FROM {QuoteOracleIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1";
+        var query = $"SELECT id, connectionstring, databasetype, SchemaName, Prefix FROM {QuoteOracleIdentifier(tenantInfoTableName)} WHERE connectionstring IS NOT NULL AND IsActive = 1 AND IsDeleted = 0 AND TenantTypeId = :tenantTypeId";
         var rows = new List<TenantDatabaseRow>();
         await using var connection = new OracleConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new OracleCommand(query, connection);
+        command.Parameters.Add(new OracleParameter("tenantTypeId", tenantTypeId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2)));
+            rows.Add(ReadTenantRow(reader.GetValue(0), reader.GetValue(1), reader.GetValue(2), reader.GetValue(3), reader.GetValue(4)));
         }
 
         return rows;
     }
 
-    private static TenantDatabaseRow ReadTenantRow(object tenantId, object encryptedConnectionString, object databaseType)
+    private static TenantDatabaseRow ReadTenantRow(object tenantId, object encryptedConnectionString, object databaseType, object schemaName, object prefix)
     {
         return new TenantDatabaseRow(
             tenantId == DBNull.Value ? null : tenantId.ToString(),
             encryptedConnectionString == DBNull.Value ? string.Empty : encryptedConnectionString.ToString() ?? string.Empty,
-            Convert.ToInt32(databaseType));
+            Convert.ToInt32(databaseType),
+            schemaName == DBNull.Value ? null : schemaName.ToString(),
+            prefix == DBNull.Value ? null : prefix.ToString());
     }
 
     private static DiscoveredDatabaseConnection CreateDiscoveredDatabase(
@@ -303,7 +327,9 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
         DatabaseType databaseType,
         string connectionString,
         string databaseName,
-        string? tenantId)
+        string? tenantId,
+        string? schemaName = null,
+        string? tablePrefix = null)
     {
         return new DiscoveredDatabaseConnection(
             role,
@@ -311,7 +337,9 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
             connectionString,
             databaseName,
             tenantId,
-            CreateDatabaseIdentity(databaseType, connectionString));
+            CreateDatabaseIdentity(databaseType, connectionString),
+            schemaName,
+            tablePrefix);
     }
 
     private IReadOnlyList<DiscoveredDatabaseConnection> GetUniqueDatabases(IReadOnlyList<DiscoveredDatabaseConnection> databases)
@@ -418,5 +446,5 @@ public sealed class UpgradeDatabaseDiscoveryService : IUpgradeDatabaseDiscoveryS
         return string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim().ToLowerInvariant();
     }
 
-    private sealed record TenantDatabaseRow(string? TenantId, string EncryptedConnectionString, int DatabaseType);
+    private sealed record TenantDatabaseRow(string? TenantId, string EncryptedConnectionString, int DatabaseType, string? SchemaName, string? Prefix);
 }

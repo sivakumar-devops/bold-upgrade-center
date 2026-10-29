@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public enum KubernetesUpgradeScope
 {
@@ -22,6 +22,8 @@ public sealed class KubernetesUpgradeOptions
 
     public bool SkipTlsVerify { get; set; }
 
+    public bool AllowSkipTlsVerifyForLocalDevelopment { get; set; }
+
     public int RolloutTimeoutSeconds { get; set; } = 300;
 
     public int RolloutPollSeconds { get; set; } = 5;
@@ -31,6 +33,8 @@ public sealed class KubernetesUpgradeOptions
     public List<string> OptionalDeployments { get; set; } = [];
 
     public List<string> AllowedImageRepositories { get; set; } = [];
+
+    public List<string> AllowedImageRegistryHosts { get; set; } = [];
 }
 
 public sealed record KubernetesUpgradeRequest(
@@ -132,6 +136,8 @@ public sealed record KubernetesUpgradeResult(
     IReadOnlyList<KubernetesDeploymentImageSnapshot> PreviousImages,
     KubernetesNamespaceValidationResult? NamespaceValidation)
 {
+    // Additive recovery context: existing Kubernetes payloads retain their original contract.
+    public EcsDeploymentPlan? Ecs { get; init; }
     public static KubernetesUpgradeResult CreateSkipped(string message)
     {
         return new KubernetesUpgradeResult(

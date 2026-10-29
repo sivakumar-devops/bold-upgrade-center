@@ -1,28 +1,28 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class ProductVersionProvider : IProductVersionProvider
 {
     public const string HttpClientName = "UpgradeCenterProductVersion";
 
     private const string UnknownVersion = "Unavailable";
-    private const string ProductVersionApiSource = "Bold BI Product Version API";
+    private const string ProductVersionApiSource = "Product Version API";
     private const string ConfigurationSource = "IDP configuration";
 
-    private readonly UpgradeCenterOptions options;
+    private readonly IUpgradeProductContext productContext;
     private readonly IUpgradeCenterConfigurationProvider configurationProvider;
     private readonly IHttpClientFactory httpClientFactory;
     private readonly ILogger<ProductVersionProvider> logger;
 
     public ProductVersionProvider(
-        IOptions<UpgradeCenterOptions> options,
+        IUpgradeProductContext productContext,
         IUpgradeCenterConfigurationProvider configurationProvider,
         IHttpClientFactory httpClientFactory,
         ILogger<ProductVersionProvider> logger)
     {
-        this.options = options.Value;
+        this.productContext = productContext;
         this.configurationProvider = configurationProvider;
         this.httpClientFactory = httpClientFactory;
         this.logger = logger;
@@ -30,31 +30,41 @@ public sealed class ProductVersionProvider : IProductVersionProvider
 
     public async Task<ProductVersionInfo> GetCurrentVersionAsync(CancellationToken cancellationToken = default)
     {
-        var productName = string.IsNullOrWhiteSpace(options.ProductName) ? "Bold BI" : options.ProductName;
+        var product = productContext.Current;
         var runtimeConfiguration = await configurationProvider.GetConfigurationAsync(cancellationToken);
-        var apiVersion = await TryGetProductVersionFromApiAsync(runtimeConfiguration, cancellationToken);
+        var apiVersion = await TryGetProductVersionFromApiAsync(product, runtimeConfiguration, cancellationToken);
         if (!string.IsNullOrWhiteSpace(apiVersion))
         {
-            return new ProductVersionInfo(productName, apiVersion, ProductVersionApiSource);
+            return new ProductVersionInfo(product.DisplayName, apiVersion, $"{product.DisplayName} {ProductVersionApiSource}");
         }
 
-        if (string.IsNullOrWhiteSpace(runtimeConfiguration.BoldBiVersion))
+        var configuredVersion = product.Product == UpgradeProduct.BoldReports
+            ? runtimeConfiguration.BoldReportsVersion
+            : runtimeConfiguration.BoldBiVersion;
+        var configurationSource = configurationProvider switch
         {
-            logger.LogWarning("Bold BI version was not available from the Product Version API or the IDP Configuration API.");
-            return new ProductVersionInfo(productName, UnknownVersion);
+            FileUpgradeCenterConfigurationProvider => "Mounted product configuration",
+            ObjectStorageUpgradeCenterConfigurationProvider => "Standalone object-storage/database configuration",
+            _ => ConfigurationSource
+        };
+        if (string.IsNullOrWhiteSpace(configuredVersion))
+        {
+            logger.LogWarning("{ProductName} version was not available from the Product Version API or {ConfigurationSource}.", product.DisplayName, configurationSource);
+            return new ProductVersionInfo(product.DisplayName, UnknownVersion);
         }
 
-        return new ProductVersionInfo(productName, runtimeConfiguration.BoldBiVersion.Trim(), ConfigurationSource);
+        return new ProductVersionInfo(product.DisplayName, configuredVersion.Trim(), configurationSource);
     }
 
     private async Task<string?> TryGetProductVersionFromApiAsync(
+        UpgradeProductDefinition product,
         UpgradeCenterRuntimeConfiguration runtimeConfiguration,
         CancellationToken cancellationToken)
     {
-        var endpoint = ResolveProductVersionEndpoint(runtimeConfiguration);
+        var endpoint = ResolveProductVersionEndpoint(product, runtimeConfiguration);
         if (string.IsNullOrWhiteSpace(endpoint))
         {
-            logger.LogWarning("Bold BI Product Version API endpoint could not be resolved. Falling back to configuration-based version retrieval.");
+            logger.LogWarning("{ProductName} Product Version API endpoint could not be resolved. Falling back to configuration-based version retrieval.", product.DisplayName);
             return null;
         }
 
@@ -65,7 +75,8 @@ public sealed class ProductVersionProvider : IProductVersionProvider
             if (!response.IsSuccessStatusCode)
             {
                 logger.LogWarning(
-                    "Bold BI Product Version API request failed. StatusCode: {StatusCode}. Endpoint: {Endpoint}. Falling back to configuration-based version retrieval.",
+                    "{ProductName} Product Version API request failed. StatusCode: {StatusCode}. Endpoint: {Endpoint}. Falling back to configuration-based version retrieval.",
+                    product.DisplayName,
                     (int)response.StatusCode,
                     endpoint);
                 return null;
@@ -75,14 +86,14 @@ public sealed class ProductVersionProvider : IProductVersionProvider
             using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
             if (!IsSuccessfulApiResponse(document.RootElement))
             {
-                logger.LogWarning("Bold BI Product Version API returned an unsuccessful response. Falling back to configuration-based version retrieval.");
+                logger.LogWarning("{ProductName} Product Version API returned an unsuccessful response. Falling back to configuration-based version retrieval.", product.DisplayName);
                 return null;
             }
 
             var version = GetStringProperty(document.RootElement, "Data")?.Trim();
             if (string.IsNullOrWhiteSpace(version) || !ProductVersionComparer.TryParse(version, out _))
             {
-                logger.LogWarning("Bold BI Product Version API returned an invalid product version. Falling back to configuration-based version retrieval.");
+                logger.LogWarning("{ProductName} Product Version API returned an invalid product version. Falling back to configuration-based version retrieval.", product.DisplayName);
                 return null;
             }
 
@@ -94,21 +105,26 @@ public sealed class ProductVersionProvider : IProductVersionProvider
         }
         catch (Exception exception)
         {
-            logger.LogWarning(exception, "Unable to retrieve Bold BI version from the Product Version API. Falling back to configuration-based version retrieval.");
+            logger.LogWarning(exception, "Unable to retrieve {ProductName} version from the Product Version API. Falling back to configuration-based version retrieval.", product.DisplayName);
             return null;
         }
     }
 
-    private static string? ResolveProductVersionEndpoint(UpgradeCenterRuntimeConfiguration runtimeConfiguration)
+    private static string? ResolveProductVersionEndpoint(
+        UpgradeProductDefinition product,
+        UpgradeCenterRuntimeConfiguration runtimeConfiguration)
     {
         if (!string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl))
         {
-            return CombineUrl(runtimeConfiguration.IdpBaseUrl, "bi/api/product-version");
+            return CombineUrl(runtimeConfiguration.IdpBaseUrl, product.ProductVersionPath);
         }
 
-        if (!string.IsNullOrWhiteSpace(runtimeConfiguration.BiBaseUrl))
+        var productBaseUrl = product.Product == UpgradeProduct.BoldReports
+            ? runtimeConfiguration.ReportsBaseUrl
+            : runtimeConfiguration.BiBaseUrl;
+        if (!string.IsNullOrWhiteSpace(productBaseUrl))
         {
-            return CombineUrl(runtimeConfiguration.BiBaseUrl, "api/product-version");
+            return CombineUrl(productBaseUrl, "api/product-version");
         }
 
         return null;

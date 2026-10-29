@@ -2,7 +2,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptImpactService
 {
@@ -39,17 +39,20 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
     private readonly HttpClient httpClient;
     private readonly IReleaseVersionProvider releaseVersionProvider;
     private readonly UpgradeCenterOptions options;
+    private readonly IUpgradeProductContext productContext;
     private readonly ILogger<UpgradeDatabaseScriptImpactService> logger;
 
     public UpgradeDatabaseScriptImpactService(
         HttpClient httpClient,
         IReleaseVersionProvider releaseVersionProvider,
         IOptions<UpgradeCenterOptions> options,
+        IUpgradeProductContext productContext,
         ILogger<UpgradeDatabaseScriptImpactService> logger)
     {
         this.httpClient = httpClient;
         this.releaseVersionProvider = releaseVersionProvider;
         this.options = options.Value;
+        this.productContext = productContext;
         this.logger = logger;
     }
 
@@ -85,6 +88,7 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
                 Array.Empty<string>(),
                 Array.Empty<string>(),
                 new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
+                Array.Empty<UpgradeDatabaseTableImpact>(),
                 null);
         }
 
@@ -132,6 +136,7 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         var createdTables = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         var droppedTables = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         var tableVersionMap = new Dictionary<string, SortedSet<string>>(StringComparer.OrdinalIgnoreCase);
+        var tableImpacts = new Dictionary<string, UpgradeDatabaseTableImpactBuilder>(StringComparer.OrdinalIgnoreCase);
         var scriptCache = new Dictionary<string, UpgradeDatabaseScriptResponse?>(StringComparer.OrdinalIgnoreCase);
         string? scriptPreview = null;
 
@@ -154,6 +159,62 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
                         targetVersion,
                         $"Database upgrade script metadata could not be retrieved for version {FormatVersion(version)} and database type {databaseType}.",
                         applicableVersions);
+                }
+
+                if (scriptInfo.Components.Count > 0)
+                {
+                    foreach (var component in scriptInfo.Components)
+                    {
+                        if (!component.HasSchemaChanges || component.Changes.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        foreach (var change in component.Changes)
+                        {
+                            var table = ResolveComponentTableName(
+                                change.LogicalTableName,
+                                component.Component,
+                                component.DefaultTablePrefix,
+                                change.SchemaName,
+                                change.SourcePrefix,
+                                change.BaseTableName,
+                                productContext.Current.Product);
+                            if (string.IsNullOrWhiteSpace(table.LogicalTableName) || IsSqlKeyword(table.LogicalTableName))
+                            {
+                                continue;
+                            }
+
+                            var changeType = NormalizeChangeType(change.ChangeType);
+                            AddAffectedTable(table.LogicalTableName, version, affectedTables, tableVersionMap);
+                            AddTableImpact(
+                                tableImpacts,
+                                component.Component,
+                                changeType,
+                                table.LogicalTableName,
+                                component.DefaultTablePrefix,
+                                version,
+                                table.SchemaName,
+                                table.SourcePrefix,
+                                table.BaseTableName);
+
+                            if (changeType.Equals("created", StringComparison.OrdinalIgnoreCase))
+                            {
+                                createdTables.Add(table.LogicalTableName);
+                            }
+                            else if (changeType.Equals("dropped", StringComparison.OrdinalIgnoreCase))
+                            {
+                                droppedTables.Add(table.LogicalTableName);
+                            }
+                        }
+                    }
+
+                    if (scriptPreview is null && !string.IsNullOrWhiteSpace(scriptInfo.ScriptQuery))
+                    {
+                        scriptPreview = CreateScriptPreview(scriptInfo.ScriptQuery);
+                    }
+
+                    continue;
                 }
 
                 if (!scriptInfo.HasScriptChanges)
@@ -194,15 +255,8 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
 
                 foreach (var table in scriptTables)
                 {
-                    affectedTables.Add(table);
-                    if (!tableVersionMap.TryGetValue(table, out var versions))
-                    {
-                        versions = new SortedSet<string>(Comparer<string>.Create((left, right) =>
-                            ProductVersionComparer.Compare(ProductVersionComparer.Parse(left), ProductVersionComparer.Parse(right))));
-                        tableVersionMap[table] = versions;
-                    }
-
-                    versions.Add(version);
+                    AddAffectedTable(table, version, affectedTables, tableVersionMap);
+                    AddTableImpact(tableImpacts, "Unknown", "altered", table, string.Empty, version, null, null, null);
                 }
             }
         }
@@ -231,6 +285,11 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             createdTables.ToList(),
             droppedTables.ToList(),
             affectedTableVersions,
+            tableImpacts.Values
+                .Select(impact => impact.Build())
+                .OrderBy(impact => impact.Component, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(impact => impact.LogicalTableName, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
             scriptPreview);
     }
 
@@ -260,12 +319,36 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
 
     private string BuildVersionApiUri(string selectedVersion, params string[] segments)
     {
-        var baseUri = options.ReleaseVersionsApiUrl.TrimEnd('/');
+        var product = productContext.Current;
+        var baseUri = ResolveReleaseVersionsApiUrl(product).TrimEnd('/');
         var encodedSegments = new[] { NormalizeVersion(selectedVersion) }
             .Concat(segments)
             .Select(Uri.EscapeDataString);
 
         return $"{baseUri}/{string.Join("/", encodedSegments)}";
+    }
+
+    private string ResolveReleaseVersionsApiUrl(UpgradeProductDefinition product)
+    {
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(options.BiReleaseVersionsApiUrl))
+        {
+            return options.BiReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldBi &&
+            !string.IsNullOrWhiteSpace(options.ReleaseVersionsApiUrl))
+        {
+            return options.ReleaseVersionsApiUrl;
+        }
+
+        if (product.Product == UpgradeProduct.BoldReports &&
+            !string.IsNullOrWhiteSpace(options.ReportsReleaseVersionsApiUrl))
+        {
+            return options.ReportsReleaseVersionsApiUrl;
+        }
+
+        return product.ReleaseVersionsApiUrl;
     }
 
     private static bool TryGetDatabaseApiSegment(DatabaseType databaseType, out string apiSegment)
@@ -280,6 +363,64 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         };
 
         return !string.IsNullOrWhiteSpace(apiSegment);
+    }
+
+    private static void AddAffectedTable(
+        string table,
+        string version,
+        ISet<string> affectedTables,
+        IDictionary<string, SortedSet<string>> tableVersionMap)
+    {
+        affectedTables.Add(table);
+        if (!tableVersionMap.TryGetValue(table, out var versions))
+        {
+            versions = new SortedSet<string>(Comparer<string>.Create((left, right) =>
+                ProductVersionComparer.Compare(ProductVersionComparer.Parse(left), ProductVersionComparer.Parse(right))));
+            tableVersionMap[table] = versions;
+        }
+
+        versions.Add(version);
+    }
+
+    private static void AddTableImpact(
+        IDictionary<string, UpgradeDatabaseTableImpactBuilder> tableImpacts,
+        string component,
+        string changeType,
+        string logicalTableName,
+        string defaultTablePrefix,
+        string version,
+        string? schemaName,
+        string? sourcePrefix,
+        string? baseTableName)
+    {
+        var normalizedComponent = string.IsNullOrWhiteSpace(component) ? "Unknown" : component.Trim();
+        var normalizedChangeType = NormalizeChangeType(changeType);
+        var key = $"{normalizedComponent}|{normalizedChangeType}|{schemaName}|{logicalTableName}";
+        if (!tableImpacts.TryGetValue(key, out var builder))
+        {
+            builder = new UpgradeDatabaseTableImpactBuilder(
+                normalizedComponent,
+                normalizedChangeType,
+                logicalTableName,
+                defaultTablePrefix,
+                schemaName,
+                sourcePrefix,
+                baseTableName);
+            tableImpacts[key] = builder;
+        }
+
+        builder.Versions.Add(version);
+    }
+
+    private static string NormalizeChangeType(string? value)
+    {
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            "created" or "create" => "created",
+            "dropped" or "drop" => "dropped",
+            "renamed" or "rename" => "renamed",
+            _ => "altered"
+        };
     }
 
     private static SchemaImpact ExtractSchemaImpact(string script)
@@ -341,6 +482,91 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         return tableName.Trim('"', '`', '[', ']');
     }
 
+    private static ResolvedScriptTableName ResolveComponentTableName(
+        string logicalTableName,
+        string component,
+        string defaultTablePrefix,
+        string? schemaName,
+        string? sourcePrefix,
+        string? baseTableName,
+        UpgradeProduct product)
+    {
+        var normalizedTableName = NormalizeTableIdentifier(logicalTableName);
+        var normalizedSchema = NormalizeSchemaName(schemaName);
+        var normalizedSourcePrefix = sourcePrefix?.Trim() ?? string.Empty;
+        var normalizedBaseTableName = string.IsNullOrWhiteSpace(baseTableName)
+            ? RemoveKnownPrefix(normalizedTableName, component, out normalizedSourcePrefix)
+            : baseTableName.Trim();
+        var targetPrefix = string.IsNullOrWhiteSpace(defaultTablePrefix)
+            ? GetDefaultTablePrefix(component, product)
+            : defaultTablePrefix.Trim();
+        var resolvedTableName = !string.IsNullOrWhiteSpace(normalizedBaseTableName) &&
+                                !string.IsNullOrWhiteSpace(targetPrefix) &&
+                                !string.IsNullOrWhiteSpace(normalizedSourcePrefix)
+            ? targetPrefix + normalizedBaseTableName
+            : normalizedTableName;
+
+        return new ResolvedScriptTableName(
+            normalizedSchema,
+            normalizedSourcePrefix,
+            normalizedBaseTableName,
+            resolvedTableName);
+    }
+
+    private static string? NormalizeSchemaName(string? schemaName)
+    {
+        var normalized = schemaName?.Trim().Trim('"', '`', '[', ']', '{', '}');
+        return string.IsNullOrWhiteSpace(normalized) ||
+               normalized.Equals("database_name", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : normalized;
+    }
+
+    private static string RemoveKnownPrefix(string tableName, string component, out string sourcePrefix)
+    {
+        foreach (var knownPrefix in GetKnownTablePrefixes(component))
+        {
+            if (tableName.StartsWith(knownPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                sourcePrefix = knownPrefix;
+                return tableName[knownPrefix.Length..];
+            }
+        }
+
+        sourcePrefix = string.Empty;
+        return tableName;
+    }
+
+    private static string GetDefaultTablePrefix(string component, UpgradeProduct product)
+    {
+        if (component.Equals("IDP", StringComparison.OrdinalIgnoreCase))
+        {
+            return "BOLDTC_";
+        }
+
+        if (component.Equals("Server", StringComparison.OrdinalIgnoreCase))
+        {
+            return product == UpgradeProduct.BoldReports ? "BOLDRS_" : "BOLDBI_";
+        }
+
+        return string.Empty;
+    }
+
+    private static IReadOnlyList<string> GetKnownTablePrefixes(string component)
+    {
+        if (component.Equals("IDP", StringComparison.OrdinalIgnoreCase))
+        {
+            return ["BOLDTC_"];
+        }
+
+        if (component.Equals("Server", StringComparison.OrdinalIgnoreCase))
+        {
+            return ["BOLDBI_", "SyncDS_", "BOLDRS_", "SyncRS_"];
+        }
+
+        return ["BOLDTC_", "BOLDBI_", "SyncDS_", "BOLDRS_", "SyncRS_"];
+    }
+
     private static bool IsSqlKeyword(string value)
     {
         return value.Equals("SET", StringComparison.OrdinalIgnoreCase) ||
@@ -395,6 +621,7 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
             Array.Empty<string>(),
             Array.Empty<string>(),
             new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase),
+            Array.Empty<UpgradeDatabaseTableImpact>(),
             null);
     }
 
@@ -402,4 +629,61 @@ public sealed class UpgradeDatabaseScriptImpactService : IUpgradeDatabaseScriptI
         IReadOnlyList<string> AffectedTables,
         IReadOnlyList<string> CreatedTables,
         IReadOnlyList<string> DroppedTables);
+
+    private sealed class UpgradeDatabaseTableImpactBuilder
+    {
+        public UpgradeDatabaseTableImpactBuilder(
+            string component,
+            string changeType,
+            string logicalTableName,
+            string defaultTablePrefix,
+            string? schemaName,
+            string? sourcePrefix,
+            string? baseTableName)
+        {
+            Component = component;
+            ChangeType = changeType;
+            LogicalTableName = logicalTableName;
+            DefaultTablePrefix = defaultTablePrefix;
+            SchemaName = schemaName;
+            SourcePrefix = sourcePrefix;
+            BaseTableName = baseTableName;
+        }
+
+        public string Component { get; }
+
+        public string ChangeType { get; }
+
+        public string LogicalTableName { get; }
+
+        public string DefaultTablePrefix { get; }
+
+        public string? SchemaName { get; }
+
+        public string? SourcePrefix { get; }
+
+        public string? BaseTableName { get; }
+
+        public SortedSet<string> Versions { get; } = new(Comparer<string>.Create((left, right) =>
+            ProductVersionComparer.Compare(ProductVersionComparer.Parse(left), ProductVersionComparer.Parse(right))));
+
+        public UpgradeDatabaseTableImpact Build()
+        {
+            return new UpgradeDatabaseTableImpact(
+                Component,
+                ChangeType,
+                LogicalTableName,
+                DefaultTablePrefix,
+                Versions.ToList(),
+                SchemaName,
+                SourcePrefix,
+                BaseTableName);
+        }
+    }
+
+    private sealed record ResolvedScriptTableName(
+        string? SchemaName,
+        string SourcePrefix,
+        string BaseTableName,
+        string LogicalTableName);
 }

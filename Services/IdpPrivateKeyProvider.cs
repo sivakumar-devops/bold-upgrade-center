@@ -1,7 +1,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IIdpPrivateKeyProvider
 {

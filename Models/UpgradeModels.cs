@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace BoldBI.UpgradeCenter.Models
+namespace Bold.UpgradeCenter.Models
 {
     // Enumerations
 
@@ -25,6 +25,16 @@ namespace BoldBI.UpgradeCenter.Models
         Failed,
         Cancelled,
         Skipped
+    }
+
+    public enum StageDetailStatus
+    {
+        Pending,
+        Running,
+        Completed,
+        Skipped,
+        Warning,
+        Failed
     }
 
     public enum ReleaseType
@@ -121,6 +131,7 @@ namespace BoldBI.UpgradeCenter.Models
         public string Name { get; set; } = string.Empty;
         public string? Meta { get; set; }
         public StageStatus Status { get; set; } = StageStatus.Pending;
+        public int ProgressPercent { get; set; }
         public TimeSpan? Duration { get; set; }
         public List<StageCheckResult> Checks { get; set; } = new();
         public List<string> LogLines { get; set; } = new();
@@ -133,7 +144,19 @@ namespace BoldBI.UpgradeCenter.Models
     public class StageCheckResult
     {
         public string Description { get; set; } = string.Empty;
-        public bool Passed { get; set; }
+        public StageDetailStatus Status { get; set; } = StageDetailStatus.Pending;
+        public bool Passed => Status is StageDetailStatus.Completed or StageDetailStatus.Skipped;
+    }
+
+    public class OperationLogLine
+    {
+        public long Sequence { get; set; }
+        public string Timestamp { get; set; } = string.Empty;
+        public string Level { get; set; } = "Info";
+        public string Stage { get; set; } = "Job";
+        public string Source { get; set; } = string.Empty;
+        public string Message { get; set; } = string.Empty;
+        public bool IsTruncated { get; set; }
     }
 
     /// <summary>
@@ -150,6 +173,8 @@ namespace BoldBI.UpgradeCenter.Models
         public string InitiatedBy { get; set; } = string.Empty;
         public ReleaseType ReleaseType { get; set; } = ReleaseType.Standard;
 
+        public string ProductName { get; set; } = "Bold BI";
+
         /// <summary>
         /// Ordered stages for this job (pre-upgrade -> upgrade -> post-upgrade,
         /// or revert deployment -> restore schema -> verify health for rollback).
@@ -161,6 +186,8 @@ namespace BoldBI.UpgradeCenter.Models
         /// stages and operation messages. Sensitive values must never be added.
         /// </summary>
         public List<string> CompleteLogLines { get; set; } = new();
+
+        public List<OperationLogLine> CompleteLogEntries { get; set; } = new();
 
         public long CompleteLogSequence { get; set; }
 
@@ -203,6 +230,7 @@ namespace BoldBI.UpgradeCenter.Models
         public UpgradeJobStatus Status { get; set; }
         public DateTime CompletedAt { get; set; }
         public bool HasJobContext { get; set; }
+        public bool IsAutomaticRollback { get; set; }
     }
 
     // Installation / environment info

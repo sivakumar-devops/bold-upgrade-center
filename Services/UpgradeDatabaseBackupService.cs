@@ -6,7 +6,7 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
 {
@@ -18,6 +18,7 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
     private readonly IUpgradeDatabaseScriptImpactService scriptImpactService;
     private readonly IUpgradeOperationLogStore operationLogStore;
     private readonly DatabaseBackupOptions backupOptions;
+    private readonly IUpgradeProductContext productContext;
     private readonly ILogger<UpgradeDatabaseBackupService> logger;
 
     public UpgradeDatabaseBackupService(
@@ -25,12 +26,14 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         IUpgradeDatabaseScriptImpactService scriptImpactService,
         IUpgradeOperationLogStore operationLogStore,
         IOptions<DatabaseBackupOptions> backupOptions,
+        IUpgradeProductContext productContext,
         ILogger<UpgradeDatabaseBackupService> logger)
     {
         this.databaseDiscoveryService = databaseDiscoveryService;
         this.scriptImpactService = scriptImpactService;
         this.operationLogStore = operationLogStore;
         this.backupOptions = backupOptions.Value;
+        this.productContext = productContext;
         this.logger = logger;
     }
 
@@ -142,11 +145,19 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
 
                 try
                 {
+                    var resolvedImpact = ResolveDatabaseTableImpact(discoveredDatabase, scriptImpact);
+                    AppendOperationLog(
+                        jobId,
+                        "Schema Backup",
+                        "Info",
+                        "DatabaseBackup",
+                        $"Taking backup of database '{validation.DatabaseName}'.");
                     var backupPlan = await BuildDatabaseBackupPlanAsync(
+                        discoveredDatabase,
                         databaseType,
                         sourceConnectionString,
-                        allAffectedTables,
-                        scriptImpact.CreatedTables,
+                        resolvedImpact.AffectedTables,
+                        resolvedImpact.CreatedTables,
                         jobId,
                         cancellationToken);
                     if (backupPlan.TablesToBackup.Count == 0)
@@ -163,7 +174,8 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                                 string.Empty,
                                 null,
                                 discoveredDatabase.Identity,
-                                backupPlan.CreatedTablesToDrop));
+                                backupPlan.CreatedTablesToDrop,
+                                backupPlan.TablesToBackup.Select(table => table.LookupName).ToList()));
                         }
 
                         logger.LogInformation(
@@ -188,7 +200,7 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                         SourceConnectionString = sourceConnectionString,
                         TargetConnectionString = backupConnection.ConnectionString,
                         DatabaseType = databaseType,
-                        IncludeTables = backupPlan.TablesToBackup,
+                        IncludeTables = backupPlan.TablesToBackup.Select(table => table.LookupName).ToList(),
                         BatchSize = Math.Max(1, backupOptions.BatchSize),
                         DropAndRecreate = backupOptions.DropAndRecreate,
                         DisableFKDuringLoad = backupOptions.DisableForeignKeysDuringLoad
@@ -211,7 +223,8 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                         backupConnection.ConnectionString,
                         status,
                         discoveredDatabase.Identity,
-                        backupPlan.CreatedTablesToDrop));
+                        backupPlan.CreatedTablesToDrop,
+                        backupPlan.TablesToBackup.Select(table => table.LookupName).ToList()));
 
                     logger.LogInformation(
                         "Database backup completed for {OriginalDatabaseName}. Success: {Success}. BackupDatabase: {BackupDatabase}. Tables: {TablesSucceeded}/{TablesAttempted}. Rows: {RowsCopied}. Message: {Message}",
@@ -401,7 +414,9 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                     BackupConnectionString = backupMapping.BackupConnectionString,
                     TargetConnectionString = backupMapping.SourceConnectionString,
                     DatabaseType = databaseType,
-                    IncludeTables = resolvedBackupResult.AffectedTables,
+                    IncludeTables = backupMapping.BackupTableNames.Count > 0
+                        ? backupMapping.BackupTableNames
+                        : resolvedBackupResult.AffectedTables,
                     BatchSize = Math.Max(1, backupOptions.BatchSize),
                     DropAndRecreate = true,
                     DisableFKDuringLoad = backupOptions.DisableForeignKeysDuringLoad
@@ -541,11 +556,248 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         }
     }
 
+    private ResolvedDatabaseTableImpact ResolveDatabaseTableImpact(
+        DiscoveredDatabaseConnection discoveredDatabase,
+        UpgradeDatabaseScriptImpactResult scriptImpact)
+    {
+        if (scriptImpact.TableImpacts.Count == 0)
+        {
+            return new ResolvedDatabaseTableImpact(
+                scriptImpact.AffectedTables.Select(table => ResolvedPhysicalTable.Unknown(discoveredDatabase, table)).ToList(),
+                scriptImpact.CreatedTables.Select(table => ResolvedPhysicalTable.Unknown(discoveredDatabase, table)).ToList());
+        }
+
+        var affectedTables = new Dictionary<string, ResolvedPhysicalTable>(StringComparer.OrdinalIgnoreCase);
+        var createdTables = new Dictionary<string, ResolvedPhysicalTable>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var tableImpact in scriptImpact.TableImpacts)
+        {
+            var physicalTables = ResolvePhysicalTableNames(
+                discoveredDatabase,
+                tableImpact.Component,
+                tableImpact.LogicalTableName,
+                tableImpact.DefaultTablePrefix,
+                tableImpact.SchemaName,
+                tableImpact.SourcePrefix,
+                tableImpact.BaseTableName,
+                tableImpact.ChangeType,
+                productContext.Current.Product);
+
+            foreach (var physicalTable in physicalTables)
+            {
+                affectedTables.TryAdd(physicalTable.LookupName, physicalTable);
+
+                if (tableImpact.ChangeType.Equals("created", StringComparison.OrdinalIgnoreCase))
+                {
+                    createdTables.TryAdd(physicalTable.LookupName, physicalTable);
+                }
+            }
+        }
+
+        return new ResolvedDatabaseTableImpact(
+            affectedTables.Values.OrderBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase).ToList(),
+            createdTables.Values.OrderBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase).ToList());
+    }
+
+    private static IReadOnlyList<ResolvedPhysicalTable> ResolvePhysicalTableNames(
+        DiscoveredDatabaseConnection discoveredDatabase,
+        string component,
+        string logicalTableName,
+        string defaultTablePrefix,
+        string? schemaName,
+        string? sourcePrefix,
+        string? baseTableName,
+        string changeType,
+        UpgradeProduct product)
+    {
+        var tableName = NormalizePhysicalTableName(logicalTableName);
+        if (string.IsNullOrWhiteSpace(tableName))
+        {
+            return Array.Empty<ResolvedPhysicalTable>();
+        }
+
+        var fallbackPrefix = string.IsNullOrWhiteSpace(defaultTablePrefix)
+            ? GetDefaultTablePrefix(component, product)
+            : defaultTablePrefix.Trim();
+        var configuredPrefix = string.IsNullOrWhiteSpace(discoveredDatabase.TablePrefix)
+            ? fallbackPrefix
+            : discoveredDatabase.TablePrefix.Trim();
+        var resolvedBaseTableName = string.IsNullOrWhiteSpace(baseTableName)
+            ? RemoveKnownTablePrefix(tableName, component)
+            : baseTableName.Trim();
+
+        var candidateNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        AddTableNameCandidate(candidateNames, tableName);
+        if (!string.IsNullOrWhiteSpace(resolvedBaseTableName))
+        {
+            AddTableNameCandidate(candidateNames, ReplaceKnownTablePrefix(tableName, component, fallbackPrefix));
+            if (!string.IsNullOrWhiteSpace(sourcePrefix))
+            {
+                AddTableNameCandidate(candidateNames, sourcePrefix.Trim() + resolvedBaseTableName);
+            }
+
+            if (ShouldApplyConfiguredPrefix(component, configuredPrefix))
+            {
+                AddTableNameCandidate(candidateNames, configuredPrefix + resolvedBaseTableName);
+            }
+        }
+
+        var resolvedSchema = ResolveSchemaName(discoveredDatabase, schemaName);
+
+        return candidateNames
+            .Select(candidateName =>
+            {
+                var lookupName = FormatLookupTableName(discoveredDatabase.DatabaseType, resolvedSchema, candidateName);
+                var displayName = string.IsNullOrWhiteSpace(resolvedSchema)
+                    ? candidateName
+                    : $"{resolvedSchema}.{candidateName}";
+
+                return new ResolvedPhysicalTable(
+                    lookupName,
+                    displayName,
+                    component,
+                    changeType,
+                    resolvedSchema,
+                    configuredPrefix,
+                    sourcePrefix ?? string.Empty,
+                    discoveredDatabase.DatabaseName,
+                    discoveredDatabase.DatabaseType.ToString());
+            })
+            .OrderBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void AddTableNameCandidate(ISet<string> candidateNames, string? tableName)
+    {
+        if (!string.IsNullOrWhiteSpace(tableName))
+        {
+            candidateNames.Add(tableName.Trim());
+        }
+    }
+
+    private static bool ShouldApplyConfiguredPrefix(string component, string configuredPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPrefix))
+        {
+            return false;
+        }
+
+        var knownPrefixes = GetKnownTablePrefixes("Unknown");
+        var componentPrefixes = GetKnownTablePrefixes(component);
+        var isKnownDifferentComponentPrefix = knownPrefixes.Any(prefix => prefix.Equals(configuredPrefix, StringComparison.OrdinalIgnoreCase)) &&
+                                             !componentPrefixes.Any(prefix => prefix.Equals(configuredPrefix, StringComparison.OrdinalIgnoreCase));
+
+        return !isKnownDifferentComponentPrefix;
+    }
+
+    private static string NormalizePhysicalTableName(string tableName)
+    {
+        var trimmed = tableName.Trim().TrimEnd(';', ',');
+        var parts = trimmed.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var actualTableName = parts.Length == 0 ? trimmed : parts[^1];
+        return actualTableName.Trim('"', '`', '[', ']');
+    }
+
+    private static string ReplaceKnownTablePrefix(string tableName, string component, string actualPrefix)
+    {
+        foreach (var knownPrefix in GetKnownTablePrefixes(component))
+        {
+            if (tableName.StartsWith(knownPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return actualPrefix + tableName[knownPrefix.Length..];
+            }
+        }
+
+        return tableName;
+    }
+
+    private static string RemoveKnownTablePrefix(string tableName, string component)
+    {
+        foreach (var knownPrefix in GetKnownTablePrefixes(component))
+        {
+            if (tableName.StartsWith(knownPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return tableName[knownPrefix.Length..];
+            }
+        }
+
+        return tableName;
+    }
+
+    private static bool HasKnownTablePrefix(string tableName, string component)
+    {
+        return GetKnownTablePrefixes(component)
+            .Any(prefix => tableName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? ResolveSchemaName(DiscoveredDatabaseConnection discoveredDatabase, string? scriptSchemaName)
+    {
+        var schema = !string.IsNullOrWhiteSpace(discoveredDatabase.SchemaName)
+            ? discoveredDatabase.SchemaName
+            : scriptSchemaName;
+        schema = schema?.Trim();
+        return string.IsNullOrWhiteSpace(schema) ||
+               schema.Equals("database_name", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : schema;
+    }
+
+    private static string FormatLookupTableName(DatabaseType databaseType, string? schemaName, string tableName)
+    {
+        if (string.IsNullOrWhiteSpace(schemaName))
+        {
+            return tableName;
+        }
+
+        var defaultSchema = databaseType switch
+        {
+            DatabaseType.MSSQL => "dbo",
+            DatabaseType.PostgreSQL => "public",
+            _ => string.Empty
+        };
+
+        return !string.IsNullOrWhiteSpace(defaultSchema) &&
+               schemaName.Equals(defaultSchema, StringComparison.OrdinalIgnoreCase)
+            ? tableName
+            : $"{schemaName}.{tableName}";
+    }
+
+    private static IReadOnlyList<string> GetKnownTablePrefixes(string component)
+    {
+        if (component.Equals("IDP", StringComparison.OrdinalIgnoreCase))
+        {
+            return ["BOLDTC_"];
+        }
+
+        if (component.Equals("Server", StringComparison.OrdinalIgnoreCase))
+        {
+            return ["BOLDBI_", "SyncDS_", "BOLDRS_", "SyncRS_"];
+        }
+
+        return ["BOLDTC_", "BOLDBI_", "SyncDS_", "BOLDRS_", "SyncRS_"];
+    }
+
+    private static string GetDefaultTablePrefix(string component, UpgradeProduct product)
+    {
+        if (component.Equals("IDP", StringComparison.OrdinalIgnoreCase))
+        {
+            return "BOLDTC_";
+        }
+
+        if (component.Equals("Server", StringComparison.OrdinalIgnoreCase))
+        {
+            return product == UpgradeProduct.BoldReports ? "BOLDRS_" : "BOLDBI_";
+        }
+
+        return string.Empty;
+    }
+
     private async Task<DatabaseBackupPlan> BuildDatabaseBackupPlanAsync(
+        DiscoveredDatabaseConnection discoveredDatabase,
         DatabaseType databaseType,
         string sourceConnectionString,
-        IReadOnlyList<string> affectedTables,
-        IReadOnlyList<string> createdTables,
+        IReadOnlyList<ResolvedPhysicalTable> affectedTables,
+        IReadOnlyList<ResolvedPhysicalTable> createdTables,
         string? jobId,
         CancellationToken cancellationToken)
     {
@@ -557,15 +809,20 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
             .GroupBy(table => table, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
         var tablesToBackup = affectedTables
-            .Where(existingTableLookup.ContainsKey)
-            .Select(table => existingTableLookup[table])
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .Where(table => existingTableLookup.ContainsKey(table.LookupName))
+            .GroupBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var table = group.First();
+                return table with { LookupName = existingTableLookup[table.LookupName] };
+            })
+            .OrderBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase)
             .ToList();
         var missingAffectedTables = affectedTables
-            .Where(table => !existingTables.Contains(table))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
+            .Where(table => !existingTables.Contains(table.LookupName))
+            .GroupBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .OrderBy(table => table.LookupName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         foreach (var missingTable in missingAffectedTables)
@@ -575,7 +832,7 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 "Schema Backup",
                 "Warning",
                 "DatabaseBackup",
-                $"Affected table '{missingTable}' was not found in the source database and will be skipped.");
+                $"Table '{missingTable.DisplayName}' is not available in database '{discoveredDatabase.DatabaseName}' and will be skipped.");
         }
 
         if (tablesToBackup.Count == 0)
@@ -585,35 +842,53 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 "Schema Backup",
                 "Warning",
                 "DatabaseBackup",
-                "None of the requested affected tables were found in the source database. Physical backup database creation was skipped.");
+                $"No matching affected tables were found in database '{discoveredDatabase.DatabaseName}'. Backup database creation was skipped.");
         }
 
         var createdTablesToDrop = createdTables
-            .Where(table => !existingTables.Contains(table))
+            .Where(table => !existingTables.Contains(table.LookupName))
+            .Select(table => table.LookupName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(table => table, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        foreach (var table in createdTables.Except(createdTablesToDrop, StringComparer.OrdinalIgnoreCase))
+        foreach (var table in createdTables.Where(table => existingTables.Contains(table.LookupName)))
         {
             AppendOperationLog(
                 jobId,
                 "Schema Backup",
                 "Info",
                 "DatabaseBackup",
-                $"Upgrade script includes CREATE TABLE for '{table}', but the table already exists before upgrade; it will be backed up/restored instead of dropped as a new table.");
+                $"Table '{table.DisplayName}' already exists in database '{discoveredDatabase.DatabaseName}'. Backup will be used for rollback if required.");
         }
 
-        foreach (var table in createdTablesToDrop)
+        foreach (var table in createdTables.Where(table => !existingTables.Contains(table.LookupName)))
         {
             AppendOperationLog(
                 jobId,
                 "Schema Backup",
                 "Info",
                 "DatabaseBackup",
-                $"Upgrade-created table '{table}' did not exist before upgrade and will be removed during rollback if rollback is required.");
+                $"Table '{table.DisplayName}' is not available in database '{discoveredDatabase.DatabaseName}'. It will be treated as upgrade-created and removed during rollback if required.");
         }
 
         return new DatabaseBackupPlan(tablesToBackup, createdTablesToDrop);
+    }
+
+    private static string FormatComponentName(string component)
+    {
+        return string.IsNullOrWhiteSpace(component) || component.Equals("Unknown", StringComparison.OrdinalIgnoreCase)
+            ? "database"
+            : component;
+    }
+
+    private static string FormatSchemaName(string? schemaName)
+    {
+        return string.IsNullOrWhiteSpace(schemaName) ? "default" : schemaName;
+    }
+
+    private static string FormatPrefix(string? prefix)
+    {
+        return string.IsNullOrWhiteSpace(prefix) ? "default" : prefix;
     }
 
     private async Task<CreatedTableCleanupResult> DropUpgradeCreatedTablesAsync(
@@ -1327,8 +1602,38 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
 
     private sealed record BackupConnectionInfo(string ConnectionString, string DatabaseName);
 
+    private sealed record ResolvedDatabaseTableImpact(
+        IReadOnlyList<ResolvedPhysicalTable> AffectedTables,
+        IReadOnlyList<ResolvedPhysicalTable> CreatedTables);
+
+    private sealed record ResolvedPhysicalTable(
+        string LookupName,
+        string DisplayName,
+        string Component,
+        string ChangeType,
+        string? SchemaName,
+        string ConfiguredPrefix,
+        string SourcePrefix,
+        string DatabaseName,
+        string DatabaseType)
+    {
+        public static ResolvedPhysicalTable Unknown(DiscoveredDatabaseConnection database, string tableName)
+        {
+            return new ResolvedPhysicalTable(
+                tableName,
+                tableName,
+                "Unknown",
+                "altered",
+                database.SchemaName,
+                database.TablePrefix ?? string.Empty,
+                string.Empty,
+                database.DatabaseName,
+                database.DatabaseType.ToString());
+        }
+    }
+
     private sealed record DatabaseBackupPlan(
-        IReadOnlyList<string> TablesToBackup,
+        IReadOnlyList<ResolvedPhysicalTable> TablesToBackup,
         IReadOnlyList<string> CreatedTablesToDrop);
 
     private sealed record CreatedTableCleanupResult(bool Succeeded, string Message);
@@ -1339,6 +1644,8 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         private readonly IUpgradeOperationLogStore operationLogStore;
         private readonly string? jobId;
         private readonly string stage;
+        private int currentTableIndex;
+        private int totalTables;
 
         public LoggerBackupProgress(
             ILogger logger,
@@ -1355,19 +1662,18 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
         public void OnPhaseStarted(string phase)
         {
             logger.LogInformation("Database backup phase: {Phase}", phase);
-            Append("Info", "DatabaseBackup", phase);
         }
 
         public void OnTableStarted(string tableName, int tableIndex, int totalTables)
         {
+            this.currentTableIndex = tableIndex;
+            this.totalTables = totalTables;
             logger.LogInformation("Processing table {TableName} ({TableIndex}/{TotalTables}).", tableName, tableIndex, totalTables);
-            Append("Info", "DatabaseBackup", $"Processing table '{tableName}' ({tableIndex}/{totalTables}).");
         }
 
         public void OnTableProgress(string tableName, long rowsCopied)
         {
-            logger.LogInformation("Processed {RowsCopied} rows from table {TableName}.", rowsCopied, tableName);
-            Append("Info", "DatabaseBackup", $"Processed {rowsCopied} row(s) from table '{tableName}'.");
+            logger.LogDebug("Processed {RowsCopied} rows from table {TableName}.", rowsCopied, tableName);
         }
 
         public void OnTableCompleted(TableBackupResult result)
@@ -1383,8 +1689,8 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
                 result.Success ? "Info" : "Error",
                 "DatabaseBackup",
                 result.Success
-                    ? $"Table '{result.TableName}' completed successfully. Rows copied/restored: {result.RowsCopied}."
-                    : $"Table '{result.TableName}' failed. {result.ErrorMessage}");
+                    ? $"Table '{result.TableName}' {GetOperationName()} completed. Rows: {result.RowsCopied}. {FormatTableProgress()}."
+                    : $"Table '{result.TableName}' {GetOperationName()} failed. {FormatTableProgress()}. {result.ErrorMessage}");
         }
 
         public void OnWarning(string message)
@@ -1407,6 +1713,20 @@ public sealed class UpgradeDatabaseBackupService : IUpgradeDatabaseBackupService
             }
 
             operationLogStore.Append(jobId, stage, level, source, ToSafeDatabaseMessage(message));
+        }
+
+        private string FormatTableProgress()
+        {
+            return totalTables > 0
+                ? $"{Math.Clamp(currentTableIndex, 0, totalTables)} of {totalTables}"
+                : "Table progress unavailable";
+        }
+
+        private string GetOperationName()
+        {
+            return stage.Contains("restore", StringComparison.OrdinalIgnoreCase)
+                ? "restore"
+                : "backup";
         }
     }
 }

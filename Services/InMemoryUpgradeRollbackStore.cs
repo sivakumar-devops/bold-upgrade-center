@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class InMemoryUpgradeRollbackStore : IUpgradeRollbackStore
 {
@@ -170,6 +170,22 @@ public sealed class InMemoryUpgradeRollbackStore : IUpgradeRollbackStore
         entry.CleanupCompletedAt = DateTimeOffset.UtcNow;
         entry.CleanupMessage = cleanupResult.Message;
         entry.State = deleted ? UpgradeRollbackState.Deleted : UpgradeRollbackState.CleanupPending;
+        entries[entry.Id] = entry;
+        operationalStateStore.SaveRollback(entry);
+    }
+
+    public void MarkRestoreFailed(string id, string message)
+    {
+        if (!entries.TryGetValue(id, out var entry) &&
+            !operationalStateStore.TryGetRollback(id, out entry!))
+        {
+            return;
+        }
+
+        entry.LastRestoreAt = DateTimeOffset.UtcNow;
+        entry.RestoreCompletedAt = entry.LastRestoreAt;
+        entry.RestoreMessage = message;
+        entry.State = UpgradeRollbackState.RollbackFailed;
         entries[entry.Id] = entry;
         operationalStateStore.SaveRollback(entry);
     }

@@ -7,7 +7,7 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public enum DatabaseType
 {
@@ -488,6 +488,25 @@ public abstract class DbBackupProviderBase : IDatabaseProvider
     protected abstract string BuildTableReference(string tableName);
     protected abstract string MapStoreType(string storeType);
 
+    protected static (string? SchemaName, string TableName) SplitTableIdentifier(string tableName, string? defaultSchema = null)
+    {
+        var parts = tableName
+            .Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(part => part.Trim('"', '`', '[', ']'))
+            .ToArray();
+
+        return parts.Length >= 2
+            ? (parts[^2], parts[^1])
+            : (defaultSchema, parts.Length == 0 ? tableName : parts[0]);
+    }
+
+    protected static string FormatDiscoveredTableName(string schemaName, string tableName, string defaultSchema)
+    {
+        return schemaName.Equals(defaultSchema, StringComparison.OrdinalIgnoreCase)
+            ? tableName
+            : $"{schemaName}.{tableName}";
+    }
+
     public virtual async Task<IReadOnlyList<BackupColumn>> GetTableColumnsAsync(string tableName, CancellationToken cancellationToken = default)
     {
         await using var command = Connection!.CreateCommand();
@@ -709,11 +728,11 @@ public sealed class PostgreSqlBackupProvider : DbBackupProviderBase
     public override async Task<IReadOnlyList<string>> GetTableNamesAsync(CancellationToken cancellationToken = default)
     {
         const string sql = """
-            SELECT table_name
+            SELECT table_schema, table_name
             FROM information_schema.tables
-            WHERE table_schema = 'public'
+            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
               AND table_type = 'BASE TABLE'
-            ORDER BY table_name
+            ORDER BY table_schema, table_name
             """;
 
         return await ReadTableNamesAsync(sql, cancellationToken);
@@ -726,7 +745,11 @@ public sealed class PostgreSqlBackupProvider : DbBackupProviderBase
 
     protected override string QuoteIdentifier(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
     protected override string GetParameterName(int index) => $"@p{index}";
-    protected override string BuildTableReference(string tableName) => $"public.{QuoteIdentifier(tableName)}";
+    protected override string BuildTableReference(string tableName)
+    {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "public");
+        return $"{QuoteIdentifier(schemaName ?? "public")}.{QuoteIdentifier(actualTableName)}";
+    }
 
     protected override string MapStoreType(string storeType)
     {
@@ -762,7 +785,7 @@ public sealed class PostgreSqlBackupProvider : DbBackupProviderBase
         var tables = new List<string>();
         while (await reader.ReadAsync(cancellationToken))
         {
-            tables.Add(reader.GetString(0));
+            tables.Add(FormatDiscoveredTableName(reader.GetString(0), reader.GetString(1), "public"));
         }
 
         return tables;
@@ -772,6 +795,7 @@ public sealed class PostgreSqlBackupProvider : DbBackupProviderBase
 public sealed class SqlServerBackupProvider : DbBackupProviderBase
 {
     private readonly Dictionary<string, string> pendingForeignKeyScripts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> pendingSecurityPolicyScripts = new(StringComparer.OrdinalIgnoreCase);
 
     public override DatabaseType DatabaseType => DatabaseType.MSSQL;
 
@@ -780,11 +804,10 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
     public override async Task<IReadOnlyList<string>> GetTableNamesAsync(CancellationToken cancellationToken = default)
     {
         const string sql = """
-            SELECT TABLE_NAME
+            SELECT TABLE_SCHEMA, TABLE_NAME
             FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = 'dbo'
-              AND TABLE_TYPE = 'BASE TABLE'
-            ORDER BY TABLE_NAME
+            WHERE TABLE_TYPE = 'BASE TABLE'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
 
         await using var command = Connection!.CreateCommand();
@@ -793,7 +816,7 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
         var tables = new List<string>();
         while (await reader.ReadAsync(cancellationToken))
         {
-            tables.Add(reader.GetString(0));
+            tables.Add(FormatDiscoveredTableName(reader.GetString(0), reader.GetString(1), "dbo"));
         }
 
         return tables;
@@ -906,15 +929,20 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
 
     public override async Task DropTableIfExistsAsync(string tableName, CancellationToken cancellationToken = default)
     {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
+        var escapedObjectName = $"{(schemaName ?? "dbo").Replace("'", "''", StringComparison.Ordinal)}.{actualTableName.Replace("'", "''", StringComparison.Ordinal)}";
+        await CaptureAndDropSecurityPoliciesAsync(tableName, cancellationToken);
         await CaptureAndDropForeignKeysAsync(tableName, cancellationToken);
-        await ExecuteAsync($"IF OBJECT_ID(N'dbo.{tableName.Replace("'", "''", StringComparison.Ordinal)}', N'U') IS NOT NULL DROP TABLE {BuildTableReference(tableName)}", cancellationToken);
+        await ExecuteAsync($"IF OBJECT_ID(N'{escapedObjectName}', N'U') IS NOT NULL DROP TABLE {BuildTableReference(tableName)}", cancellationToken);
     }
 
     public override async Task DisableForeignKeysAsync(IReadOnlyList<string> tableNames, CancellationToken cancellationToken = default)
     {
         foreach (var table in tableNames)
         {
-            await ExecuteAsync($"IF OBJECT_ID(N'dbo.{table.Replace("'", "''", StringComparison.Ordinal)}', N'U') IS NOT NULL ALTER TABLE {BuildTableReference(table)} NOCHECK CONSTRAINT ALL", cancellationToken);
+            var (schemaName, actualTableName) = SplitTableIdentifier(table, "dbo");
+            var escapedObjectName = $"{(schemaName ?? "dbo").Replace("'", "''", StringComparison.Ordinal)}.{actualTableName.Replace("'", "''", StringComparison.Ordinal)}";
+            await ExecuteAsync($"IF OBJECT_ID(N'{escapedObjectName}', N'U') IS NOT NULL ALTER TABLE {BuildTableReference(table)} NOCHECK CONSTRAINT ALL", cancellationToken);
         }
     }
 
@@ -922,23 +950,49 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
     {
         foreach (var table in tableNames)
         {
-            await ExecuteAsync($"IF OBJECT_ID(N'dbo.{table.Replace("'", "''", StringComparison.Ordinal)}', N'U') IS NOT NULL ALTER TABLE {BuildTableReference(table)} WITH CHECK CHECK CONSTRAINT ALL", cancellationToken);
+            var (schemaName, actualTableName) = SplitTableIdentifier(table, "dbo");
+            var escapedObjectName = $"{(schemaName ?? "dbo").Replace("'", "''", StringComparison.Ordinal)}.{actualTableName.Replace("'", "''", StringComparison.Ordinal)}";
+            await ExecuteAsync($"IF OBJECT_ID(N'{escapedObjectName}', N'U') IS NOT NULL ALTER TABLE {BuildTableReference(table)} WITH CHECK CHECK CONSTRAINT ALL", cancellationToken);
         }
     }
 
     public override async Task CompleteTableRestoreAsync(IReadOnlyList<string> tableNames, CancellationToken cancellationToken = default)
     {
-        foreach (var script in pendingForeignKeyScripts.Values)
+        try
         {
-            await ExecuteAsync(script, cancellationToken);
-        }
+            foreach (var script in pendingForeignKeyScripts.Values)
+            {
+                await ExecuteAsync(script, cancellationToken);
+            }
 
-        pendingForeignKeyScripts.Clear();
+            foreach (var (policyName, script) in pendingSecurityPolicyScripts)
+            {
+                try
+                {
+                    await ExecuteAsync(script, cancellationToken);
+                }
+                catch (Exception exception)
+                {
+                    throw new InvalidOperationException(
+                        $"SQL Server security policy '{policyName}' could not be recreated after table restore: {exception.Message}",
+                        exception);
+                }
+            }
+        }
+        finally
+        {
+            pendingForeignKeyScripts.Clear();
+            pendingSecurityPolicyScripts.Clear();
+        }
     }
 
     protected override string QuoteIdentifier(string identifier) => "[" + identifier.Replace("]", "]]", StringComparison.Ordinal) + "]";
     protected override string GetParameterName(int index) => $"@p{index}";
-    protected override string BuildTableReference(string tableName) => $"dbo.{QuoteIdentifier(tableName)}";
+    protected override string BuildTableReference(string tableName)
+    {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
+        return $"{QuoteIdentifier(schemaName ?? "dbo")}.{QuoteIdentifier(actualTableName)}";
+    }
 
     protected override string MapStoreType(string storeType)
     {
@@ -965,8 +1019,9 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
 
     private async Task<IReadOnlyList<SqlServerColumnDefinition>> ReadColumnDefinitionsAsync(string tableName, CancellationToken cancellationToken)
     {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
         const string sql = """
-            DECLARE @qualifiedTable nvarchar(517) = N'dbo.' + QUOTENAME(@tableName);
+            DECLARE @qualifiedTable nvarchar(517) = QUOTENAME(@schemaName) + N'.' + QUOTENAME(@tableName);
 
             SELECT
                 c.name AS ColumnName,
@@ -986,14 +1041,15 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
             INNER JOIN sys.columns c ON tableInfo.object_id = c.object_id
             INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
             LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
-            WHERE schemaInfo.name = N'dbo'
+            WHERE schemaInfo.name = @schemaName
               AND tableInfo.name = @tableName
             ORDER BY c.column_id;
             """;
 
         await using var command = Connection!.CreateCommand();
         command.CommandText = sql;
-        AddParameter(command, "@tableName", tableName);
+        AddParameter(command, "@schemaName", schemaName ?? "dbo");
+        AddParameter(command, "@tableName", actualTableName);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var columns = new List<SqlServerColumnDefinition>();
@@ -1019,6 +1075,7 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
 
     private async Task<IReadOnlyList<SqlServerKeyConstraintColumn>> ReadKeyConstraintsAsync(string tableName, CancellationToken cancellationToken)
     {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
         const string sql = """
             SELECT
                 keyConstraint.name AS ConstraintName,
@@ -1040,7 +1097,7 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
             INNER JOIN sys.columns columnInfo
                 ON indexColumn.object_id = columnInfo.object_id
                AND indexColumn.column_id = columnInfo.column_id
-            WHERE schemaInfo.name = N'dbo'
+            WHERE schemaInfo.name = @schemaName
               AND tableInfo.name = @tableName
               AND keyConstraint.type IN ('PK', 'UQ')
             ORDER BY keyConstraint.name, indexColumn.key_ordinal;
@@ -1048,7 +1105,8 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
 
         await using var command = Connection!.CreateCommand();
         command.CommandText = sql;
-        AddParameter(command, "@tableName", tableName);
+        AddParameter(command, "@schemaName", schemaName ?? "dbo");
+        AddParameter(command, "@tableName", actualTableName);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var columns = new List<SqlServerKeyConstraintColumn>();
@@ -1084,8 +1142,109 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
         }
     }
 
+    private async Task CaptureAndDropSecurityPoliciesAsync(string tableName, CancellationToken cancellationToken)
+    {
+        var securityPredicates = await ReadSecurityPredicatesAsync(tableName, cancellationToken);
+        foreach (var group in securityPredicates.GroupBy(predicate => predicate.PolicyId))
+        {
+            var predicates = group.OrderBy(predicate => predicate.PredicateId).ToList();
+            var first = predicates[0];
+            var key = $"{first.PolicySchema}.{first.PolicyName}";
+            if (!pendingSecurityPolicyScripts.ContainsKey(key))
+            {
+                pendingSecurityPolicyScripts[key] = BuildSecurityPolicyScript(predicates);
+                await ExecuteAsync($"DROP SECURITY POLICY {BuildTableReference(first.PolicySchema, first.PolicyName)}", cancellationToken);
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<SqlServerSecurityPredicate>> ReadSecurityPredicatesAsync(string tableName, CancellationToken cancellationToken)
+    {
+        if (!await SupportsSecurityPredicatesAsync(cancellationToken))
+        {
+            return Array.Empty<SqlServerSecurityPredicate>();
+        }
+
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
+        const string sql = """
+            WITH ReferencingPolicies AS
+            (
+                SELECT DISTINCT securityPolicy.object_id AS PolicyId
+                FROM sys.security_policies securityPolicy
+                INNER JOIN sys.security_predicates securityPredicate ON securityPolicy.object_id = securityPredicate.object_id
+                INNER JOIN sys.tables targetTable ON securityPredicate.target_object_id = targetTable.object_id
+                INNER JOIN sys.schemas targetSchema ON targetTable.schema_id = targetSchema.schema_id
+                WHERE targetSchema.name = @schemaName
+                  AND targetTable.name = @tableName
+            )
+            SELECT
+                securityPolicy.object_id AS PolicyId,
+                policySchema.name AS PolicySchema,
+                securityPolicy.name AS PolicyName,
+                securityPolicy.is_enabled AS IsEnabled,
+                securityPolicy.is_schema_bound AS IsSchemaBound,
+                securityPredicate.security_predicate_id AS PredicateId,
+                securityPredicate.predicate_type_desc AS PredicateType,
+                securityPredicate.operation_desc AS Operation,
+                securityPredicate.predicate_definition AS PredicateDefinition,
+                targetSchema.name AS TargetSchema,
+                targetTable.name AS TargetTable
+            FROM ReferencingPolicies referencingPolicy
+            INNER JOIN sys.security_policies securityPolicy ON referencingPolicy.PolicyId = securityPolicy.object_id
+            INNER JOIN sys.schemas policySchema ON securityPolicy.schema_id = policySchema.schema_id
+            INNER JOIN sys.security_predicates securityPredicate ON securityPolicy.object_id = securityPredicate.object_id
+            INNER JOIN sys.tables targetTable ON securityPredicate.target_object_id = targetTable.object_id
+            INNER JOIN sys.schemas targetSchema ON targetTable.schema_id = targetSchema.schema_id
+            ORDER BY securityPolicy.object_id, securityPredicate.security_predicate_id;
+            """;
+
+        await using var command = Connection!.CreateCommand();
+        command.CommandText = sql;
+        AddParameter(command, "@schemaName", schemaName ?? "dbo");
+        AddParameter(command, "@tableName", actualTableName);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var predicates = new List<SqlServerSecurityPredicate>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            predicates.Add(new SqlServerSecurityPredicate(
+                Convert.ToInt32(reader.GetValue(0)),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetBoolean(3),
+                reader.GetBoolean(4),
+                Convert.ToInt32(reader.GetValue(5)),
+                reader.GetString(6),
+                await reader.IsDBNullAsync(7, cancellationToken) ? null : reader.GetString(7),
+                reader.GetString(8),
+                reader.GetString(9),
+                reader.GetString(10)));
+        }
+
+        return predicates;
+    }
+
+    private async Task<bool> SupportsSecurityPredicatesAsync(CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT CASE
+                WHEN OBJECT_ID(N'sys.security_policies') IS NULL THEN 0
+                WHEN OBJECT_ID(N'sys.security_predicates') IS NULL THEN 0
+                WHEN COL_LENGTH(N'sys.security_predicates', N'predicate_type_desc') IS NULL THEN 0
+                WHEN COL_LENGTH(N'sys.security_predicates', N'predicate_definition') IS NULL THEN 0
+                ELSE 1
+            END
+            """;
+
+        await using var command = Connection!.CreateCommand();
+        command.CommandText = sql;
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt32(result) == 1;
+    }
+
     private async Task<IReadOnlyList<SqlServerForeignKeyColumn>> ReadForeignKeysAsync(string tableName, CancellationToken cancellationToken)
     {
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
         const string sql = """
             SELECT
                 foreignKey.object_id AS ForeignKeyId,
@@ -1112,14 +1271,15 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
             INNER JOIN sys.columns referencedColumn
                 ON foreignKeyColumn.referenced_object_id = referencedColumn.object_id
                AND foreignKeyColumn.referenced_column_id = referencedColumn.column_id
-            WHERE (parentSchema.name = N'dbo' AND parentTable.name = @tableName)
-               OR (referencedSchema.name = N'dbo' AND referencedTable.name = @tableName)
+            WHERE (parentSchema.name = @schemaName AND parentTable.name = @tableName)
+               OR (referencedSchema.name = @schemaName AND referencedTable.name = @tableName)
             ORDER BY foreignKey.object_id, foreignKeyColumn.constraint_column_id;
             """;
 
         await using var command = Connection!.CreateCommand();
         command.CommandText = sql;
-        AddParameter(command, "@tableName", tableName);
+        AddParameter(command, "@schemaName", schemaName ?? "dbo");
+        AddParameter(command, "@tableName", actualTableName);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var foreignKeys = new List<SqlServerForeignKeyColumn>();
@@ -1153,19 +1313,21 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
             return false;
         }
 
+        var (schemaName, actualTableName) = SplitTableIdentifier(tableName, "dbo");
         const string sql = """
             SELECT columnInfo.name
             FROM sys.columns columnInfo
             INNER JOIN sys.tables tableInfo ON columnInfo.object_id = tableInfo.object_id
             INNER JOIN sys.schemas schemaInfo ON tableInfo.schema_id = schemaInfo.schema_id
-            WHERE schemaInfo.name = N'dbo'
+            WHERE schemaInfo.name = @schemaName
               AND tableInfo.name = @tableName
               AND columnInfo.is_identity = 1;
             """;
 
         await using var command = Connection!.CreateCommand();
         command.CommandText = sql;
-        AddParameter(command, "@tableName", tableName);
+        AddParameter(command, "@schemaName", schemaName ?? "dbo");
+        AddParameter(command, "@tableName", actualTableName);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var identityColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1284,6 +1446,47 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
         return builder.ToString();
     }
 
+    private string BuildSecurityPolicyScript(IReadOnlyList<SqlServerSecurityPredicate> predicates)
+    {
+        var first = predicates[0];
+        var builder = new StringBuilder();
+        builder.Append("CREATE SECURITY POLICY ");
+        builder.Append(BuildTableReference(first.PolicySchema, first.PolicyName));
+        builder.AppendLine();
+
+        for (var index = 0; index < predicates.Count; index++)
+        {
+            var predicate = predicates[index];
+            if (index > 0)
+            {
+                builder.AppendLine(",");
+            }
+
+            builder.Append("ADD ");
+            builder.Append(FormatSecurityPredicateType(predicate.PredicateType));
+            builder.Append(" PREDICATE ");
+            builder.Append(NormalizeSecurityPredicateDefinition(predicate.PredicateDefinition));
+            builder.Append(" ON ");
+            builder.Append(BuildTableReference(predicate.TargetSchema, predicate.TargetTable));
+
+            var operation = FormatSecurityPredicateOperation(predicate.Operation);
+            if (!string.IsNullOrWhiteSpace(operation))
+            {
+                builder.Append(' ');
+                builder.Append(operation);
+            }
+        }
+
+        builder.AppendLine();
+        builder.Append("WITH (STATE = ");
+        builder.Append(first.IsEnabled ? "ON" : "OFF");
+        builder.Append(", SCHEMABINDING = ");
+        builder.Append(first.IsSchemaBound ? "ON" : "OFF");
+        builder.Append(");");
+
+        return builder.ToString();
+    }
+
     private static void AppendReferentialAction(StringBuilder builder, string actionName, string action)
     {
         if (string.Equals(action, "NO_ACTION", StringComparison.OrdinalIgnoreCase))
@@ -1295,6 +1498,65 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
         builder.Append(actionName);
         builder.Append(' ');
         builder.Append(action.Replace("_", " ", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string FormatSecurityPredicateType(string predicateType)
+    {
+        return string.Equals(predicateType, "BLOCK", StringComparison.OrdinalIgnoreCase)
+            ? "BLOCK"
+            : "FILTER";
+    }
+
+    private static string FormatSecurityPredicateOperation(string? operation)
+    {
+        if (string.IsNullOrWhiteSpace(operation) ||
+            string.Equals(operation, "ALL", StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        return operation.Replace("_", " ", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeSecurityPredicateDefinition(string predicateDefinition)
+    {
+        var definition = predicateDefinition.Trim();
+        while (definition.Length > 1 &&
+               definition[0] == '(' &&
+               definition[^1] == ')' &&
+               HasSingleOuterParentheses(definition))
+        {
+            definition = definition[1..^1].Trim();
+        }
+
+        return definition;
+    }
+
+    private static bool HasSingleOuterParentheses(string value)
+    {
+        var depth = 0;
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (value[index] == '(')
+            {
+                depth++;
+            }
+            else if (value[index] == ')')
+            {
+                depth--;
+                if (depth == 0 && index < value.Length - 1)
+                {
+                    return false;
+                }
+            }
+
+            if (depth < 0)
+            {
+                return false;
+            }
+        }
+
+        return depth == 0;
     }
 
     private string BuildTableReference(string schemaName, string tableName) => $"{QuoteIdentifier(schemaName)}.{QuoteIdentifier(tableName)}";
@@ -1366,6 +1628,19 @@ public sealed class SqlServerBackupProvider : DbBackupProviderBase
         int Ordinal,
         string ParentColumn,
         string ReferencedColumn);
+
+    private sealed record SqlServerSecurityPredicate(
+        int PolicyId,
+        string PolicySchema,
+        string PolicyName,
+        bool IsEnabled,
+        bool IsSchemaBound,
+        int PredicateId,
+        string PredicateType,
+        string? Operation,
+        string PredicateDefinition,
+        string TargetSchema,
+        string TargetTable);
 }
 
 public sealed class MySqlBackupProvider : DbBackupProviderBase

@@ -4,11 +4,12 @@ using MySqlConnector;
 using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
 {
     private const string TableName = "bolduc_upgradeoperationhistory";
+    private const string ProductColumnName = "product";
     private readonly IUpgradeDatabaseDiscoveryService databaseDiscoveryService;
     private readonly ILogger<DatabaseUpgradeHistoryStore> logger;
     private readonly SemaphoreSlim schemaLock = new(1, 1);
@@ -30,11 +31,11 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
 
         const string sql = """
             INSERT INTO bolduc_upgradeoperationhistory
-            (id, jobid, parentjobid, operationtype, previousversion, targetversion, upgradetype, status, startedat, completedat,
+            (id, jobid, parentjobid, product, operationtype, previousversion, targetversion, upgradetype, status, startedat, completedat,
              initiatedbyuserid, initiatedbyname, initiatedbyemail, initiatedbyrole, rollbackmode, rollbackjobid, rollbackavailable,
              failurestage, failuresummary, createdat, modifiedat)
             VALUES
-            (@id, @jobid, @parentjobid, @operationtype, @previousversion, @targetversion, @upgradetype, @status, @startedat, @completedat,
+            (@id, @jobid, @parentjobid, @product, @operationtype, @previousversion, @targetversion, @upgradetype, @status, @startedat, @completedat,
              @initiatedbyuserid, @initiatedbyname, @initiatedbyemail, @initiatedbyrole, @rollbackmode, @rollbackjobid, @rollbackavailable,
              @failurestage, @failuresummary, @createdat, @modifiedat)
             """;
@@ -77,6 +78,29 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
         AddParameter(command, master.DatabaseType, "rollbackjobid", rollbackJobId);
         AddParameter(command, master.DatabaseType, "failurestage", failureStage);
         AddParameter(command, master.DatabaseType, "failuresummary", Truncate(failureSummary, 2000));
+        AddParameter(command, master.DatabaseType, "modifiedat", FormatDate(DateTimeOffset.UtcNow));
+        AddParameter(command, master.DatabaseType, "jobid", jobId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task UpdateStatusAsync(
+        string jobId,
+        string status,
+        CancellationToken cancellationToken = default)
+    {
+        var master = await OpenMasterConnectionAsync(cancellationToken);
+        await using var connection = master.Connection;
+        await EnsureSchemaAsync(master, cancellationToken);
+
+        const string sql = """
+            UPDATE bolduc_upgradeoperationhistory
+            SET status = @status,
+                modifiedat = @modifiedat
+            WHERE jobid = @jobid
+            """;
+
+        await using var command = CreateCommand(master, sql);
+        AddParameter(command, master.DatabaseType, "status", status);
         AddParameter(command, master.DatabaseType, "modifiedat", FormatDate(DateTimeOffset.UtcNow));
         AddParameter(command, master.DatabaseType, "jobid", jobId);
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -141,7 +165,14 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                 await command.ExecuteNonQueryAsync(cancellationToken);
                 logger.LogInformation("Upgrade Center history table was created in the master database.");
             }
+            else if (!await ColumnExistsAsync(master, ProductColumnName, cancellationToken))
+            {
+                await using var command = CreateCommand(master, AddProductColumnSql(master.DatabaseType));
+                await command.ExecuteNonQueryAsync(cancellationToken);
+                logger.LogInformation("Upgrade Center history table was updated with product tracking.");
+            }
 
+            await NormalizeProductValuesAsync(master, cancellationToken);
             schemaReady = true;
         }
         finally
@@ -167,6 +198,83 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
         return result is not null && result != DBNull.Value;
     }
 
+    private static async Task<bool> ColumnExistsAsync(MasterHistoryConnection master, string columnName, CancellationToken cancellationToken)
+    {
+        var sql = master.DatabaseType switch
+        {
+            DatabaseType.PostgreSQL => "SELECT 1 FROM information_schema.columns WHERE lower(table_name) = lower(@tableName) AND lower(column_name) = lower(@columnName) LIMIT 1",
+            DatabaseType.MSSQL => "SELECT COL_LENGTH(@tableName, @columnName)",
+            DatabaseType.MySQL => "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND lower(table_name) = lower(@tableName) AND lower(column_name) = lower(@columnName) LIMIT 1",
+            DatabaseType.Oracle => "SELECT 1 FROM all_tab_columns WHERE table_name = :tableName AND column_name = :columnName AND ROWNUM = 1",
+            _ => throw new NotSupportedException($"Database type '{master.DatabaseType}' is not supported for upgrade history.")
+        };
+
+        await using var command = CreateCommand(master, sql);
+        AddParameter(command, master.DatabaseType, "tableName", master.DatabaseType == DatabaseType.Oracle ? TableName.ToUpperInvariant() : TableName);
+        AddParameter(command, master.DatabaseType, "columnName", master.DatabaseType == DatabaseType.Oracle ? columnName.ToUpperInvariant() : columnName);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return result is not null && result != DBNull.Value;
+    }
+
+    private static string AddProductColumnSql(DatabaseType databaseType)
+    {
+        return databaseType switch
+        {
+            DatabaseType.PostgreSQL => $"ALTER TABLE {TableName} ADD COLUMN {ProductColumnName} varchar(64) NULL",
+            DatabaseType.MSSQL => $"ALTER TABLE {TableName} ADD {ProductColumnName} nvarchar(64) NULL",
+            DatabaseType.MySQL => $"ALTER TABLE {TableName} ADD COLUMN {ProductColumnName} varchar(64) NULL",
+            DatabaseType.Oracle => $"ALTER TABLE {TableName} ADD ({ProductColumnName} varchar2(64) NULL)",
+            _ => throw new NotSupportedException($"Database type '{databaseType}' is not supported for upgrade history.")
+        };
+    }
+
+    private async Task NormalizeProductValuesAsync(MasterHistoryConnection master, CancellationToken cancellationToken)
+    {
+        var updatedRows = 0;
+        updatedRows += await NormalizeProductValueAsync(
+            master,
+            UpgradeProductKeys.BoldBi,
+            ["bi", "boldbi", "bold-bi", "bold bi"],
+            cancellationToken);
+        updatedRows += await NormalizeProductValueAsync(
+            master,
+            UpgradeProductKeys.BoldReports,
+            ["reports", "boldreports", "bold-reports", "bold reports"],
+            cancellationToken);
+
+        if (updatedRows > 0)
+        {
+            logger.LogInformation(
+                "Upgrade Center history table product values were normalized. UpdatedRows: {UpdatedRows}.",
+                updatedRows);
+        }
+    }
+
+    private static async Task<int> NormalizeProductValueAsync(
+        MasterHistoryConnection master,
+        string normalizedProduct,
+        IReadOnlyList<string> legacyProducts,
+        CancellationToken cancellationToken)
+    {
+        var parameterNames = legacyProducts
+            .Select((_, index) => $"@legacyProduct{index}")
+            .ToArray();
+        var sql = $"""
+            UPDATE {TableName}
+            SET {ProductColumnName} = @normalizedProduct
+            WHERE lower({ProductColumnName}) IN ({string.Join(", ", parameterNames)})
+            """;
+
+        await using var command = CreateCommand(master, sql);
+        AddParameter(command, master.DatabaseType, "normalizedProduct", normalizedProduct);
+        for (var index = 0; index < legacyProducts.Count; index++)
+        {
+            AddParameter(command, master.DatabaseType, $"legacyProduct{index}", legacyProducts[index]);
+        }
+
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     private static string CreateTableSql(DatabaseType databaseType)
     {
         return databaseType switch
@@ -176,6 +284,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                     id varchar(64) PRIMARY KEY,
                     jobid varchar(128) NOT NULL UNIQUE,
                     parentjobid varchar(128) NULL,
+                    product varchar(64) NULL,
                     operationtype varchar(64) NOT NULL,
                     previousversion varchar(64) NULL,
                     targetversion varchar(64) NULL,
@@ -201,6 +310,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                     id nvarchar(64) NOT NULL PRIMARY KEY,
                     jobid nvarchar(128) NOT NULL UNIQUE,
                     parentjobid nvarchar(128) NULL,
+                    product nvarchar(64) NULL,
                     operationtype nvarchar(64) NOT NULL,
                     previousversion nvarchar(64) NULL,
                     targetversion nvarchar(64) NULL,
@@ -226,6 +336,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                     id varchar(64) NOT NULL PRIMARY KEY,
                     jobid varchar(128) NOT NULL UNIQUE,
                     parentjobid varchar(128) NULL,
+                    product varchar(64) NULL,
                     operationtype varchar(64) NOT NULL,
                     previousversion varchar(64) NULL,
                     targetversion varchar(64) NULL,
@@ -251,6 +362,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                     id varchar2(64) NOT NULL PRIMARY KEY,
                     jobid varchar2(128) NOT NULL UNIQUE,
                     parentjobid varchar2(128) NULL,
+                    product varchar2(64) NULL,
                     operationtype varchar2(64) NOT NULL,
                     previousversion varchar2(64) NULL,
                     targetversion varchar2(64) NULL,
@@ -301,6 +413,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
         AddParameter(command, databaseType, "id", record.Id);
         AddParameter(command, databaseType, "jobid", record.JobId);
         AddParameter(command, databaseType, "parentjobid", record.ParentJobId);
+        AddParameter(command, databaseType, "product", Truncate(record.Product, 64));
         AddParameter(command, databaseType, "operationtype", record.OperationType);
         AddParameter(command, databaseType, "previousversion", record.PreviousVersion);
         AddParameter(command, databaseType, "targetversion", record.TargetVersion);
@@ -340,6 +453,7 @@ public sealed class DatabaseUpgradeHistoryStore : IUpgradeHistoryStore
                 Id = ReadString(reader, "id") ?? string.Empty,
                 JobId = ReadString(reader, "jobid") ?? string.Empty,
                 ParentJobId = ReadString(reader, "parentjobid"),
+                Product = ReadString(reader, "product") ?? UpgradeProductKeys.BoldBi,
                 OperationType = ReadString(reader, "operationtype") ?? string.Empty,
                 PreviousVersion = ReadString(reader, "previousversion"),
                 TargetVersion = ReadString(reader, "targetversion"),

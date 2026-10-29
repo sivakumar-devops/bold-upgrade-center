@@ -1,9 +1,9 @@
 using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
-using BoldBI.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models;
 
-namespace BoldBI.UpgradeCenter.Services
+namespace Bold.UpgradeCenter.Services
 {
     /// <summary>
     /// Determines whether the current HTTP user is allowed to use the

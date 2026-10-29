@@ -1,6 +1,6 @@
-# Bold BI Upgrade Center
+# Bold Upgrade Center
 
-Bold BI Upgrade Center is an ASP.NET Core MVC application used to orchestrate Bold BI upgrades in Kubernetes environments. It integrates with the running Bold BI IDP, UMS, BI, database, and Kubernetes deployments so an administrator can review available versions, validate impact, back up affected schema objects, update deployment images, monitor progress, view history, and run rollback when required.
+Bold Upgrade Center is an ASP.NET Core MVC application used to orchestrate Bold BI upgrades in Kubernetes environments. It integrates with the running Bold BI IDP, UMS, BI, database, and Kubernetes deployments so an administrator can review available versions, validate impact, back up affected schema objects, update deployment images, monitor progress, view history, and run rollback when required.
 
 The application is designed to run beside an existing Bold BI installation, usually in the same Kubernetes namespace. It does not read Bold BI `app_data` files directly. Required configuration and cryptographic metadata are retrieved through internal IDP APIs.
 
@@ -27,7 +27,7 @@ The Upgrade Center provides:
 Browser
   |
   v
-BoldBI.UpgradeCenter MVC app
+Bold.UpgradeCenter MVC app
   |
   +-- UMS internal service
   |     - Session validation
@@ -101,7 +101,7 @@ The custom patch flow is intended for support-provided image tags.
 ## Folder Structure
 
 ```text
-BoldBI.UpgradeCenter
+Bold.UpgradeCenter
 ├── Controllers
 │   ├── UpgradeCenterController.cs
 │   └── HomeController.cs
@@ -133,11 +133,10 @@ BoldBI.UpgradeCenter
 │   ├── css
 │   ├── images
 │   └── js
-├── PlaywrightScripts
 ├── k8s
 ├── Dockerfile
 ├── appsettings.json
-└── BoldBI.UpgradeCenter.csproj
+└── Bold.UpgradeCenter.csproj
 ```
 
 ### Key Components
@@ -164,16 +163,8 @@ BoldBI.UpgradeCenter
 ### Development Machine
 
 - .NET SDK matching `net10.0`.
-- Node.js and npm.
-- Playwright dependencies:
-
-  ```powershell
-  cd D:\dev-run-new\BoldBI.UpgradeCenter
-  npm ci
-  npx playwright install chromium
-  ```
-
 - Access to the Bold BI dev-run environment or running Bold BI services.
+- No local Node.js/npm setup is required for the Upgrade Center web application. Real Playwright validation runs in the separate Kubernetes runner image when enabled; when disabled, validation uses product health checks.
 - Access to the Bold BI master database.
 - For Kubernetes upgrade testing:
   - Current Kubernetes context or in-cluster service account access.
@@ -181,8 +172,9 @@ BoldBI.UpgradeCenter
 
 ### Runtime Dependencies
 
-- `id-api` internal service.
-- `id-ums` internal service.
+- Default `IdpIntegrated` mode: `id-api` and `id-ums` internal services.
+- Optional `Standalone` mode: local administrator login with read-only configuration/key access from filesystem, S3, Azure Blob, or OCI. Object storage also checks master database runtime settings. See [Standalone Mode](docs/standalone-mode.md) for Helm/manifests, storage Secrets, and persistent state requirements.
+- Without a product PV, both integration modes persist Upgrade Center reports and authentication keys in the configured object storage, without creating a dedicated data PVC. Write access is restricted to Upgrade Center's own prefix; product configuration remains read-only. Playwright's temporary shared-state PVC is unchanged.
 - Bold BI BI product-version endpoint.
 - Master database and tenant database access.
 - Kubernetes API access from the Upgrade Center pod.
@@ -196,8 +188,8 @@ The primary configuration section is `UpgradeCenter` in `appsettings.json`.
 ```json
 {
   "UpgradeCenter": {
-    "ProductName": "Bold BI",
-    "ReleaseVersionsApiUrl": "https://boldbi-release-api.boldbidemo.com/version/json",
+    "ProductName": "Bold Upgrade Center",
+    "ReleaseVersionsApiUrl": "https://releases.boldbi.com/version/json",
     "Services": {
       "IdpApi": "",
       "Ums": ""
@@ -290,18 +282,9 @@ This is required to decrypt the master database connection string and tenant dat
 
 Configured through `UpgradeCenter:Playwright`.
 
-Defaults:
+When `UseKubernetesJob` is `true`, pre-upgrade and post-upgrade validation run through the external Playwright runner Kubernetes Job.
 
-```text
-Executable: node
-PreUpgrade arguments:
-node_modules/playwright/cli.js test PlaywrightScripts/sample-upgrade-poc.spec.ts --config PlaywrightScripts/playwright.config.ts --reporter=line
-
-PostUpgrade arguments:
-node_modules/playwright/cli.js test PlaywrightScripts/sample-post-upgrade-validation.spec.ts --config PlaywrightScripts/playwright.config.ts --reporter=line
-```
-
-Sample Playwright scripts are treated as successful even if the dummy script exits non-zero. This is temporary until real QA scripts are integrated.
+When `UseKubernetesJob` is `false`, the Upgrade Center does not execute bundled sample scripts. It validates product availability through `ProductHealthCheckService`.
 
 ### Database Backup Settings
 
@@ -347,7 +330,7 @@ Deployments inside each group are patched and monitored in parallel. The next gr
 ### Restore and Build
 
 ```powershell
-cd D:\dev-run-new\BoldBI.UpgradeCenter
+cd D:\dev-run-new\Bold.UpgradeCenter
 dotnet restore
 dotnet build
 ```
@@ -355,7 +338,7 @@ dotnet build
 ### Run Locally
 
 ```powershell
-cd D:\dev-run-new\BoldBI.UpgradeCenter
+cd D:\dev-run-new\Bold.UpgradeCenter
 $env:ASPNETCORE_ENVIRONMENT = "Development"
 $env:ASPNETCORE_URLS = "http://localhost:6717"
 $env:UpgradeCenter__Services__IdpApi = "http://localhost:6702/api"
@@ -382,7 +365,7 @@ The application supports forwarded prefixes through `X-Forwarded-Prefix`.
 The dev-run service map currently contains service ID:
 
 ```text
-upgrade-center-ui
+bold-upgrade-center
 ```
 
 Relevant service map path:
@@ -394,8 +377,8 @@ dev-run\v2\config\service-map.proxy-traefik-https.source-dev.json
 The service map entry uses:
 
 ```text
-repository: BoldBI.UpgradeCenter
-projectPath: BoldBI.UpgradeCenter.csproj
+repository: Bold.UpgradeCenter
+projectPath: Bold.UpgradeCenter.csproj
 runtimeMode: publish
 http port: 6717
 health: http://localhost:6717/upgrade-center/health-check
@@ -405,8 +388,8 @@ public route: https://localhost:6843/platform/upgrade-center
 Typical commands:
 
 ```powershell
-.\dev-run\v2\scripts\devrun.ps1 publish upgrade-center-ui --service-map dev-run\v2\config\service-map.proxy-traefik-https.source-dev.json
-.\dev-run\v2\scripts\devrun.ps1 restart upgrade-center-ui --service-map dev-run\v2\config\service-map.proxy-traefik-https.source-dev.json
+.\dev-run\v2\scripts\devrun.ps1 publish bold-upgrade-center --service-map dev-run\v2\config\service-map.proxy-traefik-https.source-dev.json
+.\dev-run\v2\scripts\devrun.ps1 restart bold-upgrade-center --service-map dev-run\v2\config\service-map.proxy-traefik-https.source-dev.json
 ```
 
 To start all configured services:
@@ -424,7 +407,7 @@ To stop all configured services:
 Check logs:
 
 ```text
-.runtime/proxy-traefik-https-source-dev/logs/upgrade-center-ui.log
+.runtime/proxy-traefik-https-source-dev/logs/bold-upgrade-center.log
 ```
 
 ## Docker
@@ -434,8 +417,6 @@ The Dockerfile uses:
 - .NET SDK `10.0-noble` for build.
 - ASP.NET Core runtime `10.0-noble`.
 - Release publish.
-- Node.js/npm for Playwright.
-- Chromium installation through `npx playwright install --with-deps chromium`.
 - Non-root user `appuser`.
 - Port `8080`.
 
@@ -443,13 +424,13 @@ Build:
 
 ```powershell
 cd D:\dev-run-new
-docker build -t sivakumar2809/upgrade-center-ui:v0.5 .\BoldBI.UpgradeCenter
+docker build -t sivakumar2809/bold-upgrade-center:v2.0.0 .\Bold.UpgradeCenter
 ```
 
 Push:
 
 ```powershell
-docker push sivakumar2809/upgrade-center-ui:v0.5
+docker push sivakumar2809/bold-upgrade-center:v2.0.0
 ```
 
 ## Kubernetes Deployment
@@ -457,7 +438,7 @@ docker push sivakumar2809/upgrade-center-ui:v0.5
 Manifest:
 
 ```text
-k8s/boldbi-upgrade-center.yaml
+k8s/bold-upgrade-center.yaml
 ```
 
 It creates:
@@ -472,21 +453,21 @@ It creates:
 Apply:
 
 ```powershell
-kubectl apply -f .\BoldBI.UpgradeCenter\k8s\boldbi-upgrade-center.yaml
+kubectl apply -f .\Bold.UpgradeCenter\k8s\bold-upgrade-center.yaml
 ```
 
 Check rollout:
 
 ```powershell
-kubectl rollout status deployment/boldbi-upgrade-center
-kubectl get pods -l app.kubernetes.io/name=boldbi-upgrade-center
-kubectl logs deployment/boldbi-upgrade-center
+kubectl rollout status deployment/bold-upgrade-center
+kubectl get pods -l app.kubernetes.io/name=bold-upgrade-center
+kubectl logs deployment/bold-upgrade-center
 ```
 
 Health:
 
 ```powershell
-kubectl port-forward service/boldbi-upgrade-center 8080:80
+kubectl port-forward service/bold-upgrade-center 8080:80
 curl http://localhost:8080/upgrade-center/health-check
 ```
 
@@ -708,24 +689,24 @@ Do not store or expose:
 
 ### Recommended Local Debugging Mode: Use Real IDP/UMS
 
-This is the safest and most accurate mode. Keep IDP, UMS, BI, and database services running through dev-run, then run only `BoldBI.UpgradeCenter` from VS Code.
+This is the safest and most accurate mode. Keep IDP, UMS, BI, and database services running through dev-run, then run only `Bold.UpgradeCenter` from VS Code.
 
 1. Start required Bold BI services.
-2. Stop only the dev-run `upgrade-center-ui` service if it is already using port `6717`.
+2. Stop only the dev-run `bold-upgrade-center` service if it is already using port `6717`.
 3. Open VS Code at:
 
    ```text
-   D:\dev-run-new\BoldBI.UpgradeCenter
+   D:\dev-run-new\Bold.UpgradeCenter
    ```
 
 4. Use a C# launch configuration like:
 
    ```json
    {
-     "name": "Debug BoldBI Upgrade Center",
+     "name": "Debug Bold Upgrade Center",
      "type": "coreclr",
      "request": "launch",
-     "program": "${workspaceFolder}/bin/Debug/net10.0/BoldBI.UpgradeCenter.dll",
+     "program": "${workspaceFolder}/bin/Debug/net10.0/Bold.UpgradeCenter.dll",
      "args": [],
      "cwd": "${workspaceFolder}",
      "stopAtEntry": false,
@@ -1046,17 +1027,11 @@ Common causes:
 
 Check:
 
-- Node.js is installed.
-- `npm ci` completed.
-- Chromium installed through Playwright.
-- `UpgradeCenter:Playwright:*` arguments point to the correct script.
-
-Run manually:
-
-```powershell
-cd D:\dev-run-new\BoldBI.UpgradeCenter
-node node_modules/playwright/cli.js test PlaywrightScripts/sample-upgrade-poc.spec.ts --config PlaywrightScripts/playwright.config.ts --reporter=line
-```
+- `UpgradeCenter:Playwright:UseKubernetesJob` is enabled when real QA validation is expected.
+- `UpgradeCenter:Playwright:RunnerImage` points to the correct Playwright runner image.
+- The Upgrade Center service account has permission to create/read/delete Jobs, Pods, Pod logs, Secrets, and PVCs where configured.
+- Required Playwright runtime secrets are present.
+- If `UseKubernetesJob` is disabled, check the product health-check endpoints configured through `ProductHealthCheckService`.
 
 ## Security Notes
 
@@ -1070,10 +1045,11 @@ node node_modules/playwright/cli.js test PlaywrightScripts/sample-upgrade-poc.sp
 
 ## Maintenance Notes
 
+ECS is an opt-in execution backend for Bold BI Standalone deployments. See [ECS deployment](docs/ecs-deployment.md) for implementation boundaries, release metadata, runner image requirements, and links to EFS/S3/hybrid task-definition examples. Kubernetes behavior remains the default.
+
 - Keep the Upgrade Center route stable at `/upgrade-center`.
 - Keep IDP/UMS internal APIs backward compatible.
 - Keep Kubernetes RBAC namespace-scoped.
 - Keep Playwright sample scripts replaceable by real QA scripts.
 - Keep custom patch validation conservative: if a required image cannot be validated, do not enable upgrade.
 - If new database script syntax is introduced, review `UpgradeDatabaseScriptImpactService` affected-table extraction.
-

@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class CustomPatchValidationRequest
 {
@@ -35,6 +35,9 @@ public sealed record CustomPatchImageValidationResult(
 
 public interface ICustomPatchValidationService
 {
+    Task<string?> GetCommonImageRepositoryAsync(
+        CancellationToken cancellationToken = default);
+
     Task<CustomPatchValidationResponse> ValidateAsync(
         CustomPatchValidationRequest request,
         string currentVersion,

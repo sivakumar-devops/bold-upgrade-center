@@ -1,0 +1,56 @@
+@model Bold.UpgradeCenter.Models.ViewModels.StandaloneLoginViewModel
+@inject Microsoft.Extensions.Options.IOptions<Bold.UpgradeCenter.Services.UpgradeCenterOptions> Options
+
+@{
+    var (productName, logo) = Options.Value.DeploymentMode?.Trim().ToLowerInvariant() switch
+    {
+        "boldbi" => ("Bold BI", "boldbi-login.svg"),
+        "boldreports" => ("Bold Reports", "boldreports-login.svg"),
+        _ => ("Bold", "bold-login.svg")
+    };
+    ViewData["Title"] = $"Sign in - {productName} Upgrade Center";
+    ViewData["BodyClass"] = "standalone-login-page";
+}
+
+@section Styles {
+    <link rel="stylesheet" href="~/upgrade-center/css/idp-roboto.css" asp-append-version="true" />
+    <link rel="stylesheet" href="~/upgrade-center/css/standalone-login.css" asp-append-version="true" />
+}
+
+<main class="standalone-login-wrap">
+    <section class="standalone-login-panel" aria-labelledby="login-title">
+        <div class="standalone-login-brand">
+            <img src="@Url.Content("~/upgrade-center/images/" + logo)" asp-append-version="true" alt="@productName" width="147" height="48" />
+        </div>
+        <h1 id="login-title">Sign in to Upgrade Center</h1>
+        <form class="standalone-login-form" asp-controller="StandaloneAuthentication" asp-action="Login" method="post">
+            <input asp-for="ReturnUrl" type="hidden" />
+            <div asp-validation-summary="ModelOnly" class="standalone-auth-error" role="alert"></div>
+            <div class="standalone-login-field">
+                <label asp-for="Username">Username / Email Address</label>
+                <input asp-for="Username" autocomplete="username" required maxlength="256" autofocus aria-describedby="username-error" spellcheck="false" autocapitalize="none" />
+                <span asp-validation-for="Username" id="username-error" class="standalone-auth-error"></span>
+            </div>
+            <div class="standalone-login-field">
+                <label asp-for="Password"></label>
+                <div class="standalone-password-field">
+                    <input asp-for="Password" autocomplete="current-password" required maxlength="4096" aria-describedby="password-error" />
+                    <button type="button" class="standalone-password-toggle" aria-label="Show password" title="Show password" aria-controls="Password" aria-pressed="false" hidden>
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">
+                            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+                            <circle cx="12" cy="12" r="3" />
+                            <path class="password-slash" d="m3 3 18 18" />
+                        </svg>
+                    </button>
+                </div>
+                <span asp-validation-for="Password" id="password-error" class="standalone-auth-error"></span>
+            </div>
+            <button type="submit" class="standalone-login-submit">Sign in</button>
+        </form>
+        <span class="beta-badge standalone-login-beta" aria-label="Beta version">BETA</span>
+    </section>
+</main>
+
+@section Scripts {
+    <script src="~/upgrade-center/js/standalone-login.js" asp-append-version="true" defer></script>
+}

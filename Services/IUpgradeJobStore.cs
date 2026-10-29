@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IUpgradeJobStore
 {
@@ -8,15 +8,19 @@ public interface IUpgradeJobStore
         UpgradeJobType upgradeType,
         IReadOnlyList<string> selectedDeployments,
         IReadOnlyList<CustomPatchImageMapping>? customImages = null,
-        UpgradeUserInfo? initiatedBy = null);
+        UpgradeUserInfo? initiatedBy = null,
+        string? productKey = null);
 
     UpgradeJob CreateRollback(
         string currentVersion,
         string targetVersion,
+        string rollbackId,
         IReadOnlyList<string> selectedDeployments,
-        UpgradeUserInfo? initiatedBy = null);
+        UpgradeUserInfo? initiatedBy = null,
+        string? productKey = null);
 
     bool TryGet(string jobId, out UpgradeJob job);
+    void SaveEcsValidation(string jobId, string mode, EcsValidationExecution execution) => throw new NotSupportedException();
 
     bool TryGetLatestActive(out UpgradeJob job);
 

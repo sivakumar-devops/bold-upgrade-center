@@ -1,9 +1,11 @@
-@using BoldBI.UpgradeCenter.Models.ViewModels
+@using Bold.UpgradeCenter.Models.ViewModels
+@inject Microsoft.Extensions.Configuration.IConfiguration Configuration
 @model ConfirmRollbackViewModel
 
 @{
     ViewData["Title"] = "Confirm Rollback";
     Layout = "~/Views/Shared/_Layout.cshtml";
+    var ecs = string.Equals(Configuration["UpgradeCenter:ExecutionEnvironment"], "ECS", StringComparison.OrdinalIgnoreCase);
 }
 
 <partial name="_Topbar" model="@Model.CurrentUser" />
@@ -47,7 +49,7 @@
                 <strong>@Model.BackupDatabaseCount</strong>
             </div>
             <div>
-                <span>Kubernetes images</span>
+                <span>@(ecs ? "ECS service revisions" : "Kubernetes images")</span>
                 <strong>@Model.KubernetesImageCount</strong>
             </div>
         </div>
@@ -61,7 +63,7 @@
                 <strong>Rollback impact</strong>
                 <div>
                     The Upgrade Center will restore the recorded database backups and revert the
-                    recorded Kubernetes deployment image tags for this rollback point.
+                    @(ecs ? "recorded ECS task-definition revisions for this rollback point." : "recorded Kubernetes deployment image tags for this rollback point.")
                 </div>
             </div>
         </div>

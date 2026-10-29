@@ -2,7 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Xml.Linq;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IBoldConnectionStringDecryptor
 {

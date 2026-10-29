@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Models;
+namespace Bold.UpgradeCenter.Models;
 
 public class ErrorViewModel
 {

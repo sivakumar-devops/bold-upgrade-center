@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed record UpgradeCenterRuntimeConfiguration(
     string? IdpBaseUrl,
@@ -8,7 +8,13 @@ public sealed record UpgradeCenterRuntimeConfiguration(
     int? MasterDatabaseServerType = null,
     string? MachineKeyDecryptionKey = null,
     string? InternalAppClientId = null,
-    string? InternalAppClientSecret = null);
+    string? InternalAppClientSecret = null,
+    bool? UseSingleTenantDb = null,
+    string? MasterDatabaseSchemaName = null,
+    string? MasterDatabaseTablePrefix = null,
+    bool? ShowDataHub = null,
+    string? ReportsBaseUrl = null,
+    string? BoldReportsVersion = null);
 
 public interface IUpgradeCenterConfigurationProvider
 {

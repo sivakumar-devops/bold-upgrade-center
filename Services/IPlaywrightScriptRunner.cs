@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IPlaywrightScriptRunner
 {
@@ -9,11 +9,19 @@ public interface IPlaywrightScriptRunner
     Task<PlaywrightScriptResult> ExecutePreUpgradeAsync(
         string upgradeJobId,
         Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
         CancellationToken cancellationToken = default);
 
     Task<PlaywrightScriptResult> ExecutePostUpgradeAsync(
         string upgradeJobId,
         Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
+        CancellationToken cancellationToken = default);
+
+    Task<PlaywrightScriptResult> ExecuteCleanupAsync(
+        string upgradeJobId,
+        Action<PlaywrightValidationProgress>? progress = null,
+        string? runnerImageVersion = null,
         CancellationToken cancellationToken = default);
 
     Task CleanupSharedStateAsync(string upgradeJobId, CancellationToken cancellationToken = default);

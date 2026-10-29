@@ -1,8 +1,8 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
-using BoldBI.UpgradeCenter.Models;
+using Bold.UpgradeCenter.Models;
 
-namespace BoldBI.UpgradeCenter.Controllers;
+namespace Bold.UpgradeCenter.Controllers;
 
 public class HomeController : Controller
 {

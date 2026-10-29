@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed class InMemoryPlaywrightValidationResultStore : IPlaywrightValidationResultStore
 {

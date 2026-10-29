@@ -1,11 +1,13 @@
 using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 // Keeps a hot in-memory cache and writes operational state through to persistent storage.
 public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 {
+    private const int RetainedOperationLogJobCount = 7;
+
     private static readonly Regex SensitiveAssignmentPattern = new(
         @"(?<key>Password|Pwd|User\s*ID|Username|Token|AccessToken|Secret|Key)\s*=\s*[^;,\s]+",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -15,13 +17,16 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
     private readonly IUpgradeOperationalStateStore operationalStateStore;
     private readonly IUpgradeOperationLogStore operationLogStore;
     private readonly object syncRoot = new();
+    private readonly string executionEnvironment;
 
     public InMemoryUpgradeJobStore(
         IUpgradeOperationalStateStore operationalStateStore,
-        IUpgradeOperationLogStore operationLogStore)
+        IUpgradeOperationLogStore operationLogStore,
+        IConfiguration? configuration = null)
     {
         this.operationalStateStore = operationalStateStore;
         this.operationLogStore = operationLogStore;
+        executionEnvironment = UpgradeExecutionEnvironments.Parse(configuration?["UpgradeCenter:ExecutionEnvironment"]).ToString();
     }
 
     public UpgradeJob Create(
@@ -30,17 +35,20 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
         UpgradeJobType upgradeType,
         IReadOnlyList<string> selectedDeployments,
         IReadOnlyList<CustomPatchImageMapping>? customImages = null,
-        UpgradeUserInfo? initiatedBy = null)
+        UpgradeUserInfo? initiatedBy = null,
+        string? productKey = null)
     {
         var job = new UpgradeJob
         {
             Id = Guid.NewGuid().ToString("N"),
+            ExecutionEnvironment = executionEnvironment,
             CurrentVersion = currentVersion,
             TargetVersion = targetVersion,
             UpgradeType = upgradeType,
+            ProductKey = UpgradeProductDefinitions.Resolve(productKey).Key,
             SelectedDeployments = selectedDeployments.Count > 0
                 ? selectedDeployments.ToArray()
-                : ["All applicable Bold BI deployments"],
+                : [$"All applicable {UpgradeProductDefinitions.Resolve(productKey).DisplayName} deployments"],
             CustomImages = customImages?.ToArray() ?? Array.Empty<CustomPatchImageMapping>(),
             InitiatedBy = initiatedBy ?? UpgradeUserInfo.System(),
             StartedAt = DateTimeOffset.UtcNow,
@@ -65,7 +73,7 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                     ]),
                 CreateStage(
                     UpgradeJobStageName.KubernetesImageUpgrade,
-                    "Kubernetes image upgrade",
+                    executionEnvironment == "Ecs" ? "ECS image upgrade" : "Kubernetes image upgrade",
                     [
                         CreateOperation("kubernetes-images", "Retrieved target image details"),
                         CreateOperation("kubernetes-deployments", "Updated applicable deployment images")
@@ -77,6 +85,17 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
                         CreateOperation("post-validation-wait", "Waiting for upgrade completion"),
                         CreateOperation("post-validation-tests", "Executed validation tests"),
                         CreateOperation("post-validation-complete", "Validation completed")
+                    ]),
+                CreateStage(
+                    UpgradeJobStageName.CleanupJob,
+                    "Cleanup Job",
+                    [
+                        CreateOperation("playwright-prepare", "Prepare Playwright cleanup"),
+                        CreateOperation("playwright-shared-state", "Prepare shared Playwright state"),
+                        CreateOperation("playwright-secret", "Create temporary runtime Secret"),
+                        CreateOperation("playwright-job", "Create Playwright cleanup Job"),
+                        CreateOperation("playwright-runner", "Wait for Playwright runner"),
+                        CreateOperation("playwright-tests", "Delete Playwright validation resources")
                     ]),
                 CreateStage(
                     UpgradeJobStageName.AutomaticRollback,
@@ -97,20 +116,25 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
     public UpgradeJob CreateRollback(
         string currentVersion,
         string targetVersion,
+        string rollbackId,
         IReadOnlyList<string> selectedDeployments,
-        UpgradeUserInfo? initiatedBy = null)
+        UpgradeUserInfo? initiatedBy = null,
+        string? productKey = null)
     {
         var job = new UpgradeJob
         {
             Id = $"manual-rollback-{Guid.NewGuid():N}",
+            ExecutionEnvironment = executionEnvironment,
             CurrentVersion = currentVersion,
             TargetVersion = targetVersion,
             UpgradeType = UpgradeJobType.Rollback,
+            ProductKey = UpgradeProductDefinitions.Resolve(productKey).Key,
             SelectedDeployments = selectedDeployments.Count > 0
                 ? selectedDeployments.ToArray()
                 : ["All recorded rollback targets"],
             CustomImages = Array.Empty<CustomPatchImageMapping>(),
             InitiatedBy = initiatedBy ?? UpgradeUserInfo.System(),
+            RollbackId = rollbackId,
             StartedAt = DateTimeOffset.UtcNow,
             Stages =
             [
@@ -453,10 +477,24 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             job.Status = status;
             job.CompletedAt = DateTimeOffset.UtcNow;
             job.SafeErrorDetails = safeErrorDetails;
-            AppendJobLog(job, status is UpgradeJobStatus.Failed or UpgradeJobStatus.RollbackFailed ? "Error" : "Info", "Job", string.IsNullOrWhiteSpace(safeErrorDetails)
-                ? $"Job completed. Final status: {status}."
-                : $"Job completed. Final status: {status}. {safeErrorDetails}");
+            var completionMessage = status is UpgradeJobStatus.Failed or UpgradeJobStatus.RollbackFailed
+                ? $"Job completed. Final status: {status}. Review the failed stage log above for the detailed reason."
+                : string.IsNullOrWhiteSpace(safeErrorDetails)
+                    ? $"Job completed. Final status: {status}."
+                    : $"Job completed. Final status: {status}. {safeErrorDetails}";
+            AppendJobLog(
+                job,
+                status is UpgradeJobStatus.Failed or UpgradeJobStatus.RollbackFailed ? "Error" : "Info",
+                "Job",
+                completionMessage);
+            operationLogStore.RetainLatestJobs(RetainedOperationLogJobCount);
         });
+    }
+
+    public void SaveEcsValidation(string jobId, string mode, EcsValidationExecution execution)
+    {
+        if (!TryGet(jobId, out _)) throw new InvalidOperationException("ECS validation job has no durable operation context.");
+        Update(jobId, job => job.EcsValidationExecutions[mode] = execution);
     }
 
     private void Update(string jobId, Action<UpgradeJob> update)
@@ -584,17 +622,29 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
     private void AppendStageLog(UpgradeJob job, UpgradeJobStage stage, string level, string source, string message)
     {
+        if (ShouldSuppressStageLog(stage, source))
+        {
+            return;
+        }
+
         AppendLog(job.Id, stage.DisplayName, level, source, message);
     }
 
     private void AppendOperationLog(UpgradeJob job, UpgradeJobStage stage, UpgradeJobOperation operation, string level, string source)
     {
+        if (string.Equals(source, "OperationResult", StringComparison.Ordinal) ||
+            ShouldSuppressOperationLog(stage, operation, source))
+        {
+            return;
+        }
+
         var detail = operation.SafeErrorDetails ?? operation.Message;
         var message = string.IsNullOrWhiteSpace(detail)
             ? $"{operation.Name}: {operation.Status}."
             : $"{operation.Name}: {operation.Status}. {detail}";
 
-        if (operation.StartedAt.HasValue && operation.CompletedAt.HasValue)
+        if (operation.StartedAt.HasValue && operation.CompletedAt.HasValue &&
+            !ContainsDuration(message))
         {
             var duration = operation.CompletedAt.Value - operation.StartedAt.Value;
             message += $" Duration {FormatDuration(duration)}.";
@@ -629,6 +679,51 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
 
         lastLogFingerprints[fingerprintKey] = fingerprintValue;
         operationLogStore.Append(jobId, stage, level, source, safeMessage);
+    }
+
+    private static bool ShouldSuppressStageLog(UpgradeJobStage stage, string source)
+    {
+        if (!string.Equals(source, "Stage", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (stage.Status is not (UpgradeJobStageStatus.Succeeded or UpgradeJobStageStatus.Failed))
+        {
+            return false;
+        }
+
+        return stage.Name is UpgradeJobStageName.PreUpgradeValidation
+            or UpgradeJobStageName.PostUpgradeValidation
+            or UpgradeJobStageName.CleanupJob;
+    }
+
+    private static bool ShouldSuppressOperationLog(UpgradeJobStage stage, UpgradeJobOperation operation, string source)
+    {
+        if (!string.Equals(source, "Operation", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (stage.Name == UpgradeJobStageName.PreUpgradeValidation)
+        {
+            return operation.Status != UpgradeJobStageStatus.Failed &&
+                   (operation.Id is "pre-validation-start" or "pre-validation-tests" or "pre-validation-complete");
+        }
+
+        if (stage.Name == UpgradeJobStageName.PostUpgradeValidation)
+        {
+            return operation.Status != UpgradeJobStageStatus.Failed &&
+                   (operation.Id is "post-validation-tests" or "post-validation-complete");
+        }
+
+        return false;
+    }
+
+    private static bool ContainsDuration(string message)
+    {
+        return message.Contains("Duration:", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("Duration ", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ResolveLogLevel(UpgradeJobStageStatus status)
@@ -666,6 +761,9 @@ public sealed class InMemoryUpgradeJobStore : IUpgradeJobStore
             CurrentVersion = job.CurrentVersion,
             TargetVersion = job.TargetVersion,
             UpgradeType = job.UpgradeType,
+            ProductKey = job.ProductKey,
+            ExecutionEnvironment = job.ExecutionEnvironment,
+            EcsValidationExecutions = new(job.EcsValidationExecutions),
             SelectedDeployments = job.SelectedDeployments.ToArray(),
             CustomImages = job.CustomImages.ToArray(),
             InitiatedBy = job.InitiatedBy,

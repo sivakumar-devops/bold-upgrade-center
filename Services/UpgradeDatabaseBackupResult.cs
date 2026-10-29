@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed record UpgradeDatabaseBackupResult(
     bool Succeeded,
@@ -56,9 +56,12 @@ public sealed record DatabaseBackupMapping(
     string BackupConnectionString,
     BackupStatus? BackupStatus,
     string? OriginalDatabaseIdentifier = null,
-    IReadOnlyList<string>? CreatedTablesToDrop = null)
+    IReadOnlyList<string>? CreatedTablesToDrop = null,
+    IReadOnlyList<string>? TablesToRestore = null)
 {
     public IReadOnlyList<string> UpgradeCreatedTablesToDrop => CreatedTablesToDrop ?? Array.Empty<string>();
+
+    public IReadOnlyList<string> BackupTableNames => TablesToRestore ?? Array.Empty<string>();
 }
 
 public sealed record UpgradeDatabaseRestoreResult(

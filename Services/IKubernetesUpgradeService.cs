@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public interface IKubernetesUpgradeService
 {
@@ -24,6 +24,11 @@ public interface IKubernetesUpgradeService
         Func<KubernetesUpgradeResult, Task>? rollbackContextPrepared = null);
 
     Task<KubernetesRollbackResult> RollbackAsync(
+        KubernetesUpgradeResult upgradeResult,
+        CancellationToken cancellationToken = default,
+        Action<KubernetesDeploymentProgress>? progress = null);
+
+    Task<KubernetesRollbackResult> ReconcileRollbackAsync(
         KubernetesUpgradeResult upgradeResult,
         CancellationToken cancellationToken = default,
         Action<KubernetesDeploymentProgress>? progress = null);

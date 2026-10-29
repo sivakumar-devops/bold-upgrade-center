@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed record PlaywrightScriptResult(
     bool Succeeded,
@@ -9,7 +9,8 @@ public sealed record PlaywrightScriptResult(
     string Command,
     string StandardOutput,
     string StandardError,
-    string Message)
+    string Message,
+    bool KubernetesJobCreated = false)
 {
     public TimeSpan Duration => FinishedAt - StartedAt;
 }

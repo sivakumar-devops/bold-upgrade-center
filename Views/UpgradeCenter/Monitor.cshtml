@@ -1,5 +1,5 @@
-@using BoldBI.UpgradeCenter.Models
-@using BoldBI.UpgradeCenter.Models.ViewModels
+@using Bold.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Models.ViewModels
 @model MonitoringViewModel
 
 @{
@@ -310,10 +310,7 @@
 
             var shouldFollowLatest = completeLogAutoScroll && isCompleteLogNearBottom(logBox);
             entries.forEach(function (entry) {
-                var line = document.createElement('div');
-                line.className = 'complete-log-line';
-                line.textContent = entry.line || '';
-                logBox.appendChild(line);
+                logBox.appendChild(createCompleteLogLine(entry));
                 lastLogSequence = Math.max(lastLogSequence, Number(entry.sequence || 0));
             });
 
@@ -321,6 +318,50 @@
             if (shouldFollowLatest) {
                 scrollCompleteLogToBottom();
             }
+        }
+
+        function createCompleteLogLine(entry) {
+            var level = entry.level || 'Info';
+            var levelClass = String(level).toLowerCase() === 'error'
+                ? 'error'
+                : String(level).toLowerCase() === 'warning'
+                    ? 'warning'
+                    : 'info';
+            var line = document.createElement('div');
+            line.className = 'complete-log-line ' + levelClass;
+            line.dataset.sequence = String(entry.sequence || '');
+
+            var timestamp = document.createElement('span');
+            timestamp.className = 'log-timestamp';
+            timestamp.textContent = entry.timestamp || '';
+
+            var levelElement = document.createElement('span');
+            levelElement.className = 'log-level';
+            levelElement.textContent = level;
+
+            var stage = document.createElement('span');
+            stage.className = 'log-stage';
+            stage.textContent = entry.stage || 'Job';
+
+            var message = document.createElement('div');
+            message.className = 'complete-log-message';
+            message.textContent = entry.message || '';
+
+            line.appendChild(timestamp);
+            line.appendChild(createLogSeparator());
+            line.appendChild(levelElement);
+            line.appendChild(createLogSeparator());
+            line.appendChild(stage);
+            line.appendChild(createLogSeparator());
+            line.appendChild(message);
+            return line;
+        }
+
+        function createLogSeparator() {
+            var separator = document.createElement('span');
+            separator.className = 'log-separator';
+            separator.textContent = '|';
+            return separator;
         }
 
         document.addEventListener('toggle', function (event) {

@@ -1,7 +1,7 @@
 using System.Security.Claims;
-using BoldBI.UpgradeCenter.Security;
+using Bold.UpgradeCenter.Security;
 
-namespace BoldBI.UpgradeCenter.Services;
+namespace Bold.UpgradeCenter.Services;
 
 public sealed record UpgradeUserInfo(
     string UserId,

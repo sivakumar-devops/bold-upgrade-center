@@ -1,4 +1,4 @@
-namespace BoldBI.UpgradeCenter.Models.ViewModels
+namespace Bold.UpgradeCenter.Models.ViewModels
 {
     /// <summary>
     /// View-model for the manual rollback confirmation page.

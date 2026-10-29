@@ -1,5 +1,5 @@
-@using BoldBI.UpgradeCenter.Models
-@using BoldBI.UpgradeCenter.Models.ViewModels
+@using Bold.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Models.ViewModels
 @model MonitoringViewModel
 
 @{
@@ -55,6 +55,30 @@
         _                   => "Pending"
     };
 
+    string StageBadgeClass(JobStage stage) => BadgeClass(stage.Status);
+
+    string StageBadgeLabel(JobStage stage) => BadgeLabel(stage.Status);
+
+    string DetailStatusClass(StageDetailStatus s) => s switch
+    {
+        StageDetailStatus.Completed => "completed",
+        StageDetailStatus.Running => "running",
+        StageDetailStatus.Failed => "failed",
+        StageDetailStatus.Skipped => "skipped",
+        StageDetailStatus.Warning => "warning",
+        _ => "pending"
+    };
+
+    string DetailStatusIcon(StageDetailStatus s) => s switch
+    {
+        StageDetailStatus.Completed => "✓",
+        StageDetailStatus.Running => "⟳",
+        StageDetailStatus.Failed => "×",
+        StageDetailStatus.Skipped => "−",
+        StageDetailStatus.Warning => "!",
+        _ => "○"
+    };
+
     string JobBadgeClass(UpgradeJobStatus s) => s switch
     {
         UpgradeJobStatus.Completed   => "badge-teal",
@@ -99,6 +123,7 @@
             "Schema Backup" => "Schema backup failed.",
             "Upgrade" => "Upgrade failed.",
             "Post-Upgrade Validation" => "Post-upgrade validation found issues.",
+            "Cleanup Job" => "Cleanup failed.",
             _ => "Upgrade workflow found issues."
         };
     }
@@ -112,6 +137,7 @@
             "Schema Backup" => "The upgrade was stopped before deployment images were changed. Review the schema backup details and retry after fixing the issue.",
             "Upgrade" => "Rollback is available only if the previous images and database backup were recorded successfully.",
             "Post-Upgrade Validation" => $"Rolling back restores v{job.FromVersion} and the backed-up tables when a valid rollback point is available.",
+            "Cleanup Job" => "Cleanup could not be completed. Manual cleanup is required.",
             _ => "Review the failed stage details before retrying or starting rollback."
         };
     }
@@ -119,14 +145,27 @@
     var isLatestRollbackable = ViewData["IsLatestRollbackable"] is bool b && b;
     var failedStage = job.Stages.FirstOrDefault(stage => stage.Status == StageStatus.Failed);
     var canCancel = Model.CanCancelUpgrade;
+    var isRollbackHeader = job.IsRollback || job.Status == UpgradeJobStatus.RollingBack;
+    var fromVersionLabel = isRollbackHeader ? "Rollback From" : "Current Version";
+    var toVersionLabel = isRollbackHeader ? "Restore To" : "Target Version";
 }
 
 <div class="job-header" data-job-status="@JobBadgeLabel(job.Status)" data-can-cancel="@(canCancel ? "true" : "false")">
     <div>
         <div class="eyebrow">@(job.IsRollback ? $"Rollback job - reverting job {job.RevertsJobId}" : "Upgrade job")</div>
-        <h1 class="page-title">v@(job.FromVersion) -> v@(job.ToVersion)</h1>
+        <h1 class="version-transition" aria-label="@fromVersionLabel v@(job.FromVersion) to @toVersionLabel v@(job.ToVersion)">
+            <span class="version-block">
+                <span class="version-label">@fromVersionLabel</span>
+                <span class="version-value">v@(job.FromVersion)</span>
+            </span>
+            <span class="version-arrow" aria-hidden="true">&rarr;</span>
+            <span class="version-block">
+                <span class="version-label">@toVersionLabel</span>
+                <span class="version-value">v@(job.ToVersion)</span>
+            </span>
+        </h1>
         <div class="job-id">
-            Job ID: @job.JobId - started @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
+            Job ID: @job.JobId - Started by @job.InitiatedBy at @job.StartedAt.ToString("HH:mm:ss, dd MMM yyyy")
         </div>
     </div>
     <span class="badge @JobBadgeClass(job.Status)" aria-label="Job status: @JobBadgeLabel(job.Status)">@JobBadgeLabel(job.Status)</span>
@@ -158,7 +197,7 @@
     <div class="success-banner">
         <div class="txt">
             <b>Upgrade completed successfully.</b>
-            <span>Bold BI is now running v@(job.ToVersion). No further action is required.</span>
+            <span>@job.ProductName is now running v@(job.ToVersion). No further action is required.</span>
         </div>
         @if (job.CanRollBack && isLatestRollbackable)
         {
@@ -197,24 +236,6 @@ else if (job.Status == UpgradeJobStatus.Failed)
         }
     </div>
 }
-else if (job.Status == UpgradeJobStatus.RollingBack)
-{
-    <div class="banner">
-        <div class="txt">
-            <b>Rollback in progress.</b>
-            <span>Bold BI will be back on v@(job.ToVersion) with the pre-upgrade data restored once this finishes. This page updates automatically.</span>
-        </div>
-    </div>
-}
-else if (job.Status == UpgradeJobStatus.Running)
-{
-    <div class="banner running">
-        <div class="txt">
-            <b>Upgrade in progress.</b>
-            <span>Started by @job.InitiatedBy - @(job.CurrentStage != null ? $"currently running: {job.CurrentStage.Name}" : "preparing...")</span>
-        </div>
-    </div>
-}
 else if (job.Status == UpgradeJobStatus.Cancelling)
 {
     <div class="banner running">
@@ -243,7 +264,7 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
     var hasHtmlReport = !string.IsNullOrWhiteSpace(stage.HtmlReportUrl);
     var detailsKey = $"stage:{job.JobId}:{stage.Name}";
 
-    <div class="card stage-card" aria-label="@stage.Name status: @BadgeLabel(stage.Status)">
+    <div class="card stage-card" aria-label="@stage.Name status: @StageBadgeLabel(stage)">
         <div class="stage-head">
             <div class="stage-head-left">
                 <div class="stage-icon @iconCls" aria-hidden="true">@StageIconLabel(stage.Status)</div>
@@ -254,14 +275,14 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
                         {
                             <span>@stage.Meta</span>
                         }
-                        else if (stage.Checks.Count > 0)
-                        {
-                            var passed = stage.Checks.Count(c => c.Passed);
-                            <span>@passed of @stage.Checks.Count checks passed</span>
-                        }
                         else
                         {
-                            <span>@BadgeLabel(stage.Status)</span>
+                            <span>@StageBadgeLabel(stage)</span>
+                        }
+
+                        @if (stage.Checks.Count > 0)
+                        {
+                            <span>@stage.ProgressPercent% complete</span>
                         }
 
                         @if (stage.Duration.HasValue)
@@ -269,9 +290,16 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
                             <span class="stage-duration">@FormatDuration(stage.Duration)</span>
                         }
                     </div>
+                    @if (stage.Checks.Count > 0)
+                    {
+                        <div class="stage-progress-meter" aria-label="@stage.Name progress: @stage.ProgressPercent percent complete">
+                            <div class="stage-progress-meter-fill @StageIconClass(stage.Status)"
+                                 style="width:@stage.ProgressPercent%"></div>
+                        </div>
+                    }
                 </div>
             </div>
-            <span class="badge @BadgeClass(stage.Status)" aria-label="@stage.Name status: @BadgeLabel(stage.Status)">@BadgeLabel(stage.Status)</span>
+            <span class="badge @StageBadgeClass(stage)" aria-label="@stage.Name status: @StageBadgeLabel(stage)">@StageBadgeLabel(stage)</span>
         </div>
 
         @if (hasHtmlReport || hasDetails)
@@ -303,12 +331,16 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
                             @if (hasProgress)
                             {
                                 <div class="stage-log-heading">Progress Details</div>
-                                <ul class="stage-progress-list">
+                                <div class="stage-progress-list">
                                     @foreach (var check in stage.Checks)
                                     {
-                                        <li class="@(check.Passed ? "good" : "bad")">@check.Description</li>
+                                        var detailClass = DetailStatusClass(check.Status);
+                                        <div class="stage-progress-row @detailClass">
+                                            <span class="stage-progress-icon" aria-hidden="true">@DetailStatusIcon(check.Status)</span>
+                                            <span class="stage-progress-description">@check.Description</span>
+                                        </div>
                                     }
-                                </ul>
+                                </div>
                             }
                             else if (hasLogs)
                             {
@@ -341,41 +373,59 @@ else if (job.Status == UpgradeJobStatus.Cancelled)
     </div>
 }
 
-@if (job.CompleteLogLines.Count > 0)
-{
-    <div class="card complete-log-card">
-        <div class="complete-log-head">
-            <div>
-                <div class="stage-name">Complete operation logs</div>
-                <div class="stage-summary">
-                    <span>
-                        Includes database backup/restore, Playwright validation, Kubernetes upgrade/rollback,
-                        warnings, errors, and final operation status.
-                    </span>
-                </div>
+<div class="card complete-log-card">
+    <div class="complete-log-head">
+        <div>
+            <div class="stage-name">Complete operation logs</div>
+            <div class="stage-summary">
+                <span>
+                    Includes database backup/restore, Playwright validation, Kubernetes upgrade/rollback,
+                    warnings, errors, and final operation status.
+                </span>
             </div>
         </div>
-        <div class="stage-body complete-log-body">
-            <details class="stage-log-details complete-log-details" data-details-key="complete:@job.JobId">
-                <summary class="stage-action-row">
-                    <span class="stage-action-left"></span>
-                    <span class="stage-action-link stage-action-right">
-                        <span class="summary-open">Hide Complete Logs</span>
-                        <span class="summary-closed">View Complete Logs</span>
-                    </span>
-                </summary>
-                <div class="stage-details-content">
-                    <div class="stage-log-heading">Detailed Logs</div>
-                    <div class="log-box complete-log-box"
-                         id="complete-log-box"
-                         data-last-sequence="@job.CompleteLogSequence">
-                        @foreach (var line in job.CompleteLogLines)
-                        {
-                            <div class="complete-log-line">@line</div>
-                        }
-                    </div>
-                </div>
-            </details>
-        </div>
     </div>
-}
+    <div class="stage-body complete-log-body">
+        <details class="stage-log-details complete-log-details" data-details-key="complete:@job.JobId">
+            <summary class="stage-action-row">
+                <span class="stage-action-left">
+                    <a class="stage-action-link complete-log-download"
+                       asp-controller="UpgradeCenter"
+                       asp-action="DownloadCompleteLogs"
+                       asp-route-jobId="@job.JobId"
+                       onclick="event.stopPropagation();">
+                        Download Complete Logs
+                    </a>
+                </span>
+                <span class="stage-action-link stage-action-right">
+                    <span class="summary-open">Hide Complete Logs</span>
+                    <span class="summary-closed">View Complete Logs</span>
+                </span>
+            </summary>
+            <div class="stage-details-content">
+                <div class="stage-log-heading">Detailed Logs</div>
+                <div class="log-box complete-log-box"
+                     id="complete-log-box"
+                     data-last-sequence="@job.CompleteLogSequence">
+                    @foreach (var entry in job.CompleteLogEntries)
+                    {
+                        var logLevelClass = entry.Level.Equals("Error", StringComparison.OrdinalIgnoreCase)
+                            ? "error"
+                            : entry.Level.Equals("Warning", StringComparison.OrdinalIgnoreCase)
+                                ? "warning"
+                                : "info";
+                        <div class="complete-log-line @logLevelClass" data-sequence="@entry.Sequence">
+                            <span class="log-timestamp">@entry.Timestamp</span>
+                            <span class="log-separator">|</span>
+                            <span class="log-level">@entry.Level</span>
+                            <span class="log-separator">|</span>
+                            <span class="log-stage">@entry.Stage</span>
+                            <span class="log-separator">|</span>
+                            <div class="complete-log-message">@entry.Message</div>
+                        </div>
+                    }
+                </div>
+            </div>
+        </details>
+    </div>
+</div>

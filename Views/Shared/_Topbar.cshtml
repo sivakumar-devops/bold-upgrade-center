@@ -1,24 +1,28 @@
-@using BoldBI.UpgradeCenter.Models
-@using BoldBI.UpgradeCenter.Services
+@using Bold.UpgradeCenter.Models
+@using Bold.UpgradeCenter.Services
 @model UpgradeCenterUser
 @inject IUpgradeCenterConfigurationProvider ConfigurationProvider
+@inject IUpgradeProductContext ProductContext
+@inject Microsoft.Extensions.Options.IOptions<UpgradeCenterOptions> Options
 
 @{
     var runtimeConfiguration = await ConfigurationProvider.GetConfigurationAsync();
-    var boldBiUrl = string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl)
+    var productUrl = string.IsNullOrWhiteSpace(runtimeConfiguration.IdpBaseUrl)
         ? Url.Action("Index", "UpgradeCenter")
         : runtimeConfiguration.IdpBaseUrl;
+    var currentProduct = ProductContext.Current;
     var email = string.IsNullOrWhiteSpace(Model.Email) ? string.Empty : Model.Email;
 }
 
 <div class="product-topbar">
     <div class="brand">
-        <img class="brand-logo" src="~/upgrade-center/images/boldid_main_logo.svg" asp-append-version="true" alt="Bold BI" />
-        <div class="name">Bold BI</div>
-        <a class="crumb" href="@Url.Action("Index", "UpgradeCenter")">Upgrade Center</a>
+        <img class="brand-logo" src="~/upgrade-center/images/boldid_main_logo.svg" asp-append-version="true" alt="Bold" />
+        <div class="name">Bold</div>
+        <a class="crumb" href="@Url.Action("Index", "UpgradeCenter", new { product = currentProduct.Key })">Upgrade Center</a>
+        <span class="beta-badge beta-badge-topbar" aria-label="Beta version">BETA</span>
     </div>
     <div class="topbar-actions">
-        <a class="back-to-boldbi" href="@boldBiUrl">Back to Bold BI</a>
+        <a class="back-to-boldbi" href="@productUrl">Back to application</a>
         <details class="user-menu">
             <summary class="user-chip" aria-label="Open user menu">
                 <div class="avatar">@Model.Initials</div>
@@ -37,7 +41,16 @@
                     </div>
                 </div>
                 <div class="user-menu-divider"></div>
-                <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Sign out</a>
+                @if (UpgradeCenterIntegrationModes.Parse(Options.Value.IntegrationMode) == UpgradeCenterIntegrationMode.Standalone)
+                {
+                    <form class="user-menu-signout" asp-controller="StandaloneAuthentication" asp-action="SignOutLocal" method="post">
+                        <button class="user-menu-logout" type="submit">Sign out</button>
+                    </form>
+                }
+                else
+                {
+                    <a class="user-menu-logout" href="@Url.Action("Logout", "UpgradeCenter")">Sign out</a>
+                }
             </div>
         </details>
     </div>
